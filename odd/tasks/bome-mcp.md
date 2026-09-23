@@ -92,6 +92,10 @@ Out of scope, deliberately:
       that returns the matching articles, bounded).
       Verified: `162 passed, 9 skipped` offline; `9 passed` live; independent verify PASS.
       Target question "personal eventual" AND "cese" → 12 articles in 12 BOMEs, no errors.
+      Commit `0e20f5f`; native review `review-b147ae3b2618f346` approved and acknowledged.
+      Follow-ups (advisory): gap detection (search.py:660) misses edge omissions and assumes
+      consecutive numbering; skip gap fetches when a `consejeria` filter is absent from the
+      bulletin; OR-merge order with dateless bulletins.
 - [ ] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
 - [ ] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
       index search tool, index status.
@@ -105,6 +109,7 @@ Out of scope, deliberately:
 - Recon: /tmp/bome-recon (raw samples), Engram `bome-navaja/site-recon`.
 - `be43b03` chore: initialize repository (main); `edeee29` docs(odd) (feat/bome-mcp).
 - `bed0423` feat: add BOME client, CVE model and site parsers (task 2).
+- `0e20f5f` feat: add BOME search and article drill-down (task 3).
 - Incident 2026-09-23: the first two commits (`e696d7e`, `7886b43`) landed in a pre-existing
   empty repository at `/home/ubuntu/.git` (created 2026-09-11) because `bome-navaja` had no
   `.git` of its own. Fixed by `git init -b main` inside the project and recreating both commits.
