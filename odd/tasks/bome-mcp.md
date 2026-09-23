@@ -54,6 +54,16 @@ Out of scope, deliberately:
     are also sent; otherwise it silently lists the current-year bulletins (task 3 must enforce).
   - Calendar `end` is inclusive. `/buscar-cve` redirects even for non-existent CVEs (target
     then 404s), so resolution confirms the target. Year slider: `/api/bomes/{year}` (HTML).
+- Learned in task 3 (live-verified 2026-09-23, `/buscador-avanzado`):
+  - `from` is mandatory for text filtering; `to` is honoured. AND and "no contiene" apply
+    within ONE article sumario; OR is ignored by the site (so `buscar_articulos` runs one
+    site search per AND-group). Scopes can be mixed per term. "ñ" folds to "n".
+  - Numeric criteria are exact (bulletin 6416, article 1051, page 4784, year 2025).
+  - Counters use a thousands dot ("1.934").
+  - Bulletin pages can OMIT articles (BOME-B-2025-6294 hides 745, a personal-eventual cese);
+    the drill-down fetches numbering gaps from `/articulo/{n}`. Edge omissions are undetectable.
+  - Some sumario pages (e.g. 2025-6294) are free-form `<p>` HTML and parse to 0 entries:
+    task 5 must index from bulletin pages + gap fetch, not from the sumario view.
 
 ## Constraints
 
@@ -78,8 +88,10 @@ Out of scope, deliberately:
       Follow-ups (advisory, non-blocking): the `resolve_cve` confirmation GET follows
       redirects, so only the first hop is host-checked (client.py:293); sumario article CVEs
       are derived from the bulletin kind, not read from the page (parsers.py:463).
-- [ ] 3. Search: `buscar_bomes` (quick + advanced params) and `buscar_articulos` (drill-down
+- [x] 3. Search: `buscar_bomes` (quick + advanced params) and `buscar_articulos` (drill-down
       that returns the matching articles, bounded).
+      Verified: `162 passed, 9 skipped` offline; `9 passed` live; independent verify PASS.
+      Target question "personal eventual" AND "cese" → 12 articles in 12 BOMEs, no errors.
 - [ ] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
 - [ ] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
       index search tool, index status.

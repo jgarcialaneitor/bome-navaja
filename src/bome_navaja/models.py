@@ -69,6 +69,10 @@ class _JsonModel:
         return _jsonable(self)
 
 
+# Public name so other layers (search, index) can reuse the same JSON contract.
+JsonModel = _JsonModel
+
+
 @dataclass(frozen=True, slots=True)
 class BulletinRef(_JsonModel):
     """A bulletin as listed by the calendar API, the year slider or a search."""

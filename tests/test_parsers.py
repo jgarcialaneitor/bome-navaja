@@ -411,6 +411,17 @@ def test_search_page_zero_of_zero_counter() -> None:
     assert page.has_next is False
 
 
+def test_search_page_thousands_separator() -> None:
+    # Live: counts of 1,000 or more are printed with a dot, e.g. "1.934".
+    html = (
+        '<div class="page-search-result"><p class="lead">'
+        "Página 3 de 1.194. Mostrando 10 elementos de un total de 11.934 elementos."
+        "</p><ul></ul></div>"
+    )
+    page = parse_search_page(html)
+    assert (page.page, page.total_pages, page.total_results) == (3, 1194, 11934)
+
+
 # --------------------------------------------------------------------------- year slider
 
 

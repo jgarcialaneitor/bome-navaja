@@ -64,8 +64,9 @@ _CVE_IN_TEXT = re.compile(r"BOME-[A-Z]{1,2}-\d{4}-\d+", re.IGNORECASE)
 _BULLETIN_HREF = re.compile(r"/bome/(BOME-BX?-\d{4}-\d+)/?$", re.IGNORECASE)
 _INT = re.compile(r"\d+")
 _SEARCH_COUNTER = re.compile(
-    r"P[áa]gina\s+(\d+)\s+de\s+(\d+)\.\s*Mostrando\s+(\d+)\s+elementos?\s+"
-    r"de\s+un\s+total\s+de\s+(\d+)",
+    # Counts use "." as thousands separator ("un total de 1.934 elementos").
+    r"P[áa]gina\s+(\d[\d.]*)\s+de\s+(\d[\d.]*?)\.\s*Mostrando\s+(\d[\d.]*)\s+elementos?\s+"
+    r"de\s+un\s+total\s+de\s+(\d[\d.]*\d|\d)",
     re.IGNORECASE,
 )
 _SUMARIO_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*\.\s*")
@@ -534,7 +535,9 @@ def parse_search_page(html: str, *, base_url: str = BASE_URL) -> SearchPage:
             total_pages=1 if results else 0,
             total_results=len(results),
         )
-    page, total_pages, _shown, total = (int(value) for value in counter.groups())
+    page, total_pages, _shown, total = (
+        int(value.replace(".", "")) for value in counter.groups()
+    )
     return SearchPage(
         results=results,
         # "Página 0 de 0" (no hits) is normalised to page 1 of 0.
