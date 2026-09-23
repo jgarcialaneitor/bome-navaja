@@ -16,9 +16,20 @@ Nothing here creates directories. Empty or blank variables count as unset;
 a leading ``~`` in an override expands to ``home``. The home directory is
 only looked up when the chosen rule needs it; if it cannot be determined a
 :class:`~bome_navaja.models.BomeStorageError` asks for ``BOME_NAVAJA_DATA_DIR``.
-Relative ``BOME_NAVAJA_*`` overrides are resolved against the working
-directory at resolution time (the reason says so); a relative
-``XDG_DATA_HOME`` is ignored, as the XDG spec requires.
+Absoluteness is judged by the HOST filesystem (``Path(value).is_absolute()``),
+because these are real paths on the machine running the server: on Windows
+``/srv/bome`` has no drive and is therefore relative, even when ``platform``
+is injected as ``"linux"``. The injected ``platform`` only selects WHICH rule
+applies (``LOCALAPPDATA`` vs ``Library`` vs XDG). Rules:
+
+* ``~`` or ``~/x`` (also ``~\\x``) is joined to home and used as is: it is
+  anchored at home, never passed through ``abspath`` (it is absolute iff
+  home is).
+* Any other host-relative ``BOME_NAVAJA_*`` override is resolved against the
+  working directory at resolution time, and the reason says so.
+* A host-relative ``XDG_DATA_HOME`` is ignored, as the XDG spec requires
+  (a ``~`` value counts as anchored and is accepted).
+* ``LOCALAPPDATA`` is taken as the OS gives it (no absoluteness check).
 """
 
 from __future__ import annotations
@@ -65,18 +76,20 @@ class _Home:
         return self._home
 
 
-def _expand(value: str, home: _Home) -> Path:
+def _expand(value: str, home: _Home) -> tuple[Path, bool]:
+    """``(path, anchored)``: ``~`` / ``~/x`` are joined to home and count as anchored."""
     if value == "~":
-        return home()
+        return home(), True
     if value.startswith(("~/", "~\\")):
-        return home() / value[2:]
-    return Path(value)
+        return home() / value[2:], True
+    path = Path(value)
+    return path, path.is_absolute()
 
 
 def _override(value: str, name: str, home: _Home) -> tuple[Path, str]:
-    """An explicit ``BOME_NAVAJA_*`` path: ``~`` expanded, relative made absolute."""
-    path = _expand(value, home)
-    if path.is_absolute():
+    """An explicit ``BOME_NAVAJA_*`` path: ``~`` expanded, host-relative made absolute."""
+    path, anchored = _expand(value, home)
+    if anchored:
         return path, name
     return Path(os.path.abspath(path)), name + RELATIVE_NOTE
 
@@ -115,9 +128,9 @@ def data_dir(
         return lazy_home() / "Library" / "Application Support" / APP_NAME, "macOS default"
     xdg = _env(environ, "XDG_DATA_HOME")
     if xdg:
-        xdg_path = _expand(xdg, lazy_home)
+        xdg_path, anchored = _expand(xdg, lazy_home)
         # The XDG spec: a relative path in these variables is invalid; ignore it.
-        if xdg_path.is_absolute():
+        if anchored:
             return xdg_path / APP_NAME, "XDG_DATA_HOME"
     return lazy_home() / ".local" / "share" / APP_NAME, "XDG default"
 

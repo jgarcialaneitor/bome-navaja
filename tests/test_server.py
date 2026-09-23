@@ -460,27 +460,47 @@ def test_shared_client_is_created_once(site: Site, monkeypatch: pytest.MonkeyPat
 def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
     import mcp.types
 
+    import time
+
     env = {**os.environ, "BOME_NAVAJA_DATA_DIR": str(tmp_path / "datos")}
+    # Binary pipes: the MCP stdio transport writes UTF-8 whatever the platform
+    # (it re-wraps stdout's buffer), so each line is decoded strictly as UTF-8
+    # here instead of with the locale encoding (cp1252 on Windows).
     process = subprocess.Popen(
         [sys.executable, "-m", "bome_navaja.server"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         env=env,
-        text=True,
     )
-    lines: queue.Queue[str] = queue.Queue()
-    reader = threading.Thread(target=lambda: [lines.put(line) for line in process.stdout], daemon=True)
+    lines: queue.Queue[str | BaseException] = queue.Queue()
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        try:
+            for raw_line in process.stdout:
+                lines.put(raw_line.decode("utf-8", errors="strict"))
+        except BaseException as exc:  # surface reader failures in the test thread
+            lines.put(exc)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
     reader.start()
+    deadline = time.monotonic() + 60
+
+    def next_line() -> str:
+        item = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def send(message: dict) -> None:
         assert process.stdin is not None
-        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
         process.stdin.flush()
 
     def receive(message_id: int) -> dict:
         while True:
-            raw = lines.get(timeout=30)
+            raw = next_line()
             message = json.loads(raw)  # every stdout line must be JSON-RPC
             assert message.get("jsonrpc") == "2.0", raw
             if message.get("id") == message_id:
@@ -499,7 +519,9 @@ def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
         })
         initialized = receive(1)
         assert initialized["result"]["serverInfo"]["name"] == "bome-navaja"
-        assert "buscar_en_indice" in initialized["result"].get("instructions", "")
+        instructions = initialized["result"].get("instructions", "")
+        assert "buscar_en_indice" in instructions
+        assert "Autónoma" in instructions  # non-ASCII survives the UTF-8 round trip
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         listed = receive(2)
@@ -513,7 +535,10 @@ def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
             process.kill()
     reader.join(timeout=5)
     while not lines.empty():
-        json.loads(lines.get())  # anything left on stdout is JSON too
+        leftover = lines.get_nowait()
+        if isinstance(leftover, BaseException):
+            raise leftover
+        json.loads(leftover)  # anything left on stdout is JSON too
     assert not (tmp_path / "datos" / "sumarios.sqlite3").exists()
 
 

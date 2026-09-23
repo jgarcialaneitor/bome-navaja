@@ -9,6 +9,15 @@ import pytest
 from bome_navaja.paths import APP_NAME, data_dir, index_path, pdf_dir
 
 HOME = Path("/home/ana")
+"""Only joined to, never checked for absoluteness, so a POSIX literal works on every host."""
+
+ROOT = Path(Path(__file__).resolve().anchor)
+"""Host filesystem root ("/" on Linux/macOS, e.g. "D:\\" on Windows): paths built from it
+are absolute on the host, which is what the override and XDG rules check."""
+
+
+def host_abs(*parts: str) -> Path:
+    return ROOT.joinpath(*parts)
 
 
 def test_app_name() -> None:
@@ -25,8 +34,9 @@ def test_linux_default() -> None:
 
 
 def test_linux_xdg_data_home() -> None:
-    path, reason = data_dir(platform="linux", environ={"XDG_DATA_HOME": "/data/xdg"}, home=HOME)
-    assert path == Path("/data/xdg/bome-navaja")
+    xdg = host_abs("data", "xdg")
+    path, reason = data_dir(platform="linux", environ={"XDG_DATA_HOME": str(xdg)}, home=HOME)
+    assert path == xdg / "bome-navaja"
     assert reason == "XDG_DATA_HOME"
 
 
@@ -64,12 +74,12 @@ def test_windows_without_localappdata() -> None:
 @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
 def test_data_dir_env_override_wins_everywhere(platform: str) -> None:
     environ = {
-        "BOME_NAVAJA_DATA_DIR": "/srv/bome",
+        "BOME_NAVAJA_DATA_DIR": str(host_abs("srv", "bome")),
         "LOCALAPPDATA": "C:/x",
         "XDG_DATA_HOME": "/x",
     }
     path, reason = data_dir(platform=platform, environ=environ, home=HOME)
-    assert path == Path("/srv/bome")
+    assert path == host_abs("srv", "bome")
     assert reason == "BOME_NAVAJA_DATA_DIR"
 
 
@@ -101,15 +111,15 @@ def test_pdf_dir_defaults_under_data_dir() -> None:
 
 
 def test_pdf_dir_env_override() -> None:
-    environ = {"BOME_NAVAJA_PDF_DIR": "/pdfs", "BOME_NAVAJA_DATA_DIR": "/data"}
+    environ = {"BOME_NAVAJA_PDF_DIR": str(host_abs("pdfs")), "BOME_NAVAJA_DATA_DIR": str(host_abs("data"))}
     path, reason = pdf_dir(platform="win32", environ=environ, home=HOME)
-    assert path == Path("/pdfs")
+    assert path == host_abs("pdfs")
     assert reason == "BOME_NAVAJA_PDF_DIR"
 
 
 def test_pdf_dir_follows_data_dir_override() -> None:
-    path, reason = pdf_dir(platform="darwin", environ={"BOME_NAVAJA_DATA_DIR": "/data"}, home=HOME)
-    assert path == Path("/data/pdfs")
+    path, reason = pdf_dir(platform="darwin", environ={"BOME_NAVAJA_DATA_DIR": str(host_abs("data"))}, home=HOME)
+    assert path == host_abs("data", "pdfs")
     assert reason == "data dir (BOME_NAVAJA_DATA_DIR)"
 
 
@@ -129,10 +139,10 @@ def _no_home() -> Path:
 
 def test_home_is_not_needed_when_an_absolute_override_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "home", staticmethod(_no_home))
-    path, reason = data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": "/srv/bome"})
-    assert (path, reason) == (Path("/srv/bome"), "BOME_NAVAJA_DATA_DIR")
-    pdfs, _ = pdf_dir(platform="linux", environ={"BOME_NAVAJA_PDF_DIR": "/pdfs"})
-    assert pdfs == Path("/pdfs")
+    path, reason = data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": str(host_abs("srv", "bome"))})
+    assert (path, reason) == (host_abs("srv", "bome"), "BOME_NAVAJA_DATA_DIR")
+    pdfs, _ = pdf_dir(platform="linux", environ={"BOME_NAVAJA_PDF_DIR": str(host_abs("pdfs"))})
+    assert pdfs == host_abs("pdfs")
     windows, _ = data_dir(platform="win32", environ={"LOCALAPPDATA": r"C:\L"})
     assert windows == Path(r"C:\L") / "bome-navaja"
 
@@ -160,3 +170,22 @@ def test_relative_overrides_are_made_absolute(monkeypatch: pytest.MonkeyPatch, t
     # The XDG spec says a relative XDG_DATA_HOME is invalid and must be ignored.
     xdg, xdg_reason = data_dir(platform="linux", environ={"XDG_DATA_HOME": "xdg"}, home=HOME)
     assert (xdg, xdg_reason) == (HOME / ".local" / "share" / "bome-navaja", "XDG default")
+
+
+# --------------------------------------------------------------------------- Windows CI: host absoluteness
+
+
+def test_tilde_override_is_anchored_at_home_never_at_the_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    relative_home = Path("perfil")  # absolute iff home is: here it is not
+    path, reason = data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": "~/bome"}, home=relative_home)
+    assert (path, reason) == (relative_home / "bome", "BOME_NAVAJA_DATA_DIR")
+    pdfs, pdf_reason = pdf_dir(platform="win32", environ={"BOME_NAVAJA_PDF_DIR": "~"}, home=relative_home)
+    assert (pdfs, pdf_reason) == (relative_home, "BOME_NAVAJA_PDF_DIR")
+
+
+def test_tilde_xdg_data_home_is_accepted() -> None:
+    path, reason = data_dir(platform="linux", environ={"XDG_DATA_HOME": "~/xdg"}, home=Path("perfil"))
+    assert (path, reason) == (Path("perfil") / "xdg" / "bome-navaja", "XDG_DATA_HOME")
