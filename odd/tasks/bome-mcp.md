@@ -126,7 +126,13 @@ Out of scope, deliberately:
       Verified: `306 passed, 15 skipped` offline; 7 live passed; independent verify PASS
       (0 unexpected exceptions in a 400-string query fuzz; lease race and mid-save crash
       probes OK). Its medium finding (a raw sqlite error made the whole sync `fallido`)
-      and 4 lows were fixed.
+      and 4 lows were fixed. Commit `aec4609`; Windows CI 306 passed (official CPython has
+      FTS5); native review `review-003756d6afb01a15` approved and acknowledged.
+      Follow-ups (advisory): a bulletin whose hidden-article fetch failed is stored as
+      `indexado` with a note and is never retried outside the recent-days window
+      (sync.py:310); the lease heartbeat is renewed only between bulletins (sync.py:277).
+      Product option: FTS5 `trigram` over the normalised text would give the same substring
+      semantics as the site (bigger index, terms under 3 characters need a fallback).
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
@@ -139,6 +145,7 @@ Out of scope, deliberately:
 - `bed0423` feat: add BOME client, CVE model and site parsers (task 2).
 - `0e20f5f` feat: add BOME search and article drill-down (task 3).
 - `b7f6e97` feat: add PDF cache and paginated document reading (task 4).
+- `aec4609` feat: add local SQLite FTS5 index of article sumarios (task 5).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
