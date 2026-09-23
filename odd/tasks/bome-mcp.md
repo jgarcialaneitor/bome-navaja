@@ -73,7 +73,11 @@ Out of scope, deliberately:
 - [x] 2. Client + models + parsers: calendar, bulletin page tree, article page, sumario,
       section APIs, CVE resolution, search-results parsing and pagination.
       Verified: `106 passed, 4 skipped` offline; `4 passed` live (`BOME_NAVAJA_LIVE=1`);
-      independent verify PASS, its 2 medium + 3 low findings fixed. Commit: see Evidence.
+      independent verify PASS, its 2 medium + 3 low findings fixed. Commit `bed0423`;
+      native review `review-6fa20ed52d3e2aa4` approved and acknowledged (1 lens, reliability).
+      Follow-ups (advisory, non-blocking): the `resolve_cve` confirmation GET follows
+      redirects, so only the first hop is host-checked (client.py:293); sumario article CVEs
+      are derived from the bulletin kind, not read from the page (parsers.py:463).
 - [ ] 3. Search: `buscar_bomes` (quick + advanced params) and `buscar_articulos` (drill-down
       that returns the matching articles, bounded).
 - [ ] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
@@ -88,6 +92,7 @@ Out of scope, deliberately:
 
 - Recon: /tmp/bome-recon (raw samples), Engram `bome-navaja/site-recon`.
 - `be43b03` chore: initialize repository (main); `edeee29` docs(odd) (feat/bome-mcp).
+- `bed0423` feat: add BOME client, CVE model and site parsers (task 2).
 - Incident 2026-09-23: the first two commits (`e696d7e`, `7886b43`) landed in a pre-existing
   empty repository at `/home/ubuntu/.git` (created 2026-09-11) because `bome-navaja` had no
   `.git` of its own. Fixed by `git init -b main` inside the project and recreating both commits.
