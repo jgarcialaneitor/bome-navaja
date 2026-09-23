@@ -80,6 +80,8 @@ Out of scope, deliberately:
 - [x] 1. Scaffold: pyproject (package `bome_navaja`, scripts `bome-navaja-mcp`), MIT license,
       pytest config, CI (Linux gating + Windows), README skeleton, fixtures.
       Verified: `15 passed` (`uv run pytest`). Commit `409df1f`.
+      Native review not possible: `lens_context_budget_exceeded` (mostly fixtures + uv.lock).
+      User decision 2026-09-23: leave it unreviewed rather than rewrite history.
 - [x] 2. Client + models + parsers: calendar, bulletin page tree, article page, sumario,
       section APIs, CVE resolution, search-results parsing and pagination.
       Verified: `106 passed, 4 skipped` offline; `4 passed` live (`BOME_NAVAJA_LIVE=1`);
