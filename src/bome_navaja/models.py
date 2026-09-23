@@ -67,6 +67,18 @@ class BomeStorageError(BomeError):
         self.path = path
 
 
+class BomeIndexUnavailableError(BomeError):
+    """The local sumario index cannot be used (e.g. SQLite built without FTS5)."""
+
+    error_code = "indice_no_disponible"
+
+
+class BomeIndexVersionError(BomeIndexUnavailableError):
+    """The index file has a newer or unknown schema version."""
+
+    error_code = "indice_version_incompatible"
+
+
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}

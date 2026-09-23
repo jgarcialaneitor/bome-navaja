@@ -569,7 +569,7 @@ def buscar_articulos(
             )
             continue
         found = 0
-        for candidate in _bulletin_candidates(
+        for candidate in iter_articulos_del_boletin(
             client, bulletin, errors, consejeria=consejeria, numero_articulo=numero_articulo
         ):
             if not matches(candidate.sumario, terms):
@@ -616,15 +616,32 @@ def _split_heading(heading: str | None) -> tuple[str, str, str]:
     return (parts[0], parts[1], " - ".join(parts[2:]))
 
 
-def _bulletin_candidates(
+def articulos_del_boletin(
+    client: BomeClient, bulletin: Bulletin
+) -> tuple[tuple[ArticuloEncontrado, ...], tuple[ErrorBusqueda, ...]]:
+    """Every article of a bulletin, including those its page does not list.
+
+    Eager form of :func:`iter_articulos_del_boletin` without filters, shared
+    by the drill-down and the local sumario index. Returns the articles in
+    number order and the errors met while fetching hidden articles.
+    """
+    errors: list[ErrorBusqueda] = []
+    articles = tuple(iter_articulos_del_boletin(client, bulletin, errors))
+    return articles, tuple(errors)
+
+
+def iter_articulos_del_boletin(
     client: BomeClient,
     bulletin: Bulletin,
     errors: list[ErrorBusqueda],
     *,
-    consejeria: int | None,
-    numero_articulo: int | None,
+    consejeria: int | None = None,
+    numero_articulo: int | None = None,
 ) -> Iterator[ArticuloEncontrado]:
     """Articles of a bulletin in number order, passing the local id filters.
+
+    Lazy: hidden articles are only fetched when the caller iterates to them.
+    Errors are appended to ``errors``.
 
     Article numbers inside a bulletin are consecutive, so a gap in the listed
     numbers is an article the bulletin page does not render (verified live:
@@ -759,6 +776,8 @@ __all__ = [
     "ErrorBusqueda",
     "ResultadoBusquedaArticulos",
     "ResultadoBusquedaBomes",
+    "articulos_del_boletin",
     "buscar_articulos",
     "buscar_bomes",
+    "iter_articulos_del_boletin",
 ]

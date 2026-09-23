@@ -71,6 +71,13 @@ Out of scope, deliberately:
     265 KB / 4; page PDF 66 KB / 1. All recent PDFs have a text layer.
   - Article CVEs map to their bulletin only through `/buscar-cve` (302 to
     `/bome/{B}/articulo/{n}`); a page CVE resolves to the article URL + `#pagina-N`.
+- Learned in task 5 (live-verified 2026-09-23):
+  - Sync throughput ≈ 0.61 s per bulletin at `polite_delay=0.5` → full sync of ~1935
+    bulletins ≈ 20–25 min. Index size ≈ 1.3 MB per 100 bulletins (≈ 25 MB total).
+  - July 2025 (12 bulletins) syncs in 7.5 s with 14 GETs, including hidden article A-2025-745.
+  - The index matches WHOLE WORDS (FTS5 unicode61 over `normalize(sumario)`), while the site
+    and `buscar_articulos` match substrings: "cese" does not find "ceses"; use `cese*`.
+    Every index result carries a note saying so.
 
 ## Constraints
 
@@ -114,8 +121,12 @@ Out of scope, deliberately:
       Follow-up (advisory, paths.py:51): `Path.home()` is evaluated even when an env override
       is set and raises a non-Bome `RuntimeError` without a resolvable home; relative env
       overrides depend on the client's cwd. Handle both when task 6 reports `estado_servidor`.
-- [ ] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
+- [x] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
       index search tool, index status.
+      Verified: `306 passed, 15 skipped` offline; 7 live passed; independent verify PASS
+      (0 unexpected exceptions in a 400-string query fuzz; lease race and mid-save crash
+      probes OK). Its medium finding (a raw sqlite error made the whole sync `fallido`)
+      and 4 lows were fixed.
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)

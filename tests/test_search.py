@@ -517,3 +517,38 @@ def test_first_search_page_failure_propagates(site: Site) -> None:
 
     with site.client() as client, pytest.raises(BomeHTTPError):
         buscar_articulos(client, texto="cese")
+
+
+# --------------------------------------------------------------------------- articulos_del_boletin
+
+
+def test_articulos_del_boletin_lists_every_article(site: Site, fixtures_dir: Path) -> None:
+    from bome_navaja.parsers import parse_bulletin_page
+    from bome_navaja.search import articulos_del_boletin
+
+    bulletin = parse_bulletin_page((fixtures_dir / "b6416.html").read_text("utf-8"), "BOME-B-2026-6416")
+    with site.client() as client:
+        articles, errors = articulos_del_boletin(client, bulletin)
+    assert [a.numero for a in articles] == list(range(1050, 1063))
+    assert errors == ()
+    assert site.requests == []
+    assert articles[0].consejeria == "CONSEJO DE GOBIERNO"
+    assert all(a.listado_en_bome for a in articles)
+
+
+def test_articulos_del_boletin_fetches_hidden_articles(site: Site, fixtures_dir: Path) -> None:
+    from bome_navaja.parsers import parse_bulletin_page
+    from bome_navaja.search import articulos_del_boletin
+
+    html = _without_article((fixtures_dir / "b6416.html").read_text("utf-8"), "BOME-A-2026-1051")
+    html = _without_article(html, "BOME-A-2026-1056")
+    bulletin = parse_bulletin_page(html, "BOME-B-2026-6416")
+    article_body = (fixtures_dir / "art1051.html").read_bytes()
+    site.bulletins["BOME-B-2026-6416/articulo/1051"] = lambda: httpx.Response(200, content=article_body)
+    with site.client() as client:
+        articles, errors = articulos_del_boletin(client, bulletin)
+    assert [a.numero for a in articles] == [n for n in range(1050, 1063) if n != 1056]
+    hidden = next(a for a in articles if a.numero == 1051)
+    assert hidden.listado_en_bome is False
+    (error,) = errors
+    assert (error.etapa, error.cve, error.error_code) == ("articulo", "BOME-A-2026-1056", "no_encontrado")
