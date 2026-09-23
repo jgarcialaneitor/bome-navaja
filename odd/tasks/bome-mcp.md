@@ -80,4 +80,5 @@ Out of scope, deliberately:
 - Incident 2026-09-23: the first two commits (`e696d7e`, `7886b43`) landed in a pre-existing
   empty repository at `/home/ubuntu/.git` (created 2026-09-11) because `bome-navaja` had no
   `.git` of its own. Fixed by `git init -b main` inside the project and recreating both commits.
-  Cleaning the stray refs/config in `/home/ubuntu/.git` is pending the user's decision.
+  User decided to delete `/home/ubuntu/.git` entirely; verified first that no project had
+  history there (no commits before ours, no linked worktrees), then removed it.
