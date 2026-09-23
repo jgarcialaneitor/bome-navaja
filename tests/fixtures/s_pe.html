@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8"/>
+    <title> Buscador Avanzado de BOMES  | BOME</title>
+    <link rel="shortcut icon" href="/favicon.ico"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta name="description" content="Boletín Oficial de la Ciudad Autónoma de Melilla"/>
+    <meta name="keywords" content="serglobin,bome,melilla,ciudad,autónoma"/>
+    <meta name="author" content="Serglobin SL"/>
+    <link rel="manifest" href="/manifest.json">
+    <link href="/assets/css/plugins.css" rel="stylesheet" type="text/css"/>
+    <link href="/assets/css/style.css" rel="stylesheet" type="text/css"/>
+    <link href="/assets/css/colors/aqua.css" rel="stylesheet" type="text/css">
+    <link rel="preload" href="/assets/css/fonts/dm.css" as="style" onload="this.rel='stylesheet'">
+    <link rel="stylesheet" href="/assets/custom/build/app-623.css?v=a3aa75d2"><link rel="stylesheet" href="/assets/custom/build/app-app.css?v=a3aa75d2">
+    <script>
+        GA_TRACKING_ID = 'UA-99767688-5';
+    </script>
+    <script>
+        // Frame-busting to prevent site from being loaded within a frame without permission (click-jacking)
+        if (window.top !== window.self) {
+            window.top.location.replace(window.self.location.href);
+        }
+    </script>
+        </head>
+<body>
+<div class="content-wrapper">
+    <header class="wrapper bg-light pt-1">
+    <nav class="navbar navbar-main navbar-expand-lg classic transparent navbar-light">
+        <div class="container flex-lg-row flex-nowrap align-items-center">
+            <div class="navbar-brand w-md-100">
+                <a href="/">
+                    <img src="/images/logo.png" width="450" alt="Comunidad Autónoma de Melilla - Boletín Oficial" />
+                </a>
+            </div>
+            <div class="navbar-collapse offcanvas offcanvas-nav offcanvas-start" id="offcanvas-nav" aria-labelledby="offcanvas-nav-label">
+                <div class="offcanvas-header d-lg-none">
+                    <h3 class="text-white fs-30 mb-0" id="offcanvas-nav-label">Menú</h3>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+                </div>
+                <div class="offcanvas-body ms-lg-auto d-flex flex-column h-100">
+                    <ul class="navbar-nav">
+                        <li class="nav-item">
+                            <a class="nav-link" href="/">BOMES</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#" data-bs-toggle="modal" data-bs-target="#modal-subscription">SUBSCRIPCIÓN</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/preguntas-frecuentes">
+                                FAQ
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/enlaces-de-interes">
+                                ENLACES
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#" data-bs-toggle="offcanvas" data-bs-target="#offcanvas-search">
+                                CVE
+                            </a>
+                        </li>
+                    </ul>
+                                    </div>
+            </div>
+            <div class="navbar-other ms-lg-10">
+                <ul class="navbar-nav flex-row align-items-center ms-auto">
+                    <li class="nav-item d-none d-md-block">
+                        <a href="#" class="btn btn-sm btn-brand rounded-pill" data-bs-toggle="modal" data-bs-target="#modal-search">
+                            <i class="uil uil-search me-2"></i> Buscar
+                        </a>
+                    </li>
+                    <li class="nav-item d-lg-none">
+                        <button class="hamburger"
+                                data-bs-toggle="offcanvas"
+                                data-bs-target="#offcanvas-nav"><span></span></button>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+    <div class="modal fade" id="modal-subscription" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-sm">
+        <div class="modal-content text-center">
+            <div class="modal-body">
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                <h2 class="mb-3 text-start">Subscripción</h2>
+                <p class="lead mb-6 text-start">
+                    Recibe un email cuando se publique un nuevo boletín.
+                    <a class="text-brand hover" href="/preguntas-frecuentes#faq-subscription">Más información</a>
+                </p>
+                <form action="https://bomemelilla.us17.list-manage.com/subscribe/post?u=fdc29325ce351eaae75260161&id=8df1fe83fc"
+                      name="mc-embedded-subscribe-form"
+                      method="post"
+                      target="_blank"
+                      class="text-start mb-3">
+                    <div class="form-floating mb-4">
+                        <input id="mce-EMAIL" type="email" name="EMAIL" class="form-control" required>
+                        <label for="mce-EMAIL">Correo Electrónico</label>
+                    </div>
+                    <input type="hidden" name="b_fdc29325ce351eaae75260161_8df1fe83fc">
+                    <input class="btn btn-brand rounded-pill mb-2" type="submit" value="Subscribirse" name="subscribe" id="mc-embedded-subscribe">
+                </form>
+                <p class="mb-1 text-center">
+                    <a class="hover text-brand" href="https://mailchimp.com/legal/privacy/" target="blank">Política de Privacidad de MailChimp</a>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+
+    <div class="modal fade" id="modal-search" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-sm">
+        <div class="modal-content text-center">
+            <div class="modal-body">
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                <h2 class="mb-3 text-start">Buscador</h2>
+                <form class="text-start mb-3" action="/buscar" method="get">
+                    <div class="form-floating mb-4">
+                        <input type="date" class="form-control" name="from" id="fechaDesde" value="2026-01-01" pattern="\d{2}-\d{2}-\d{4}">
+                        <label for="fechaDesde">Fecha Desde</label>
+                    </div>
+                    <div class="form-floating mb-4">
+                        <input type="date" class="form-control" name="to" id="fechaHasta" value="2026-09-23" pattern="\d{2}-\d{2}-\d{4}">
+                        <label for="fechaHasta">Fecha Hasta</label>
+                    </div>
+                    <div class="form-select-wrapper mb-4">
+                        <select name="tipo" class="form-select">
+                            <option value="1" >Sumario de artículo</option>
+                            <option value="2" >Contenido del BOME</option>
+                            <option value="3" >Nº Página del BOME</option>
+                            <option value="4" >Nº Artículo del BOME</option>
+                        </select>
+                    </div>
+                    <div class="form-floating mb-4">
+                        <input id="contenido" name="contenido" type="text" class="form-control" placeholder="Contenido">
+                        <label for="contenido">Contenido</label>
+                    </div>
+                    <div class="form-floating mb-4">
+                        <input id="cve" name="cve" type="text" class="form-control" placeholder="Nº BOME">
+                        <label for="cve">Nº BOME</label>
+                    </div>
+                    <button type="submit" class="btn btn-brand rounded-pill btn-login w-100 mb-2">Buscar</button>
+                                    </form>
+                <p class="mb-1">
+                    <a href="/buscador-avanzado" class="hover text-orange">Buscador avanzado</a>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+
+    <div class="offcanvas offcanvas-top bg-light" id="offcanvas-search" data-bs-scroll="true">
+    <div class="container d-flex flex-row py-6">
+        <form class="search-form w-100" method="get" action="/buscar-cve" autocomplete="off">
+            <input placeholder="BOME-L-AAAA-NNNN"
+                   title="Formato BOME-L-AAAA-NNNN"
+                   pattern="BOME-[A-Z]{1,2}-\d{4,4}-\d{1,}"
+                   id="search-form"
+                   name="cve"
+                   aria-label="Bome CVE"
+                   type="text"
+                   class="form-control"
+                   required>
+        </form>
+        <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+</div>
+
+</header>
+
+    
+    <section class="wrapper bg-soft-primary angled lower-start">
+        <div class="container pt-10 pb-19 pt-md-12 pb-md-20 text-center">
+            <div class="row">
+                <div class="col-md-9 col-lg-7 col-xl-5 mx-auto">
+                    <h1 class="display-1 mb-3">Buscador Avanzado</h1>
+                                                <nav class="d-inline-block" aria-label="breadcrumb">
+        <ol class="breadcrumb breadcrumb-separatorless">
+            <li class="breadcrumb-item text-gray-700 fw-bold">
+                <a href="/" class="text-gray-600">
+                    <i class="uil uil-home"></i> Bomes
+                </a>
+            </li>
+                                                                        <li class="breadcrumb-item active text-gray-500" aria-current="true">
+                             Buscador Avanzado de BOMES 
+                        </li>
+                                                        </ol>
+    </nav>
+
+                </div>
+            </div>
+        </div>
+    </section>
+    <section class="wrapper bg-light wrapper-page-search">
+        <div class="container pb-14 pb-md-100">
+            <div class="row">
+                <div class="col-lg-10 mx-auto">
+                    <div class="mt-n17">
+                        <div class="card shadow-lg">
+                            <div class="card-body">
+                                <div class="row">
+                                    <div class="col-12">
+                                        <div class="page-search-form">
+                                            <div id="accordion-1" class="accordion-wrapper">
+    <div class="card accordion-item">
+        <div class="card-header" id="accordion-heading-1-1">
+            <h2>
+                <button class="collapsed" data-bs-toggle="collapse"
+                        data-bs-target="#accordion-collapse-1-1" aria-expanded="false"
+                        aria-controls="accordion-collapse-1-1"> Formulario de búsqueda
+                </button>
+            </h2>
+        </div>
+        <div id="accordion-collapse-1-1" class="collapse " aria-labelledby="accordion-heading-1-1"
+             data-bs-target="#accordion-1">
+            <div class="card-body">
+                <form class="text-start mb-3" action="/buscador-avanzado" method="get">
+                    <div class="row">
+    <h3>General</h3>
+    <div class="col-12 col-md-4">
+        <div class="form-floating mb-4">
+            <input placeholder="BOME-L-AAAA-NNNN"
+                   title="Formato BOME-L-AAAA-NNNN"
+                   pattern="BOME-[A-Z]{1,2}-\d{4,4}-\d{1,}"
+                   id="cve"
+                   name="cve"
+                   type="text"
+                   value=""
+                   class="form-control">
+            <label for="cve">BOME-L-AAAA-NNNN</label>
+        </div>
+    </div>
+    <div class="col-12 col-md-4">
+        <div class="form-floating mb-4">
+            <input type="date" class="form-control" name="from" id="fechaDesde" value="1990-01-01"
+                   pattern="\d{2}-\d{2}-\d{4}">
+            <label for="fechaDesde">Fecha Desde</label>
+        </div>
+    </div>
+    <div class="col-12 col-md-4">
+        <div class="form-floating mb-4">
+            <input type="date" class="form-control" name="to" id="fechaHasta" value="2026-09-23"
+                   pattern="\d{2}-\d{2}-\d{4}">
+            <label for="fechaHasta">Fecha Hasta</label>
+        </div>
+    </div>
+</div>
+
+                    <div class="row">
+    <h3>Sección</h3>
+    <div class="col-md-4">
+        <div class="form-floating mb-4">
+            <div class="form-select-wrapper mb-4">
+                <select name="departamento" class="form-select" aria-label="Departamento">
+                    <option value="">Selecciona un departamento</option>
+                                            <option value="52" >
+                            AGENCIA TRIBUTARIA
+                        </option>
+                                            <option value="6" >
+                            AUDIENCIA PROVINCIAL DE MÁLAGA
+                        </option>
+                                            <option value="38" >
+                            AYUNTAMIENTO DE CHIPIONA
+                        </option>
+                                            <option value="37" >
+                            AYUNTAMIENTO DE MOTRIL
+                        </option>
+                                            <option value="43" >
+                            AYUNTAMIENTO DE PÁJARA (FUERTEVENTURA)
+                        </option>
+                                            <option value="1" >
+                            CIUDAD AUTÓNOMA DE MELILLA
+                        </option>
+                                            <option value="46" >
+                            CONSEJERÍA DE ADMINISTRACIONES PÚBLICAS
+                        </option>
+                                            <option value="47" >
+                            CONSEJERÍA DE BIENESTAR SOCIAL Y SANIDAD
+                        </option>
+                                            <option value="48" >
+                            CONSEJERÍA DE FOMENTO, JUVENTUD Y DEPORTES
+                        </option>
+                                            <option value="25" >
+                            CONSEJERÍA DE HACIENDA Y ADMINISTRACIONES PÚBLICAS
+                        </option>
+                                            <option value="16" >
+                            DELEGACIÓN DE MELILLA
+                        </option>
+                                            <option value="33" >
+                            DELEGACIÓN DEL GOBIERNO EN CANARIAS
+                        </option>
+                                            <option value="15" >
+                            DELEGACIÓN DEL GOBIERNO EN MELILLA
+                        </option>
+                                            <option value="36" >
+                            EMPRESA MUNICIPAL DE LA VIVIENDA Y SUELO DE MELILLA S.A.
+                        </option>
+                                            <option value="41" >
+                            EMVISMESA
+                        </option>
+                                            <option value="45" >
+                            I N M U S A
+                        </option>
+                                            <option value="30" >
+                            ILUSTRE COLEGIO NOTARIAL ANDALUCÍA
+                        </option>
+                                            <option value="9" >
+                            INSTITUTO NACIONAL DE ESTADÍSTICAS
+                        </option>
+                                            <option value="26" >
+                            JUNTA ELECTORAL DE ZONA Y PROVINCIAL DE MELILLA
+                        </option>
+                                            <option value="19" >
+                            MINIATERIO DE EDUCACIÓN,CULTURA Y DEPORTE
+                        </option>
+                                            <option value="7" >
+                            MINISTERIO DE AGRICULTURA Y PESCA, ALIMENTACION Y MEDIO AMBIENTE
+                        </option>
+                                            <option value="22" >
+                            MINISTERIO DE AGRICULTURA, ALIMENTACIÓN Y MEDIO AMBIENTE
+                        </option>
+                                            <option value="17" >
+                            MINISTERIO DE DEFENSA
+                        </option>
+                                            <option value="39" >
+                            MINISTERIO DE ECONOMÍA Y HACIENDA
+                        </option>
+                                            <option value="10" >
+                            MINISTERIO DE EDUCACIÓN Y FORMACIÓN PROFESIONAL
+                        </option>
+                                            <option value="2" >
+                            MINISTERIO DE EMPLEO Y SEGURIDAD SOCIAL
+                        </option>
+                                            <option value="5" >
+                            MINISTERIO DE FOMENTO
+                        </option>
+                                            <option value="14" >
+                            MINISTERIO DE HACIENDA
+                        </option>
+                                            <option value="23" >
+                            MINISTERIO DE HACIENDA Y ADMINISTRACIONES PÚBLICAS
+                        </option>
+                                            <option value="34" >
+                            MINISTERIO DE HACIENDA Y ADMINISTRACIONES PÚBLICAS
+                        </option>
+                                            <option value="44" >
+                            MINISTERIO DE HACIENDA Y ADMINISTRACIONES PUBLICAS
+                        </option>
+                                            <option value="28" >
+                            Ministerio de Hacienda y función públ
+                        </option>
+                                            <option value="29" >
+                            Ministerio de Hacienda y función pública
+                        </option>
+                                            <option value="55" >
+                            MINISTERIO DE HACIENDA Y FUNCIÓN PÚBLICA
+                        </option>
+                                            <option value="57" >
+                            MINISTERIO DE HACIENDA Y FUNCIÓN PÚBLICA
+                        </option>
+                                            <option value="3" >
+                            MINISTERIO DE JUSTICIA
+                        </option>
+                                            <option value="35" >
+                            MINISTERIO DE POLÍTICA TERRITORIAL Y ADMINISTRACIÓN PÚBLICA
+                        </option>
+                                            <option value="11" >
+                            MINISTERIO DE POLÍTICA TERRITORIAL Y FUNCIÓN PÚBLICA
+                        </option>
+                                            <option value="24" >
+                            MINISTERIO DE SANIDAD, SERVICIOS SOCIALES E IGUALDAD
+                        </option>
+                                            <option value="56" >
+                            MINISTERIO DE TRABAJO Y ECONOMÍA SOCIAL
+                        </option>
+                                            <option value="59" >
+                            MINISTERIO DE TRANSPORTES Y MOVILIDAD SOSTENIBLE
+                        </option>
+                                            <option value="54" >
+                            MINISTERIO DE TRANSPORTES, MOVILIDAD Y AGENCIA TRIBUTARIA
+                        </option>
+                                            <option value="53" >
+                            MINISTERIO DE TRANSPORTES, MOVILIDAD Y AGENDA URBANA
+                        </option>
+                                            <option value="51" >
+                            MINISTERIO DEL INTERIOR
+                        </option>
+                                            <option value="13" >
+                            MINISTERIO PARA LA TRAMITACIÓN ECOLÓGICA
+                        </option>
+                                            <option value="8" >
+                            MINISTERIO PARA LA TRANSICIÓN ECOLÓGICA
+                        </option>
+                                            <option value="31" >
+                            OFICINA DEL CENSO ELECTORAL
+                        </option>
+                                            <option value="42" >
+                            PARTICULARES
+                        </option>
+                                            <option value="49" >
+                            PATRONATO DE TURISMO DE MELILLA
+                        </option>
+                                            <option value="12" >
+                            PRESIDENCIA DEL GOBIERNO
+                        </option>
+                                            <option value="32" >
+                            PROYECTO MELILLA S.A.U.
+                        </option>
+                                            <option value="58" >
+                            SUBDELEGACIÓN DEL GOBIERNO EN SEVILLA
+                        </option>
+                                            <option value="27" >
+                            TRIBUNAL DE CUENTAS
+                        </option>
+                                            <option value="50" >
+                            UNED
+                        </option>
+                                            <option value="18" >
+                            UNIVERSIDAD DE GRANADA
+                        </option>
+                                    </select>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="form-floating mb-4">
+            <div class="form-select-wrapper mb-4">
+                <select name="consejeria" class="form-select" aria-label="Consejería">
+                    <option value="">Selecciona una consejería</option>
+                                    </select>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="form-floating mb-4">
+            <div class="form-select-wrapper mb-4">
+                <select name="organismo" class="form-select" aria-label="Organismo">
+                    <option value="">Selecciona un organismo</option>
+                                    </select>
+            </div>
+        </div>
+    </div>
+</div>
+
+                    
+
+<div class="form-collection form-collection--contenido mt-5 mb-10">
+    <h3 class="form-collection__title h3">Contenido</h3>
+                            <div class="form-collection__collection">
+        <div class="row align-items-center">
+            <div class="col-md-4">
+                <div class="form-select-wrapper mb-4">
+                    <select name="contenido[0][type]" class="form-select" aria-label="tipo de contenido">
+                        <option value="pagina" >
+                            Contenido de la página
+                        </option>
+                        <option value="sumario_articulo" selected>
+                            Sumario del articulo
+                        </option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="form-select-wrapper mb-4">
+                    <select name="contenido[0][like]" class="form-select" aria-label="¿Contiene?">
+                        <option value="like" selected>Contiene</option>
+                        <option value="nlike" >No contiene</option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="form-floating mb-4">
+                    <input placeholder="Contenido"
+                           id="contenido"
+                           name="contenido[0][content]"
+                           type="text"
+                           value="personal eventual"
+                           class="form-control">
+                    <label for="contenido">Contenido</label>
+                </div>
+            </div>
+            <div class="col-md-1">
+                <div class="mb-4">
+                    <button type="button"
+                            class="btn btn-sm btn-circle btn-red btn-outline-red form-collection__collection__remove">
+                        <i class="uil uil-trash"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="w-100"></div>
+            <div class="col-md-2 mx-md-auto">
+                <div class="mb-4">
+                    <div class="form-select-wrapper mb-4">
+                        <select name="contenido[0][operator]" class="form-select"
+                                aria-label="¿Operador de unión?">
+                            <option value="and" selected>Y</option>
+                            <option value="or" >O</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+                <div class="form-collection__actions">
+        <button type="button" class="btn btn-sm btn-yellow form-collection__actions__add">
+            <i class="uil uil-plus fs-15 me-1"></i> Relacionar más contenido
+        </button>
+    </div>
+</div>
+
+                    <div class="form-collection form-collection--numero mt-5 mb-10">
+    <h3 class="form-collection__title">Número</h3>
+                <div class="form-collection__collection">
+        <div class="row align-items-center">
+            <div class="col-md-4">
+                <div class="form-select-wrapper mb-4">
+                    <select name="numero[0][type]" class="form-select" aria-label="tipo de contenido">
+                        <option value="bome" >BOME</option>
+                        <option value="articulo" >Artículo</option>
+                        <option value="pagina" >Página</option>
+                        <option value="year" >Año</option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="form-select-wrapper mb-4">
+                    <select name="numero[0][like]" class="form-select" aria-label="¿Contiene?">
+                        <option value="like" >Contiene</option>
+                        <option value="nlike" >No contiene</option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="form-floating mb-4">
+                    <input placeholder="Número"
+                           id="numero"
+                           name="numero[0][number]"
+                           type="number"
+                           value=""
+                           class="form-control">
+                    <label for="numero">Número</label>
+                </div>
+            </div>
+            <div class="col-md-1">
+                <div class="mb-4">
+                    <button type="button" class="btn btn-sm btn-circle btn-red btn-outline-red form-collection__collection__remove">
+                        <i class="uil uil-trash"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="w-100"></div>
+            <div class="col-md-2 mx-md-auto">
+                <div class="mb-4">
+                    <div class="form-select-wrapper mb-4">
+                        <select name="numero[0][operator]" class="form-select" aria-label="¿Operador de unión?">
+                            <option value="and" >Y</option>
+                            <option value="or" >O</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+        <div class="form-collection__actions">
+        <button type="button" class="btn btn-sm btn-yellow form-collection__actions__add">
+            <i class="uil uil-plus fs-15 me-1"></i> Relacionar más números
+        </button>
+    </div>
+</div>
+
+                    <div class="d-flex mt-2 mb-2 justify-content-md-center">
+                        <button type="button" onclick="window.location.href = '/buscador-avanzado'" class="btn btn-navy rounded-pill me-2">
+                            <i class="uil uil-refresh fs-15 me-1"></i> Reiniciar
+                        </button>
+                        <button type="submit" class="btn btn-brand rounded-pill">
+                            <i class="uil uil-search-alt fs-15 me-1"></i> Buscar
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="row">
+                                    <div class="col-12">
+                                        <div class="page-search-result">
+                                            <h2 class="text">
+    <span class="underline-2 blue">
+        Resultados
+    </span>
+</h2>
+<p class="lead">
+    Página 1 de 3. Mostrando 10 elementos de un total de 30 elementos.
+</p>
+
+<ul>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2026-6375">
+                    BOME  Nº 6375 del viernes, 1 de mayo de 2026
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2025-6294">
+                    BOME  Nº 6294 del martes, 22 de julio de 2025
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-BX-2025-44">
+                    BOME EXTRA Nº 44 del viernes, 18 de julio de 2025
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-BX-2025-1">
+                    BOME EXTRA Nº 1 del miércoles, 8 de enero de 2025
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2024-6204">
+                    BOME  Nº 6204 del viernes, 30 de agosto de 2024
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2024-6174">
+                    BOME  Nº 6174 del viernes, 17 de mayo de 2024
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2023-6125">
+                    BOME  Nº 6125 del martes, 28 de noviembre de 2023
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2023-6120">
+                    BOME  Nº 6120 del viernes, 10 de noviembre de 2023
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2023-6117">
+                    BOME  Nº 6117 del martes, 31 de octubre de 2023
+
+            </a>
+        </li>
+            <li>
+            <a class="text-brand hover" href="/bome/BOME-B-2023-6109">
+                    BOME  Nº 6109 del martes, 3 de octubre de 2023
+
+            </a>
+        </li>
+    </ul>
+<div class="navigation-pagination d-flex mt-10">
+        <nav>
+                        <ul class="pagination">
+
+                            <li class="page-item disabled">
+                    <span class="page-link">&laquo;&nbsp;Anterior</span>
+                </li>
+            
+            
+                                                <li class="page-item active">
+                        <span class="page-link">1</span>
+                    </li>
+                
+                                                <li class="page-item">
+                        <a class="page-link" href="/buscador-avanzado?from=1990-01-01&amp;to=2026-09-23&amp;contenido%5B0%5D%5Btype%5D=sumario_articulo&amp;contenido%5B0%5D%5Blike%5D=like&amp;contenido%5B0%5D%5Bcontent%5D=personal%20eventual&amp;contenido%5B0%5D%5Boperator%5D=and&amp;page=2">2</a>
+                    </li>
+                
+                                                <li class="page-item">
+                        <a class="page-link" href="/buscador-avanzado?from=1990-01-01&amp;to=2026-09-23&amp;contenido%5B0%5D%5Btype%5D=sumario_articulo&amp;contenido%5B0%5D%5Blike%5D=like&amp;contenido%5B0%5D%5Bcontent%5D=personal%20eventual&amp;contenido%5B0%5D%5Boperator%5D=and&amp;page=3">3</a>
+                    </li>
+                
+            
+            
+                            <li class="page-item">
+                    <a class="page-link" rel="next" href="/buscador-avanzado?from=1990-01-01&amp;to=2026-09-23&amp;contenido%5B0%5D%5Btype%5D=sumario_articulo&amp;contenido%5B0%5D%5Blike%5D=like&amp;contenido%5B0%5D%5Bcontent%5D=personal%20eventual&amp;contenido%5B0%5D%5Boperator%5D=and&amp;page=2">Siguiente&nbsp;&raquo;</a>
+                </li>
+                    </ul>
+    </nav>
+
+</div>
+
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        </div>
+    </section>
+</div>
+<div class="progress-wrap">
+    <svg class="progress-circle svg-content" width="100%" height="100%" viewBox="-1 -1 102 102">
+        <path d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98" />
+    </svg>
+</div>
+<footer class="bg-light">
+    <div class="container py-7">
+    <div class="d-md-flex align-items-center justify-content-between">
+        <p class="mb-2 mb-lg-0">© 2026 Boletín Oficial de Melilla. Todos los derechos reservados.</p>
+        <nav class="nav social social-muted mb-0 text-md-end text-uppercase">
+            <a class="fs-13 text-brand" href="/">Bomes</a>
+            <a class="fs-13 text-brand" href="/buscar">Buscar</a>
+            <a class="fs-13 text-brand" href="/preguntas-frecuentes">FAQ</a>
+            <a class="fs-13 text-brand" href="/politica-cookies">Política de cookies</a>
+        </nav>
+        <!-- /.social -->
+    </div>
+</div>
+
+</footer>
+<script src="/assets/js/plugins.js"></script>
+<script src="/assets/js/theme.js"></script>
+<script src="/assets/custom/build/app-runtime.js?v=a3aa75d2"></script><script src="/assets/custom/build/app-623.js?v=a3aa75d2"></script><script src="/assets/custom/build/app-app.js?v=a3aa75d2"></script>
+</body>
+</html>

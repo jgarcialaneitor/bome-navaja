@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # CI must never hit the real bomemelilla.es site: the live tests are
+      # opt-in by design (BOME_NAVAJA_LIVE=1) and would make CI flaky and
+      # impolite to a public service.
+      - name: Run tests
+        run: uv run pytest
+
+  test-windows:
+    runs-on: windows-latest
+    # Windows is a first-class target for bome-navaja: this job gates merges
+    # exactly like the Ubuntu job (no continue-on-error).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # CI must never hit the real bomemelilla.es site: the live tests are
+      # opt-in by design (BOME_NAVAJA_LIVE=1) and would make CI flaky and
+      # impolite to a public service.
+      - name: Run tests
+        run: uv run pytest
