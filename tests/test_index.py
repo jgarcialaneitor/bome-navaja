@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
+import time
 from datetime import date
 from pathlib import Path
 
@@ -179,32 +179,113 @@ def test_rejects_unknown_estado(idx: SumarioIndex) -> None:
 # --------------------------------------------------------------------------- matching
 
 
-SAMPLES = [
+CORPUS = [
     "Decreto nº 124 relativo al CESE de D. Alejandro Silva como Personal Eventual.",
     "Orden relativa a la compañía de seguros y al Año Nuevo.",
     "Destitución del director; ceses varios y nombramientos.",
-    "Pingüino Straße ﬁnanzas",
+    "Procese el expediente de los derechos humanos, según la Ley 7/1985, de 2 de abril.",
+    "Pingüino Straße ﬁnanzas: 24.000.000,00€ (préstamo)",
+    "Relación provisional de aspirantes admitidos y excluidos a la convocatoria.",
+    "Nombramiento de personal eventual de confianza en la Consejería de Hacienda.",
+    "BASES de la convocatoria nº 3/2026 para la provisión de plazas — anuncio",
+    "Extracto de acuerdos; año 2025/2026; señor Muñoz.",
+    "de",
 ]
-PHRASES = ["cese", "personal eventual", "Nº 124", "compania", "COMPAÑÍA", "ano nuevo", "año",
-           "destitucion", "ceses", "pinguino", "strasse", "finanzas", "eventual personal"]
+PHRASES = [
+    "cese", "ceses", "personal eventual", "Nº 124", "no 1", "compania", "COMPAÑÍA", "ano nuevo",
+    "año", "ano", "destitucion", "pinguino", "strasse", "finanzas", "eventual personal", "7/1985",
+    "7/", "/2026", "de", "d", "ión", "prov", "provisional de", "24.000", "€", "(", ";", "rel",
+    "humanos", "manos", "muñoz", "unoz", "—", "de la convocatoria", "e", "xx", "nombra",
+]
 
 
-def _token_oracle(sumario: str, phrase: str) -> bool:
-    words = re.findall(r"[^\W_]+", normalize(sumario))
-    wanted = re.findall(r"[^\W_]+", normalize(phrase))
-    return any(words[i : i + len(wanted)] == wanted for i in range(len(words) - len(wanted) + 1))
-
-
-def test_matching_equals_normalized_token_phrases(idx: SumarioIndex) -> None:
+@pytest.fixture
+def corpus(idx: SumarioIndex) -> SumarioIndex:
     bulletin = ref("BOME-B-2026-6000", date(2026, 1, 2))
-    idx.guardar_boletin(bulletin, [art(bulletin, i + 1, s) for i, s in enumerate(SAMPLES)], "indexado")
+    idx.guardar_boletin(bulletin, [art(bulletin, i + 1, s) for i, s in enumerate(CORPUS)], "indexado")
+    return idx
+
+
+@pytest.mark.parametrize("coincidencia", ["fragmento", "palabra"])
+def test_single_phrases_match_text_matches(corpus: SumarioIndex, coincidencia: str) -> None:
+    palabra = coincidencia == "palabra"
     for phrase in PHRASES:
-        found = {a.numero for a in idx.buscar(phrase, limite=200).articulos}
-        expected = {i + 1 for i, s in enumerate(SAMPLES) if _token_oracle(s, phrase)}
-        assert found == expected, phrase
-        # A token-phrase hit is always a site-style substring hit too.
-        for number in found:
-            assert matches(SAMPLES[number - 1], phrase)
+        result = corpus.buscar(phrase, coincidencia=coincidencia, limite=200)
+        found = {a.numero for a in result.articulos}
+        expected = {i + 1 for i, s in enumerate(CORPUS) if matches(s, phrase, palabra=palabra)}
+        assert found == expected, (coincidencia, phrase)
+        assert result.total == len(expected)
+
+
+@pytest.mark.parametrize("coincidencia", ["fragmento", "palabra"])
+def test_random_boolean_queries_match_text_matches(corpus: SumarioIndex, coincidencia: str) -> None:
+    import random
+
+    from bome_navaja.text import Term
+
+    palabra = coincidencia == "palabra"
+    rng = random.Random(5)
+    for _ in range(150):
+        terms = [
+            {
+                "texto": rng.choice(PHRASES),
+                "operador": rng.choice(["y", "y", "o"]),
+                "modo": rng.choice(["contiene", "contiene", "no_contiene"]),
+            }
+            for _ in range(rng.randint(1, 4))
+        ]
+        query = [Term(t["texto"], operator=t["operador"], mode=t["modo"]) for t in terms]
+        expected = {i + 1 for i, s in enumerate(CORPUS) if matches(s, query, palabra=palabra)}
+        result = corpus.buscar(None, terms, coincidencia=coincidencia, limite=200)
+        assert {a.numero for a in result.articulos} == expected, (coincidencia, terms)
+        assert result.total == len(expected)
+
+
+def test_fragmento_is_the_sites_substring_match(filled: SumarioIndex) -> None:
+    assert set(cves(filled.buscar("cese"))) == {"BOME-A-2025-745", "BOME-A-2026-301", "BOME-A-2026-302"}
+    assert filled.buscar("eventual personal").total == 0  # word order matters
+    assert set(cves(filled.buscar("nombra"))) == {
+        "BOME-A-2026-300", "BOME-A-2026-301", "BOME-AX-2026-102",
+    }
+
+
+def test_palabra_requires_a_word_start(idx: SumarioIndex) -> None:
+    bulletin = ref("BOME-B-2026-6002", date(2026, 1, 4))
+    idx.guardar_boletin(
+        bulletin,
+        [
+            art(bulletin, 1, "Cese del director."),
+            art(bulletin, 2, "Ceses varios."),
+            art(bulletin, 3, "Procese el expediente."),
+            art(bulletin, 4, "Año nuevo."),
+            art(bulletin, 5, "Derechos humanos."),
+        ],
+        "indexado",
+    )
+    numbers = lambda result: [a.numero for a in result.articulos]  # noqa: E731
+    assert numbers(idx.buscar("cese")) == [1, 2, 3]
+    assert numbers(idx.buscar("cese", coincidencia="palabra")) == [1, 2]
+    assert numbers(idx.buscar("ano")) == [4, 5]
+    assert numbers(idx.buscar("ano", coincidencia="palabra")) == [4]
+    # A trailing * is accepted in both modes and changes nothing.
+    assert numbers(idx.buscar("cese*")) == [1, 2, 3]
+    assert numbers(idx.buscar("cese*", coincidencia="palabra")) == [1, 2]
+    with pytest.raises(BusquedaInvalidaError):
+        idx.buscar("cese", coincidencia="exacta")  # type: ignore[arg-type]
+
+
+def test_short_terms_fall_back_to_a_scan(corpus: SumarioIndex) -> None:
+    # "de" and "d" are under the 3-character trigram minimum.
+    assert corpus.buscar("de").total == sum(1 for s in CORPUS if matches(s, "de"))
+    assert corpus.buscar("de", coincidencia="palabra").total == sum(
+        1 for s in CORPUS if matches(s, "de", palabra=True)
+    )
+    mixed = corpus.buscar("7/", [{"texto": "humanos"}])
+    assert [a.numero for a in mixed.articulos] == [4]
+    either = corpus.buscar("€", [{"texto": "muñoz", "operador": "o"}])
+    assert sorted(a.numero for a in either.articulos) == [5, 9]
+    negated = corpus.buscar("provision", [{"texto": "de", "modo": "no_contiene"}])
+    assert negated.total == 0
 
 
 def test_accents_case_and_enye(filled: SumarioIndex) -> None:
@@ -214,53 +295,50 @@ def test_accents_case_and_enye(filled: SumarioIndex) -> None:
     assert cves(filled.buscar("nº 124")) == ["BOME-A-2025-745"]
 
 
-def test_phrase_word_order_and_whole_words(filled: SumarioIndex) -> None:
-    assert filled.buscar("eventual personal").total == 0
-    # Token semantics: "cese" does not find "Ceses" unless a prefix is asked for.
-    assert set(cves(filled.buscar("cese"))) == {"BOME-A-2025-745", "BOME-A-2026-302"}
-    assert set(cves(filled.buscar("cese*"))) == {"BOME-A-2025-745", "BOME-A-2026-301", "BOME-A-2026-302"}
-    assert set(cves(filled.buscar("personal event*"))) == {
-        "BOME-A-2025-745", "BOME-A-2026-300", "BOME-A-2026-301",
-    }
-
-
 def test_and_or_not(filled: SumarioIndex) -> None:
-    both = filled.buscar("personal eventual", [{"texto": "cese*"}])
+    both = filled.buscar("personal eventual", [{"texto": "cese"}])
     assert set(cves(both)) == {"BOME-A-2025-745", "BOME-A-2026-301"}
     either = filled.buscar(
         "personal eventual",
         [{"texto": "cese"}, {"texto": "alumnos", "operador": "o"}],
     )
-    assert set(cves(either)) == {"BOME-A-2025-745", "BOME-AX-2026-102"}
+    assert set(cves(either)) == {"BOME-A-2025-745", "BOME-A-2026-301", "BOME-AX-2026-102"}
     negated = filled.buscar("personal eventual", [{"texto": "hacienda", "modo": "no_contiene"}])
     assert set(cves(negated)) == {"BOME-A-2025-745", "BOME-A-2026-300"}
 
 
-@pytest.mark.parametrize(
-    "terminos",
-    [
-        [{"texto": "cese", "modo": "no_contiene"}],
-        [{"texto": "cese"}, {"texto": "hacienda", "operador": "o", "modo": "no_contiene"}],
-    ],
-)
-def test_negation_only_group_is_rejected(filled: SumarioIndex, terminos: list) -> None:
-    with pytest.raises(BusquedaInvalidaError, match="no_contiene"):
-        filled.buscar(None, terminos)
+def test_negation_only_groups_scan_articles_with_a_sumario(filled: SumarioIndex) -> None:
+    result = filled.buscar(None, [{"texto": "cese", "modo": "no_contiene"}])
+    # Articles without sumario (the 2014 stubs) never match: unknown text is not evidence.
+    assert set(cves(result)) == {
+        "BOME-A-2025-744", "BOME-A-2025-746", "BOME-A-2026-300", "BOME-AX-2026-102",
+    }
+    either = filled.buscar(
+        "alumnos", [{"texto": "personal", "operador": "o", "modo": "no_contiene"}]
+    )
+    assert set(cves(either)) == {"BOME-A-2025-744", "BOME-A-2025-746", "BOME-AX-2026-102"}
 
 
 NASTY = ['"', "*", "NEAR(", "AND", "OR", "NOT", "-", ":", "(", ")", "a OR b", "sumario:cese",
          '"cese', 'cese"', "cese*)", "^cese", "{cese personal}", "o'brien", "NEAR(cese personal, 2)",
-         "cese AND NOT personal", "**", "cese **", "+cese", "\\", "%", "_"]
+         "cese AND NOT personal", "**", "cese **", "+cese", "\\", "%", "_", '""', "' OR 1=1 --",
+         "a", "\x00", "*cese", "ce\"se"]
 
 
+@pytest.mark.parametrize("coincidencia", ["fragmento", "palabra"])
 @pytest.mark.parametrize("text", NASTY)
-def test_injection_inputs_never_reach_sqlite_errors(filled: SumarioIndex, text: str) -> None:
+def test_injection_inputs_never_reach_sqlite_errors(
+    filled: SumarioIndex, text: str, coincidencia: str
+) -> None:
     for call in (
-        lambda: filled.buscar(text),
-        lambda: filled.buscar("personal", [{"texto": text}]),
-        lambda: filled.buscar("personal", [{"texto": text, "operador": "o"}]),
-        lambda: filled.buscar("personal", [{"texto": text, "modo": "no_contiene"}]),
-        lambda: filled.buscar("personal", consejeria=text),
+        lambda: filled.buscar(text, coincidencia=coincidencia),
+        lambda: filled.buscar("personal", [{"texto": text}], coincidencia=coincidencia),
+        lambda: filled.buscar("personal", [{"texto": text, "operador": "o"}], coincidencia=coincidencia),
+        lambda: filled.buscar(
+            "personal", [{"texto": text, "modo": "no_contiene"}], coincidencia=coincidencia
+        ),
+        lambda: filled.buscar(None, [{"texto": text, "modo": "no_contiene"}], coincidencia=coincidencia),
+        lambda: filled.buscar("personal", consejeria=text, coincidencia=coincidencia),
     ):
         try:
             call()
@@ -268,11 +346,15 @@ def test_injection_inputs_never_reach_sqlite_errors(filled: SumarioIndex, text: 
             pass
 
 
-def test_keywords_are_searched_literally(filled: SumarioIndex) -> None:
+def test_keywords_and_quotes_are_searched_literally(filled: SumarioIndex) -> None:
     bulletin = ref("BOME-B-2026-6001", date(2026, 1, 3))
-    filled.guardar_boletin(bulletin, [art(bulletin, 9, "Convenio NEAR AND OR NOT de prueba")], "indexado")
+    filled.guardar_boletin(
+        bulletin, [art(bulletin, 9, 'Convenio NEAR AND OR NOT de "prueba" (anexo)')], "indexado"
+    )
     assert cves(filled.buscar("near and or not")) == ["BOME-A-2026-9"]
-    assert cves(filled.buscar('"NEAR" (AND) OR: NOT*')) == ["BOME-A-2026-9"]
+    assert cves(filled.buscar('de "prueba" (')) == ["BOME-A-2026-9"]
+    assert cves(filled.buscar('"')) == ["BOME-A-2026-9"]
+
 
 
 # --------------------------------------------------------------------------- filters, order, pages
@@ -361,12 +443,23 @@ def test_result_fields_and_highlight(filled: SumarioIndex) -> None:
     assert data["articulos"][0]["bome_fecha"] == "2026-05-01"
 
 
-def test_highlight_marks_every_positive_phrase_and_prefix(filled: SumarioIndex) -> None:
-    found = filled.buscar("personal eventual", [{"texto": "cese*"}]).articulos
+def test_highlight_marks_every_positive_phrase(filled: SumarioIndex) -> None:
+    found = filled.buscar("personal eventual", [{"texto": "cese"}]).articulos
     by_cve = {a.cve: a.resaltado for a in found}
     assert by_cve["BOME-A-2026-301"] == (
-        "**Ceses** y nombramientos de **personal eventual** de la Consejería de Hacienda."
+        "**Cese**s y nombramientos de **personal eventual** de la Consejería de Hacienda."
     )
+
+
+def test_highlight_follows_the_mode_on_the_original_text(idx: SumarioIndex) -> None:
+    bulletin = ref("BOME-B-2026-6003", date(2026, 1, 5))
+    idx.guardar_boletin(bulletin, [art(bulletin, 1, "Año de los derechos humanos.")], "indexado")
+    (fragment,) = idx.buscar("ano").articulos
+    assert fragment.resaltado == "**Año** de los derechos hum**ano**s."
+    (word,) = idx.buscar("ano", coincidencia="palabra").articulos
+    assert word.resaltado == "**Año** de los derechos humanos."
+    (short,) = idx.buscar("de", coincidencia="palabra").articulos
+    assert short.resaltado == "Año **de** los **de**rechos humanos."
 
 
 def test_highlight_windows_long_sumarios(idx: SumarioIndex) -> None:
@@ -446,7 +539,7 @@ def test_index_usable_from_another_thread(filled: SumarioIndex) -> None:
     worker = threading.Thread(target=lambda: box.append(filled.buscar("cese").total))
     worker.start()
     worker.join(timeout=10)
-    assert box == [2]
+    assert box == [3]
 
 
 def test_thread_connection_can_be_closed(filled: SumarioIndex) -> None:
@@ -465,7 +558,7 @@ def test_thread_connection_can_be_closed(filled: SumarioIndex) -> None:
     worker.join(timeout=10)
     assert counts[1] == counts[0] - 1
     # The main thread's connection still works.
-    assert filled.buscar("cese").total == 2
+    assert filled.buscar("cese").total == 3
 
 
 # --------------------------------------------------------------------------- verify findings (task 5 review)
@@ -604,3 +697,274 @@ def test_datetimes_count_as_their_date(filled: SumarioIndex) -> None:
     assert cves(filled.buscar("nombramiento*", desde=date(2026, 5, 1), hasta=datetime(2026, 5, 1, 0, 0))) == day
     assert cves(filled.buscar("nombramiento*", desde="2026-05-01", hasta="2026-05-01")) == day
     assert filled.buscar("nombramiento*", desde=datetime(2026, 5, 2, 0, 0)).total == 1  # only BX
+
+
+# --------------------------------------------------------------------------- task 5b: schema v2 (trigram)
+
+V1_DDL = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE bulletins (
+    cve TEXT PRIMARY KEY, number INTEGER NOT NULL, date TEXT, extraordinary INTEGER NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('indexado', 'sin_sumarios', 'error')),
+    error_code TEXT, error_message TEXT, n_articulos INTEGER NOT NULL DEFAULT 0,
+    indexed_at TEXT NOT NULL
+);
+CREATE INDEX bulletins_date ON bulletins (date);
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY, cve TEXT NOT NULL UNIQUE, bulletin_cve TEXT NOT NULL,
+    number INTEGER NOT NULL, sumario TEXT, departamento TEXT NOT NULL, consejeria TEXT NOT NULL,
+    organismo TEXT NOT NULL, consejeria_norm TEXT NOT NULL, url TEXT NOT NULL, pdf_url TEXT,
+    listado_en_bome INTEGER NOT NULL
+);
+CREATE INDEX articles_bulletin ON articles (bulletin_cve);
+CREATE VIRTUAL TABLE articles_fts USING fts5 (texto, tokenize = 'unicode61 remove_diacritics 2');
+CREATE TABLE calendar (
+    cve TEXT PRIMARY KEY, number INTEGER NOT NULL, date TEXT, extraordinary INTEGER NOT NULL
+);
+CREATE TABLE sync_lease (
+    id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, heartbeat REAL NOT NULL,
+    started REAL NOT NULL
+);
+"""
+
+
+def build_v1(path: Path, sumarios: list[str | None]) -> None:
+    """A schema-v1 index file (word tokenizer) as task 5 wrote it."""
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V1_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+        conn.execute("INSERT INTO meta VALUES ('last_sync', '{\"estado\": \"completado\"}')")
+        conn.execute(
+            "INSERT INTO bulletins VALUES ('BOME-B-2026-6375', 6375, '2026-05-01', 0, 'indexado', "
+            "NULL, NULL, ?, '2026-09-23T10:00:00Z')",
+            (len(sumarios),),
+        )
+        conn.execute("INSERT INTO calendar VALUES ('BOME-B-2026-6375', 6375, '2026-05-01', 0)")
+        for number, sumario in enumerate(sumarios, start=1):
+            cursor = conn.execute(
+                "INSERT INTO articles (cve, bulletin_cve, number, sumario, departamento, consejeria, "
+                "organismo, consejeria_norm, url, pdf_url, listado_en_bome) "
+                "VALUES (?, 'BOME-B-2026-6375', ?, ?, 'CAM', 'HACIENDA', 'HACIENDA', 'hacienda', "
+                "?, NULL, 1)",
+                (f"BOME-A-2026-{number}", number, sumario, f"{BASE}/bome/BOME-B-2026-6375/articulo/{number}"),
+            )
+            if normalize(sumario):
+                conn.execute(
+                    "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)",
+                    (cursor.lastrowid, normalize(sumario)),
+                )
+
+
+def test_v1_index_is_migrated_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "v1.sqlite3"
+    build_v1(path, ["Cese del director.", "Ceses varios.", "Procese el expediente.", None, "  "])
+    index = SumarioIndex(path)
+    try:
+        assert index.version_esquema() == SCHEMA_VERSION == 2
+        state = index.estado()
+        assert state.articulos == 5
+        assert state.boletines["indexado"] == 1
+        assert state.ultima_sincronizacion == {"estado": "completado"}
+        # Substring semantics now work on the preserved rows.
+        assert [a.numero for a in index.buscar("cese").articulos] == [1, 2, 3]
+        assert [a.numero for a in index.buscar("cese", coincidencia="palabra").articulos] == [1, 2]
+        tokenizer = index._conn().execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'articles_fts'"
+        ).fetchone()[0]
+        assert "trigram" in tokenizer
+    finally:
+        index.close()
+    # A second open finds v2 and changes nothing.
+    again = SumarioIndex(path)
+    try:
+        assert again.buscar("cese").total == 3
+    finally:
+        again.close()
+
+
+def test_sqlite_without_trigram_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(index_module, "_sqlite_version_info", lambda: (3, 33, 0))
+    with pytest.raises(BomeIndexUnavailableError, match="3.34"):
+        SumarioIndex(tmp_path / "x.sqlite3")
+
+
+def test_trigram_index_size_is_sane(tmp_path: Path) -> None:
+    import random
+
+    from bome_navaja.parsers import parse_bulletin_page
+
+    fixtures = Path(__file__).parent / "fixtures"
+    base = [
+        a.sumario
+        for name, cve in (("b6416.html", "BOME-B-2026-6416"), ("bx41.html", "BOME-BX-2026-41"))
+        for a in parse_bulletin_page((fixtures / name).read_text("utf-8"), cve).articles
+    ]
+    rng = random.Random(3)
+    sumarios = [f"{rng.choice(base)} Expediente {rng.randint(1, 99999)}." for _ in range(600)]
+
+    def size(conn: sqlite3.Connection) -> int:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute(
+            "PRAGMA page_size"
+        ).fetchone()[0]
+
+    v1_path = tmp_path / "v1.sqlite3"
+    build_v1(v1_path, sumarios)
+    with sqlite3.connect(v1_path) as raw:
+        v1_size = size(raw)
+    v2 = SumarioIndex(tmp_path / "v2.sqlite3")
+    try:
+        bulletin = ref("BOME-B-2026-6375", date(2026, 5, 1))
+        v2.guardar_boletin(bulletin, [art(bulletin, i + 1, s) for i, s in enumerate(sumarios)], "indexado")
+        v2_size = size(v2._conn())
+    finally:
+        v2.close()
+    assert v2_size < 5 * v1_size, (v1_size, v2_size)
+
+
+def test_nota_and_consulta_describe_the_mode(filled: SumarioIndex) -> None:
+    fragment = filled.buscar("cese")
+    assert fragment.consulta["coincidencia"] == "fragmento"
+    assert "substring" in fragment.nota and "whole-word" not in fragment.nota
+    word = filled.buscar("cese", coincidencia="palabra")
+    assert word.consulta["coincidencia"] == "palabra"
+    assert "word" in word.nota
+
+
+def test_relevance_without_trigram_terms_falls_back_to_date(filled: SumarioIndex) -> None:
+    assert cves(filled.buscar("de", orden="relevancia")) == cves(filled.buscar("de", orden="fecha"))
+    assert cves(filled.buscar(None, orden="relevancia", limite=3)) == cves(filled.buscar(None, limite=3))
+
+
+# --------------------------------------------------------------------------- task 5b review findings
+
+
+def _big_index(idx: SumarioIndex, total: int = 5000, common_every: int = 10) -> None:
+    """``total`` articles of ~240 chars; all but one in ``common_every`` contain "orden"."""
+    import random
+
+    rng = random.Random(11)
+    words = ["relativa", "a", "la", "provisión", "de", "plazas", "personal", "consejería",
+             "hacienda", "expediente", "convocatoria", "nombramiento", "bases", "anuncio"]
+    per_bulletin = 100
+    for bulletin_index in range(total // per_bulletin):
+        bulletin = ref(f"BOME-B-2025-{6000 + bulletin_index}", date(2025, 1, 1 + bulletin_index % 28))
+        articles = []
+        for offset in range(per_bulletin):
+            number = bulletin_index * per_bulletin + offset + 1
+            filler = " ".join(rng.choice(words) for _ in range(30))
+            head = "Anuncio" if number % common_every == 0 else f"Orden nº {number}"
+            special = " Sello único" if number % 50 == 0 else ""
+            articles.append(art(bulletin, number, f"{head}{special} {filler}."[:240]))
+        idx.guardar_boletin(bulletin, articles, "indexado")
+
+
+def test_relevance_scales_linearly(idx: SumarioIndex) -> None:
+    _big_index(idx)
+    started = time.perf_counter()
+    ranked = idx.buscar("orden", orden="relevancia")
+    elapsed = time.perf_counter() - started
+    assert ranked.total == 4500
+    assert elapsed < 2.0, f"relevancia took {elapsed:.2f}s"
+    by_date = idx.buscar("orden", orden="fecha")
+    assert by_date.total == ranked.total
+    # A narrower query: same set of hits whatever the order.
+    narrow_ranked = idx.buscar("sello unico", orden="relevancia", limite=200)
+    narrow_dated = idx.buscar("sello unico", orden="fecha", limite=200)
+    assert narrow_ranked.total == narrow_dated.total == 100
+    assert {a.cve for a in narrow_ranked.articulos} == {a.cve for a in narrow_dated.articulos}
+
+
+def test_relevance_query_plan_has_no_per_row_fts_scan(filled: SumarioIndex) -> None:
+    conn = filled._conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        filled.buscar("personal", [{"texto": "cese"}], orden="relevancia")
+    finally:
+        conn.set_trace_callback(None)
+    (rows_sql,) = [s for s in statements if s.lstrip().startswith(("SELECT a.cve", "WITH"))]
+    plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + rows_sql)]
+    assert not any("articles_fts" in step and "LEFT-JOIN" in step for step in plan), plan
+
+
+def test_relevance_orders_by_bm25_and_keeps_total_exact(idx: SumarioIndex) -> None:
+    bulletin = ref("BOME-B-2026-6100", date(2026, 1, 1))
+    idx.guardar_boletin(
+        bulletin,
+        [
+            art(bulletin, 1, "Texto largo con muchas palabras que no ayudan y un único cese al final."),
+            art(bulletin, 2, "Cese cese cese."),
+            art(bulletin, 3, "Nada que ver aquí."),
+            art(bulletin, 4, "de"),  # only reachable through the short-term OR branch
+        ],
+        "indexado",
+    )
+    result = idx.buscar("cese", [{"texto": "de", "operador": "o"}], orden="relevancia")
+    numbers = [a.numero for a in result.articulos]
+    assert result.total == 3
+    assert numbers[0] == 2
+    assert set(numbers) == {1, 2, 4}
+    assert numbers[-1] == 4  # no bm25 score: ranked last
+
+
+def test_nul_in_a_stored_sumario_behaves_like_text_matches(idx: SumarioIndex) -> None:
+    bulletin = ref("BOME-B-2026-6101", date(2026, 1, 2))
+    sumarios = ["ab\x00cde xyz", "provi\u00adsional", "normal"]
+    idx.guardar_boletin(bulletin, [art(bulletin, i + 1, s) for i, s in enumerate(sumarios)], "indexado")
+    for phrase in ("abc", "b\x00c", "provisional", "xyz", "ab cd"):
+        for coincidencia in ("fragmento", "palabra"):
+            found = {a.numero for a in idx.buscar(phrase, coincidencia=coincidencia).articulos}
+            expected = {
+                i + 1
+                for i, s in enumerate(sumarios)
+                if matches(s, phrase, palabra=coincidencia == "palabra")
+            }
+            assert found == expected, (phrase, coincidencia)
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "cese \udfff", "ok"])
+def test_lone_surrogates_in_queries_are_invalid_input(filled: SumarioIndex, bad: str) -> None:
+    calls = [
+        lambda: filled.buscar(bad),
+        lambda: filled.buscar("personal", [{"texto": bad}]),
+        lambda: filled.buscar("personal", consejeria=bad),
+    ]
+    for call in calls:
+        if bad == "ok":
+            call()
+            continue
+        with pytest.raises(BusquedaInvalidaError):
+            call()
+
+
+def test_lone_surrogates_in_stored_text_are_sanitised(idx: SumarioIndex) -> None:
+    bulletin = ref("BOME-B-2026-6102", date(2026, 1, 3))
+    idx.guardar_boletin(
+        bulletin,
+        [art(bulletin, 1, "Cese \ud800 del director", consejeria="HACIENDA \udfff")],
+        "indexado",
+        error=RuntimeError("bad \ud800 text"),
+    )
+    (found,) = idx.buscar("cese").articulos
+    assert found.sumario == "Cese ? del director"  # the lone surrogate became "?"
+    assert idx.buscar("cese", consejeria="hacienda").total == 1
+    idx.guardar_resumen_sincronizacion({"ultimo_error": "x \ud800 y"})
+    assert idx.estado().ultima_sincronizacion is not None
+
+
+def test_migration_failure_reports_index_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "v1.sqlite3"
+    build_v1(path, ["Cese del director.", "Ceses varios."])
+    monkeypatch.setattr(index_module, "_FTS_DDL", "CREATE VIRTUAL TABLE articles_fts USING nope(x)")
+    with pytest.raises(BomeIndexUnavailableError) as info:
+        SumarioIndex(path)
+    assert type(info.value) is BomeIndexUnavailableError
+    assert info.value.error_code == "indice_no_disponible"
+    assert info.value.__cause__ is not None
+    # Rolled back: still a readable v1 file with its rows.
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
+        assert raw.execute("SELECT count(*) FROM articles").fetchone()[0] == 2

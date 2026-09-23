@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bome_navaja.text import Term, matches, normalize, parse_terms
+from bome_navaja.text import Term, contains, matches, normalize, parse_terms, phrase_starts
 
 
 # --------------------------------------------------------------------------- normalize
@@ -132,3 +132,63 @@ def test_parse_terms_rejects_bad_items() -> None:
         parse_terms([{"texto": "x", "extra": 1}])
     with pytest.raises(ValueError):
         parse_terms(["not a dict"])  # type: ignore[list-item]
+
+
+# --------------------------------------------------------------------------- word-start mode (task 5b)
+
+
+def test_phrase_starts_substring_and_word_start() -> None:
+    folded = normalize("Cese, ceses y procese; año y humanos")
+    assert folded == "cese, ceses y procese; ano y humanos"
+    inside = folded.index("procese") + 3
+    year = folded.index("ano ")
+    assert phrase_starts(folded, "cese") == [0, 6, inside]
+    assert phrase_starts(folded, "cese", palabra=True) == [0, 6]
+    assert phrase_starts(folded, "ano") == [year, folded.index("anos")]
+    assert phrase_starts(folded, "ano", palabra=True) == [year]
+    assert phrase_starts(folded, "") == []
+
+
+def test_word_boundary_is_any_non_alphanumeric_char() -> None:
+    assert contains("Ley 7/1985, de 2 de abril", "1985", palabra=True)
+    assert not contains("Ley 71985", "1985", palabra=True)
+    assert contains("(cese) del cargo", "cese", palabra=True)
+    assert contains("nº 124", "124", palabra=True)
+    assert contains("personal_eventual", "eventual", palabra=True)
+
+
+def test_contains_normalizes_both_sides() -> None:
+    assert contains("AÑO NUEVO", "ano nuevo")
+    assert contains("Destitución", "DESTITUCION", palabra=True)
+    assert not contains(None, "x")
+    assert not contains("texto", "   ")
+
+
+def test_matches_word_start_mode() -> None:
+    sumario = "Procese el expediente y comunique los ceses del personal"
+    assert matches(sumario, "cese")
+    assert matches(sumario, "cese", palabra=True)  # "ceses" starts a word
+    assert not matches("Procese el expediente", "cese", palabra=True)
+    query = [Term("expediente"), Term("cese", mode="no_contiene")]
+    assert not matches(sumario, query)
+    assert matches("Procese el expediente", query, palabra=True)
+    # The default stays the site's substring semantics.
+    assert matches("Procese el expediente", "cese")
+
+
+# --------------------------------------------------------------------------- control characters (task 5b review)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("ab\x00cde", "abcde"),  # NUL: FTS5 trigram ignores it, so normalize must too
+        ("provi\u00adsional", "provisional"),  # soft hyphen (Cf)
+        ("per\u200bsonal", "personal"),  # zero-width space (Cf)
+        ("a\x07b\x1fc\x7fd", "abcd"),  # other C0/C1 controls
+        ("a\tb\nc\r\x0bd", "a b c d"),  # whitespace controls still become one space
+    ],
+)
+def test_normalize_drops_control_and_format_characters(raw: str, expected: str) -> None:
+    assert normalize(raw) == expected
+    assert contains(raw, expected)

@@ -42,13 +42,27 @@ def test_live_sync_one_month_and_search(index: SumarioIndex) -> None:
     assert all("**" in (a.resaltado or "") for a in result.articulos)
     assert result.cobertura["boletines_indexados"] == state.total_planificado
 
+    # Substring mode can only find more than word-start mode.
+    fragmento = index.buscar("cese", desde="2026-09-01", limite=200)
+    palabra = index.buscar("cese", desde="2026-09-01", limite=200, coincidencia="palabra")
+    assert fragmento.total >= palabra.total
+    assert {a.cve for a in palabra.articulos} <= {a.cve for a in fragmento.articulos}
+    # "rden" only occurs inside words ("Orden nº ..."), so the modes must differ.
+    inside = index.buscar("rden", desde="2026-09-01")
+    assert inside.total >= 1
+    assert index.buscar("rden", desde="2026-09-01", coincidencia="palabra").total == 0
+    assert index.buscar("orden", desde="2026-09-01", coincidencia="palabra").total >= 1
+    short = index.buscar("de", desde="2026-09-01")
+    assert short.total >= 1  # under 3 characters: direct scan
+
     stored = index.estado()
     assert stored.boletines["indexado"] == state.total_planificado
     assert stored.articulos_con_sumario >= 13
     assert stored.pendientes == 0
     print(
         f"\n[live] bulletins={state.total_planificado} s/bulletin={state.segundos_por_boletin} "
-        f"articles={stored.articulos} db_bytes={stored.tamano_bytes}"
+        f"articles={stored.articulos} db_bytes={stored.tamano_bytes} "
+        f"cese fragmento={fragmento.total} palabra={palabra.total}"
     )
 
 

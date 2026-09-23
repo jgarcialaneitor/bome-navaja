@@ -89,6 +89,12 @@ Out of scope, deliberately:
   (index sync, drill-down).
 - Python >= 3.12, deps: httpx, beautifulsoup4, lxml, mcp>=2,<3, pypdf.
 
+## Decisions
+
+- 2026-09-23: index sync runs ONLY when the model asks (`sincronizar_indice`); the server never
+  crawls on its own. Empty or stale index is reported by `buscar_en_indice` / `estado_indice`.
+- 2026-09-23: trigram index with a "palabra" mode (task 5b).
+
 ## Tasks
 
 - [x] 1. Scaffold: pyproject (package `bome_navaja`, scripts `bome-navaja-mcp`), MIT license,
@@ -133,6 +139,18 @@ Out of scope, deliberately:
       (sync.py:310); the lease heartbeat is renewed only between bulletins (sync.py:277).
       Product option: FTS5 `trigram` over the normalised text would give the same substring
       semantics as the site (bigger index, terms under 3 characters need a fallback).
+- [x] 5b. Trigram index (user decision 2026-09-23): FTS5 `trigram` over `normalize(sumario)` so
+      the index matches substrings like the site; `coincidencia` = "fragmento" (default) |
+      "palabra" (match only at a word start: "cese" → cese/ceses, not procese); terms under
+      3 characters fall back to a direct scan; schema v2 rebuilds the FTS table locally.
+      Verified: `372 passed, 15 skipped` offline; live index passed; two independent verifies.
+      The first verify found a blocker: `orden="relevancia"` took 36–111 s on 20k articles,
+      because bm25 was re-run per row. Fixed with a per-query temp score table: 28–185 ms on
+      20k (1.2x of fecha). Other results: 0 mismatches vs `text.matches` over 240 random
+      queries; exact pagination; the v1→v2 migration is atomic (survives a crash) and takes
+      3.5 s at 20k; 0 raw exceptions in fuzzing; no concurrency cross-talk. Size ≈ 1.7x of
+      v1. `normalize` now drops control/format characters (NUL made trigram produce false
+      hits).
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
