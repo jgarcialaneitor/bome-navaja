@@ -150,7 +150,9 @@ Out of scope, deliberately:
       queries; exact pagination; the v1→v2 migration is atomic (survives a crash) and takes
       3.5 s at 20k; 0 raw exceptions in fuzzing; no concurrency cross-talk. Size ≈ 1.7x of
       v1. `normalize` now drops control/format characters (NUL made trigram produce false
-      hits).
+      hits). Commit `0ac7ff3`; CI green (Linux + Windows, trigram available); native review
+      `review-0a05f01dafa3410f` approved and acknowledged, with one advisory WARNING at
+      index.py:690 (the v1→v2 FTS rebuild) to re-check in task 6.
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
@@ -164,6 +166,7 @@ Out of scope, deliberately:
 - `0e20f5f` feat: add BOME search and article drill-down (task 3).
 - `b7f6e97` feat: add PDF cache and paginated document reading (task 4).
 - `aec4609` feat: add local SQLite FTS5 index of article sumarios (task 5).
+- `0ac7ff3` feat: switch the sumario index to trigrams with word-start mode (task 5b).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
