@@ -172,7 +172,18 @@ Out of scope, deliberately:
       Commits `e15698e` + `f319653` (Windows CI fix: host-judged absolute paths, UTF-8 stdio
       test). Native reviews (high tier, 4 lenses) `review-7c4fcd6674915bb8` and
       `review-ca1e368edc1a0aa8` approved and acknowledged. CI green on Linux and Windows.
-- [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
+- [x] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
+      Mirrors navaja: manifest v0.4 (`server.type` uv, 17 tools matched against the server by
+      test), launcher `bome_navaja_mcpb.py`, `scripts/build_mcpb.py` (safe staging) with
+      `build_mcpb.sh` and `build_mcpb.ps1`. Optional `user_config.directorio_datos` maps to
+      `BOME_NAVAJA_DATA_DIR`; its empty default is required (without it the literal
+      `${user_config...}` would reach the server) and is enforced by a test.
+      Verified: `437 passed, 16 skipped`; bundle 68.6 KB, 17 files (no tests/fixtures/caches);
+      `mcpb validate` passes; the unpacked bundle launched like Claude Desktop answers
+      initialize, lists 17 tools and runs `estado_servidor` with JSON-RPC-only stdout
+      (3.7 s first run with a warm uv cache, 1.5 s warm). CI builds the bundle on Linux
+      (artifact) and runs the PowerShell wrapper on Windows.
+      Not verified: an install inside Claude Desktop itself; the bundle is unsigned.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
       and a live smoke run.
 
