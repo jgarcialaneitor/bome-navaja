@@ -1,0 +1,12 @@
+# Local Pi runtime state
+.atl/
+skill-registry.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
