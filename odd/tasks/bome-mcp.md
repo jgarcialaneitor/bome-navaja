@@ -110,6 +110,10 @@ Out of scope, deliberately:
       PASS (bulletin 6416 read in 5 chunks, pages 1..37 without gaps). Verify findings F1
       (non-positive budget in `paginar`) and F2 (temp file left on interrupt) fixed.
       Follow-up (perf): cache hits re-hash and re-parse the whole PDF on every read.
+      Commit `b7f6e97`; native review `review-2aa297913d1a4077` approved and acknowledged.
+      Follow-up (advisory, paths.py:51): `Path.home()` is evaluated even when an env override
+      is set and raises a non-Bome `RuntimeError` without a resolvable home; relative env
+      overrides depend on the client's cwd. Handle both when task 6 reports `estado_servidor`.
 - [ ] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
       index search tool, index status.
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
@@ -123,6 +127,7 @@ Out of scope, deliberately:
 - `be43b03` chore: initialize repository (main); `edeee29` docs(odd) (feat/bome-mcp).
 - `bed0423` feat: add BOME client, CVE model and site parsers (task 2).
 - `0e20f5f` feat: add BOME search and article drill-down (task 3).
+- `b7f6e97` feat: add PDF cache and paginated document reading (task 4).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
