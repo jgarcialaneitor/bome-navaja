@@ -184,6 +184,10 @@ Out of scope, deliberately:
       (3.7 s first run with a warm uv cache, 1.5 s warm). CI builds the bundle on Linux
       (artifact) and runs the PowerShell wrapper on Windows.
       Not verified: an install inside Claude Desktop itself; the bundle is unsigned.
+      Commit `dc62e89`; CI green on all 4 jobs (the PowerShell wrapper ran on Windows);
+      native review (high tier) `review-906b6781f322161e` approved and acknowledged.
+      Follow-up (advisory, build_mcpb.py:75): a staging target INSIDE a staged source dir
+      (e.g. `--out src/x`) is not refused.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
       and a live smoke run.
 
@@ -197,6 +201,7 @@ Out of scope, deliberately:
 - `aec4609` feat: add local SQLite FTS5 index of article sumarios (task 5).
 - `0ac7ff3` feat: switch the sumario index to trigrams with word-start mode (task 5b).
 - `e15698e` feat: add the bome-navaja MCP server; `f319653` fix: Windows portability (task 6).
+- `dc62e89` feat: add the Claude Desktop .mcpb bundle (task 7).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
