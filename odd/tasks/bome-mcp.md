@@ -58,8 +58,9 @@ Out of scope, deliberately:
 
 ## Tasks
 
-- [ ] 1. Scaffold: pyproject (package `bome_navaja`, scripts `bome-navaja-mcp`), MIT license,
+- [x] 1. Scaffold: pyproject (package `bome_navaja`, scripts `bome-navaja-mcp`), MIT license,
       pytest config, CI (Linux gating + Windows), README skeleton, fixtures.
+      Verified: `15 passed` (`uv run pytest`). Commit `409df1f`.
 - [ ] 2. Client + models + parsers: calendar, bulletin page tree, article page, sumario,
       section APIs, CVE resolution, search-results parsing and pagination.
 - [ ] 3. Search: `buscar_bomes` (quick + advanced params) and `buscar_articulos` (drill-down
@@ -75,4 +76,8 @@ Out of scope, deliberately:
 ## Evidence
 
 - Recon: /tmp/bome-recon (raw samples), Engram `bome-navaja/site-recon`.
-- `e696d7e` chore: initialize repository (main).
+- `be43b03` chore: initialize repository (main); `edeee29` docs(odd) (feat/bome-mcp).
+- Incident 2026-09-23: the first two commits (`e696d7e`, `7886b43`) landed in a pre-existing
+  empty repository at `/home/ubuntu/.git` (created 2026-09-11) because `bome-navaja` had no
+  `.git` of its own. Fixed by `git init -b main` inside the project and recreating both commits.
+  Cleaning the stray refs/config in `/home/ubuntu/.git` is pending the user's decision.
