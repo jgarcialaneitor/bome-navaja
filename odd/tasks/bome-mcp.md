@@ -167,7 +167,11 @@ Out of scope, deliberately:
       Follow-ups (low): shutdown waits 10 s but a bulletin with many hidden articles can take
       longer (stale lease for up to 180 s); no size cap on `ver_bome`/`listar_bomes` payloads
       (~120 KB worst case); model-facing keys mix Spanish (search/index) and English (task-2
-      models: `number`, `date`, `sections`).
+      models: `number`, `date`, `sections`); `buscar_en_indice` on an empty index returns
+      before validating its arguments (review advisory, server.py:637).
+      Commits `e15698e` + `f319653` (Windows CI fix: host-judged absolute paths, UTF-8 stdio
+      test). Native reviews (high tier, 4 lenses) `review-7c4fcd6674915bb8` and
+      `review-ca1e368edc1a0aa8` approved and acknowledged. CI green on Linux and Windows.
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
       and a live smoke run.
@@ -181,6 +185,7 @@ Out of scope, deliberately:
 - `b7f6e97` feat: add PDF cache and paginated document reading (task 4).
 - `aec4609` feat: add local SQLite FTS5 index of article sumarios (task 5).
 - `0ac7ff3` feat: switch the sumario index to trigrams with word-start mode (task 5b).
+- `e15698e` feat: add the bome-navaja MCP server; `f319653` fix: Windows portability (task 6).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
