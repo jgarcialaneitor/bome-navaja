@@ -45,6 +45,15 @@ Out of scope, deliberately:
   "destitución" = 0, the BOME says "cese").
 - Article sumarios exist only from late 2016; 2014–2016 bulletins only have the whole PDF
   and page-content search.
+- Learned in task 2 (live-verified 2026-09-23):
+  - Extraordinary bulletins have their own article and sumario kinds: `BOME-AX`, `BOME-SX`
+    (no `BOME-PX` seen yet).
+  - Bulletin tree has 4 levels: departamento → consejería (id = section API id) → organismo →
+    article. The sumario web view has no organismo level and no article CVEs.
+  - Search results carry no snippet. `/buscar` only filters `contenido` when `from` and `tipo`
+    are also sent; otherwise it silently lists the current-year bulletins (task 3 must enforce).
+  - Calendar `end` is inclusive. `/buscar-cve` redirects even for non-existent CVEs (target
+    then 404s), so resolution confirms the target. Year slider: `/api/bomes/{year}` (HTML).
 
 ## Constraints
 
@@ -61,8 +70,10 @@ Out of scope, deliberately:
 - [x] 1. Scaffold: pyproject (package `bome_navaja`, scripts `bome-navaja-mcp`), MIT license,
       pytest config, CI (Linux gating + Windows), README skeleton, fixtures.
       Verified: `15 passed` (`uv run pytest`). Commit `409df1f`.
-- [ ] 2. Client + models + parsers: calendar, bulletin page tree, article page, sumario,
+- [x] 2. Client + models + parsers: calendar, bulletin page tree, article page, sumario,
       section APIs, CVE resolution, search-results parsing and pagination.
+      Verified: `106 passed, 4 skipped` offline; `4 passed` live (`BOME_NAVAJA_LIVE=1`);
+      independent verify PASS, its 2 medium + 3 low findings fixed. Commit: see Evidence.
 - [ ] 3. Search: `buscar_bomes` (quick + advanced params) and `buscar_articulos` (drill-down
       that returns the matching articles, bounded).
 - [ ] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
