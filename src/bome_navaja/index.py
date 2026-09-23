@@ -85,7 +85,11 @@ TRIGRAM_MIN_CHARS = 3
 LEASE_STALE_SECONDS = 180.0
 """A sync lease whose heartbeat is older than this belongs to a dead process."""
 
-BUSY_TIMEOUT_MS = 5000
+BUSY_TIMEOUT_MS = 15_000
+"""Wait up to 15 s for another connection's write lock. Normal writes (one
+bulletin) take milliseconds; the one long writer is the v1→v2 FTS rebuild
+(~2-4 s for ~20k articles), which must not make a concurrent opener or the
+sync of another process fail with "database is locked"."""
 DEFAULT_LIMITE = 20
 MAX_LIMITE = 200
 MAX_DESPLAZAMIENTO = 1_000_000
@@ -177,11 +181,6 @@ def _sql_word_start(texto: str | None, phrase: str | None) -> int:
     if not texto or not phrase:
         return 0
     return 1 if phrase_starts(texto, phrase, palabra=True) else 0
-
-
-def _sql_normalize(text: str | None) -> str:
-    """SQL ``bome_normalize(texto)``: :func:`bome_navaja.text.normalize`."""
-    return normalize(text)
 
 
 def _fts5_available(conn: sqlite3.Connection) -> bool:
@@ -551,7 +550,6 @@ class SumarioIndex:
                 conn.row_factory = sqlite3.Row
                 conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
                 conn.create_function("bome_palabra", 2, _sql_word_start, deterministic=True)
-                conn.create_function("bome_normalize", 1, _sql_normalize, deterministic=True)
             except sqlite3.Error as exc:
                 raise BomeIndexUnavailableError(f"cannot open the index {self.path}: {exc}") from exc
             self._local.conn = conn
@@ -680,17 +678,21 @@ class SumarioIndex:
 
         One transaction; bulletin and article rows are kept, nothing is
         crawled. The version is re-read under the write lock, so a concurrent
-        opener that already migrated makes this a no-op.
+        opener that already migrated makes this a no-op. Each sumario is
+        normalized exactly once, in Python (a SQL function in both the SELECT
+        list and the WHERE clause ran twice per row). Failures roll back and
+        surface from ``__init__`` as :class:`BomeIndexUnavailableError`.
         """
         with self._tx() as tx:
             if self._stored_version(tx) != "1":
                 return
             tx.execute("DROP TABLE IF EXISTS articles_fts")
             tx.execute(_FTS_DDL)
-            tx.execute(
-                "INSERT INTO articles_fts (rowid, texto) "
-                "SELECT id, bome_normalize(sumario) FROM articles "
-                "WHERE bome_normalize(sumario) <> ''"
+            rows = tx.execute("SELECT id, sumario FROM articles").fetchall()
+            folded = ((row[0], normalize(row[1])) for row in rows)
+            tx.executemany(
+                "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)",
+                ((article_id, text) for article_id, text in folded if text),
             )
             tx.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)

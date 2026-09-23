@@ -968,3 +968,32 @@ def test_migration_failure_reports_index_unavailable(
     with sqlite3.connect(path) as raw:
         assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
         assert raw.execute("SELECT count(*) FROM articles").fetchone()[0] == 2
+
+
+# --------------------------------------------------------------------------- task 6: migration advisory
+
+
+def test_migration_normalizes_each_sumario_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "v1.sqlite3"
+    sumarios = [f"Cese número {i} del personal" for i in range(40)] + [None, "  "]
+    build_v1(path, sumarios)
+    calls: list[object] = []
+    real = index_module.normalize
+
+    def counting(text):
+        calls.append(text)
+        return real(text)
+
+    monkeypatch.setattr(index_module, "normalize", counting)
+    index = SumarioIndex(path)
+    try:
+        assert len(calls) <= len(sumarios)
+        monkeypatch.setattr(index_module, "normalize", real)
+        assert index.buscar("cese").total == 40
+    finally:
+        index.close()
+
+
+def test_busy_timeout_covers_a_long_migration(idx: SumarioIndex) -> None:
+    timeout_ms = idx._conn().execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout_ms >= 15_000

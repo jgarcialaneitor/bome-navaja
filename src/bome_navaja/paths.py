@@ -13,7 +13,12 @@ Every function returns ``(path, reason)``, where ``reason`` names the rule
 that decided, and accepts injectable ``platform`` (``sys.platform`` values),
 ``environ`` and ``home`` so every platform can be tested from any host.
 Nothing here creates directories. Empty or blank variables count as unset;
-a leading ``~`` in an override expands to ``home``.
+a leading ``~`` in an override expands to ``home``. The home directory is
+only looked up when the chosen rule needs it; if it cannot be determined a
+:class:`~bome_navaja.models.BomeStorageError` asks for ``BOME_NAVAJA_DATA_DIR``.
+Relative ``BOME_NAVAJA_*`` overrides are resolved against the working
+directory at resolution time (the reason says so); a relative
+``XDG_DATA_HOME`` is ignored, as the XDG spec requires.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+from .models import BomeStorageError
+
 APP_NAME = "bome-navaja"
 
 DATA_DIR_ENV = "BOME_NAVAJA_DATA_DIR"
@@ -31,24 +38,56 @@ INDEX_FILENAME = "sumarios.sqlite3"
 PDF_SUBDIR = "pdfs"
 
 
+RELATIVE_NOTE = " (relative, resolved against the working directory)"
+
+
 def _env(environ: Mapping[str, str], name: str) -> str | None:
     value = environ.get(name, "")
     return value.strip() or None
 
 
-def _expand(value: str, home: Path) -> Path:
-    if value == "~" or value.startswith(("~/", "~\\")):
-        return home / value[2:] if len(value) > 1 else home
+class _Home:
+    """The home directory, resolved only when a rule actually needs it."""
+
+    def __init__(self, home: Path | None) -> None:
+        self._home = home
+
+    def __call__(self) -> Path:
+        if self._home is None:
+            try:
+                self._home = Path.home()
+            except (RuntimeError, KeyError, OSError) as exc:
+                raise BomeStorageError(
+                    f"cannot determine the user's home directory ({exc}); set "
+                    f"{DATA_DIR_ENV} (and optionally {PDF_DIR_ENV}) to an absolute path",
+                    path="~",
+                ) from exc
+        return self._home
+
+
+def _expand(value: str, home: _Home) -> Path:
+    if value == "~":
+        return home()
+    if value.startswith(("~/", "~\\")):
+        return home() / value[2:]
     return Path(value)
+
+
+def _override(value: str, name: str, home: _Home) -> tuple[Path, str]:
+    """An explicit ``BOME_NAVAJA_*`` path: ``~`` expanded, relative made absolute."""
+    path = _expand(value, home)
+    if path.is_absolute():
+        return path, name
+    return Path(os.path.abspath(path)), name + RELATIVE_NOTE
 
 
 def _context(
     platform: str | None, environ: Mapping[str, str] | None, home: Path | None
-) -> tuple[str, Mapping[str, str], Path]:
+) -> tuple[str, Mapping[str, str], _Home]:
     return (
         platform if platform is not None else sys.platform,
         environ if environ is not None else os.environ,
-        home if home is not None else Path.home(),
+        _Home(home),
     )
 
 
@@ -58,22 +97,29 @@ def data_dir(
     environ: Mapping[str, str] | None = None,
     home: Path | None = None,
 ) -> tuple[Path, str]:
-    """Directory holding every bome-navaja file, and why it was chosen."""
-    platform, environ, home = _context(platform, environ, home)
+    """Directory holding every bome-navaja file, and why it was chosen.
+
+    Raises :class:`BomeStorageError` only when the chosen rule needs the home
+    directory and it cannot be determined.
+    """
+    platform, environ, lazy_home = _context(platform, environ, home)
     override = _env(environ, DATA_DIR_ENV)
     if override:
-        return _expand(override, home), DATA_DIR_ENV
+        return _override(override, DATA_DIR_ENV, lazy_home)
     if platform.startswith("win"):
         local = _env(environ, "LOCALAPPDATA")
         if local:
             return Path(local) / APP_NAME, "LOCALAPPDATA"
-        return home / "AppData" / "Local" / APP_NAME, "Windows default"
+        return lazy_home() / "AppData" / "Local" / APP_NAME, "Windows default"
     if platform == "darwin":
-        return home / "Library" / "Application Support" / APP_NAME, "macOS default"
+        return lazy_home() / "Library" / "Application Support" / APP_NAME, "macOS default"
     xdg = _env(environ, "XDG_DATA_HOME")
     if xdg:
-        return _expand(xdg, home) / APP_NAME, "XDG_DATA_HOME"
-    return home / ".local" / "share" / APP_NAME, "XDG default"
+        xdg_path = _expand(xdg, lazy_home)
+        # The XDG spec: a relative path in these variables is invalid; ignore it.
+        if xdg_path.is_absolute():
+            return xdg_path / APP_NAME, "XDG_DATA_HOME"
+    return lazy_home() / ".local" / "share" / APP_NAME, "XDG default"
 
 
 def pdf_dir(
@@ -83,10 +129,10 @@ def pdf_dir(
     home: Path | None = None,
 ) -> tuple[Path, str]:
     """Directory for downloaded PDFs: ``BOME_NAVAJA_PDF_DIR`` or ``data_dir()/pdfs``."""
-    platform, environ, home = _context(platform, environ, home)
+    platform, environ, lazy_home = _context(platform, environ, home)
     override = _env(environ, PDF_DIR_ENV)
     if override:
-        return _expand(override, home), PDF_DIR_ENV
+        return _override(override, PDF_DIR_ENV, lazy_home)
     base, reason = data_dir(platform=platform, environ=environ, home=home)
     return base / PDF_SUBDIR, f"data dir ({reason})"
 

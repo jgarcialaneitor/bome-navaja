@@ -153,7 +153,21 @@ Out of scope, deliberately:
       hits). Commit `0ac7ff3`; CI green (Linux + Windows, trigram available); native review
       `review-0a05f01dafa3410f` approved and acknowledged, with one advisory WARNING at
       index.py:690 (the v1→v2 FTS rebuild) to re-check in task 6.
-- [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
+- [x] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
+      17 Spanish tools on MCP v2 `MCPServer` with routing `instructions`; `ok`/`error`/
+      `error_code` contract (11 BomeError subclasses mapped, `error_interno` without traceback).
+      Site requests from tools are serialised through one locked client (MCP v2 runs sync
+      tools in worker threads); the sync owns a second polite client. Nothing crawls or
+      opens the index at start. Advisories fixed: lazy home + absolute env overrides
+      (paths.py); v1→v2 migration normalises once, busy_timeout 15 s (index.py).
+      Verified: `420 passed, 16 skipped` offline; all 16 live tests passed; independent verify
+      PASS with a real stdio E2E through the `bome-navaja-mcp` script (17 tools, all stdout
+      lines valid JSON-RPC, sync start/poll/search, closing stdin mid-sync exits in 0.5 s with
+      a consistent index). Its medium finding (httpx INFO logs on stderr) and 3 lows fixed.
+      Follow-ups (low): shutdown waits 10 s but a bulletin with many hidden articles can take
+      longer (stale lease for up to 180 s); no size cap on `ver_bome`/`listar_bomes` payloads
+      (~120 KB worst case); model-facing keys mix Spanish (search/index) and English (task-2
+      models: `number`, `date`, `sections`).
 - [ ] 7. `.mcpb` bundle: manifest template, launcher, build scripts (Linux + Windows), parity test.
 - [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
       and a live smoke run.

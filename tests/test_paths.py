@@ -118,3 +118,45 @@ def test_index_path() -> None:
     path, reason = index_path(platform="win32", environ=environ, home=HOME)
     assert path == Path(r"C:\L") / "bome-navaja" / "sumarios.sqlite3"
     assert reason == "data dir (LOCALAPPDATA)"
+
+
+# --------------------------------------------------------------------------- task 6 advisories
+
+
+def _no_home() -> Path:
+    raise RuntimeError("Could not determine home directory.")
+
+
+def test_home_is_not_needed_when_an_absolute_override_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Path, "home", staticmethod(_no_home))
+    path, reason = data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": "/srv/bome"})
+    assert (path, reason) == (Path("/srv/bome"), "BOME_NAVAJA_DATA_DIR")
+    pdfs, _ = pdf_dir(platform="linux", environ={"BOME_NAVAJA_PDF_DIR": "/pdfs"})
+    assert pdfs == Path("/pdfs")
+    windows, _ = data_dir(platform="win32", environ={"LOCALAPPDATA": r"C:\L"})
+    assert windows == Path(r"C:\L") / "bome-navaja"
+
+
+def test_missing_home_is_a_clear_bome_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bome_navaja.models import BomeStorageError
+
+    monkeypatch.setattr(Path, "home", staticmethod(_no_home))
+    for platform in ("linux", "darwin", "win32"):
+        with pytest.raises(BomeStorageError, match="BOME_NAVAJA_DATA_DIR"):
+            data_dir(platform=platform, environ={})
+    with pytest.raises(BomeStorageError):
+        data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": "~/bome"})
+
+
+def test_relative_overrides_are_made_absolute(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    path, reason = data_dir(platform="linux", environ={"BOME_NAVAJA_DATA_DIR": "datos"}, home=HOME)
+    assert path == tmp_path / "datos"
+    assert path.is_absolute()
+    assert reason == "BOME_NAVAJA_DATA_DIR (relative, resolved against the working directory)"
+    pdfs, pdf_reason = pdf_dir(platform="linux", environ={"BOME_NAVAJA_PDF_DIR": "./pdfs"}, home=HOME)
+    assert pdfs == tmp_path / "pdfs"
+    assert pdf_reason.startswith("BOME_NAVAJA_PDF_DIR (relative")
+    # The XDG spec says a relative XDG_DATA_HOME is invalid and must be ignored.
+    xdg, xdg_reason = data_dir(platform="linux", environ={"XDG_DATA_HOME": "xdg"}, home=HOME)
+    assert (xdg, xdg_reason) == (HOME / ".local" / "share" / "bome-navaja", "XDG default")
