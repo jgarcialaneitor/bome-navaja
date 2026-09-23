@@ -45,6 +45,28 @@ class BomeParseError(BomeError):
     """A page or payload did not have the expected shape."""
 
 
+class BomeDocumentTooLargeError(BomeError):
+    """A download exceeded the size cap (100 MB for PDFs); nothing was saved."""
+
+    error_code = "documento_demasiado_grande"
+
+    def __init__(self, message: str, *, size: int, limit: int) -> None:
+        super().__init__(message)
+        self.size = size
+        """Bytes announced or received when the download was stopped."""
+        self.limit = limit
+
+
+class BomeStorageError(BomeError):
+    """A local file operation failed (disk full, permissions, locked file)."""
+
+    error_code = "error_almacenamiento"
+
+    def __init__(self, message: str, *, path: str) -> None:
+        super().__init__(message)
+        self.path = path
+
+
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}

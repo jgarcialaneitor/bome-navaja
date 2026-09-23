@@ -38,6 +38,7 @@ from .cve import (
 )
 from .models import (
     Article,
+    BomeDocumentTooLargeError,
     BomeError,
     BomeHTTPError,
     BomeNotFoundError,
@@ -85,6 +86,19 @@ _GENERIC_CVE = re.compile(r"BOME-[A-Z]{1,2}-\d{4}-\d+")
 def _today() -> date:
     """Today's date; a seam so tests can pin it."""
     return date.today()
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """Map 404 to :class:`BomeNotFoundError` and other 4xx/5xx to :class:`BomeHTTPError`."""
+    final_url = str(response.url)
+    if response.status_code == 404:
+        raise BomeNotFoundError(f"not found: {final_url}", status=404, url=final_url)
+    if response.status_code >= 400:
+        raise BomeHTTPError(
+            f"HTTP {response.status_code} for {final_url}",
+            status=response.status_code,
+            url=final_url,
+        )
 
 
 class BomeClient:
@@ -170,15 +184,7 @@ class BomeClient:
         finally:
             if self.polite_delay > 0:
                 self._last_request = time.monotonic()
-        final_url = str(response.url)
-        if response.status_code == 404:
-            raise BomeNotFoundError(f"not found: {final_url}", status=404, url=final_url)
-        if response.status_code >= 400:
-            raise BomeHTTPError(
-                f"HTTP {response.status_code} for {final_url}",
-                status=response.status_code,
-                url=final_url,
-            )
+        _raise_for_status(response)
         return response
 
     def _get_text(
@@ -265,7 +271,7 @@ class BomeClient:
             raise InvalidCveError(f"{article} is not an article CVE matching {bulletin}")
         return article.number
 
-    def resolve_cve(self, cve: str | Cve) -> str:
+    def resolve_cve(self, cve: str | Cve, *, confirm: bool = True) -> str:
         """Canonical page URL of any CVE, read from the resolver's 302.
 
         The resolver redirects even for CVEs that do not exist (live:
@@ -275,6 +281,10 @@ class BomeClient:
         Raises :class:`BomeNotFoundError` when the site does not redirect,
         redirects off-site or to the home page, or the target page is missing.
         An off-site target is never requested.
+
+        ``confirm=False`` skips the confirmation GET and returns the redirect
+        target as is; use it when the caller fetches that page next anyway
+        (it will raise :class:`BomeNotFoundError` itself if missing).
         """
         text = str(cve) if isinstance(cve, Cve) else re.sub(r"\s+", "", cve).upper()
         if _GENERIC_CVE.fullmatch(text) is None:
@@ -293,18 +303,53 @@ class BomeClient:
             raise BomeNotFoundError(
                 f"CVE {text} resolved to the home page", status=response.status_code, url=url
             )
+        if not confirm:
+            return target
         confirmation = self._request(target)
         return str(confirmation.url)
 
-    def download(self, cve: str | Cve) -> bytes:
-        """PDF bytes of any CVE (bulletin, sumario, article or page)."""
-        response = self._request(pdf_path(cve))
-        content = response.content
+    def download(self, cve: str | Cve, *, max_bytes: int | None = None) -> bytes:
+        """PDF bytes of any CVE (bulletin, sumario, article or page).
+
+        The body is streamed; with ``max_bytes`` the download aborts with
+        :class:`BomeDocumentTooLargeError` as soon as the announced
+        ``Content-Length`` or the bytes received exceed it.
+        """
+        path = pdf_path(cve)
+        url = self.base_url + path
+        if self._client.is_closed:
+            raise BomeHTTPError(f"client is closed; cannot request {url}", status=None, url=url)
+        self._wait_politely()
+        chunks: list[bytes] = []
+        received = 0
+        try:
+            with self._client.stream("GET", path) as response:
+                _raise_for_status(response)
+                announced = response.headers.get("content-length", "")
+                if max_bytes is not None and announced.isdigit() and int(announced) > max_bytes:
+                    raise BomeDocumentTooLargeError(
+                        f"{url} announces {announced} bytes, over the {max_bytes}-byte limit",
+                        size=int(announced),
+                        limit=max_bytes,
+                    )
+                for chunk in response.iter_bytes():
+                    received += len(chunk)
+                    if max_bytes is not None and received > max_bytes:
+                        raise BomeDocumentTooLargeError(
+                            f"{url} exceeded the {max_bytes}-byte limit while downloading",
+                            size=received,
+                            limit=max_bytes,
+                        )
+                    chunks.append(chunk)
+                content_type = response.headers.get("content-type")
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
+        finally:
+            if self.polite_delay > 0:
+                self._last_request = time.monotonic()
+        content = b"".join(chunks)
         if not content.lstrip()[:4] == b"%PDF":
-            raise BomeParseError(
-                f"{response.url} did not return a PDF "
-                f"(content-type {response.headers.get('content-type')!r})"
-            )
+            raise BomeParseError(f"{url} did not return a PDF (content-type {content_type!r})")
         return content
 
     # ------------------------------------------------------------------ search

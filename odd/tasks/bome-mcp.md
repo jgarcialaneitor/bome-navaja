@@ -64,6 +64,13 @@ Out of scope, deliberately:
     the drill-down fetches numbering gaps from `/articulo/{n}`. Edge omissions are undetectable.
   - Some sumario pages (e.g. 2025-6294) are free-form `<p>` HTML and parse to 0 entries:
     task 5 must index from bulletin pages + gap fetch, not from the sumario view.
+- Learned in task 4 (live-verified 2026-09-23):
+  - 2014–2016 PDFs answer 404 (B-2014-5092, B-2015-5272, B-2016-5397, A-2014-2) although the
+    page still shows "DESCARGAR BOME"; old articles have neither HTML text nor PDF.
+  - Sizes: bulletin 6416 = 4.2 MB / 37 pages (~88k chars); sumario 253 KB / 2; article 1051
+    265 KB / 4; page PDF 66 KB / 1. All recent PDFs have a text layer.
+  - Article CVEs map to their bulletin only through `/buscar-cve` (302 to
+    `/bome/{B}/articulo/{n}`); a page CVE resolves to the article URL + `#pagina-N`.
 
 ## Constraints
 
@@ -98,7 +105,11 @@ Out of scope, deliberately:
       Follow-ups (advisory): gap detection (search.py:660) misses edge omissions and assumes
       consecutive numbering; skip gap fetches when a `consejeria` filter is absent from the
       bulletin; OR-merge order with dateless bulletins.
-- [ ] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
+- [x] 4. Documents: PDF download with safe cross-platform paths; paginated PDF/HTML text reading.
+      Verified: `222 passed, 13 skipped` offline; all 13 live tests passed; independent verify
+      PASS (bulletin 6416 read in 5 chunks, pages 1..37 without gaps). Verify findings F1
+      (non-positive budget in `paginar`) and F2 (temp file left on interrupt) fixed.
+      Follow-up (perf): cache hits re-hash and re-parse the whole PDF on every read.
 - [ ] 5. Local sumario index: SQLite FTS5, incremental background sync with progress,
       index search tool, index status.
 - [ ] 6. MCP server: every tool wired, uniform contract, `estado_servidor`, tests.
