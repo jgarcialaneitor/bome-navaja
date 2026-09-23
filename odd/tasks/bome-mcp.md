@@ -112,6 +112,9 @@ Out of scope, deliberately:
 - `be43b03` chore: initialize repository (main); `edeee29` docs(odd) (feat/bome-mcp).
 - `bed0423` feat: add BOME client, CVE model and site parsers (task 2).
 - `0e20f5f` feat: add BOME search and article drill-down (task 3).
+- Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
+  (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
+  draft PR #1 that grows with the feature. CI green on Linux and Windows.
 - Incident 2026-09-23: the first two commits (`e696d7e`, `7886b43`) landed in a pre-existing
   empty repository at `/home/ubuntu/.git` (created 2026-09-11) because `bome-navaja` had no
   `.git` of its own. Fixed by `git init -b main` inside the project and recreating both commits.
