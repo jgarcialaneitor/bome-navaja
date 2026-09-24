@@ -48,4 +48,13 @@ Out of scope:
 - [x] 4. Docs: README (timings, courtesy, variables, new state), task evidence.
       Tasks 3 and 4 share one commit: the README test requires every env var the code
       reads to be documented, so the docs travel with the behaviour.
-      Verified: `510 passed, 16 skipped`.
+      Verified: `510 passed, 16 skipped`. Commit `e91c755`; native review
+      `review-d2be1f642de89a91` approved (4 lenses) and acknowledged.
+      Follow-ups (advisory, non-blocking, R3-001 / R4-cap-starvation at sync.py:450): the cap
+      takes the newest planned bulletins, and recent re-indexes plus retried errors come first,
+      so more persistent `error` bulletins than the cap could starve older unindexed ones.
+
+## Pending decisions
+
+- User-Agent: still a spoofed Chrome UA (point 5 of the proposal); the user has not decided.
+- `.mcpb` manifest does not expose the two sync overrides as user settings yet.
