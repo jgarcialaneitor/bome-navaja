@@ -33,10 +33,19 @@ decision 2026-09-24: leave as they are).
 
 ## Tasks
 
-- [x] 1. `PX` CVE kind. Verified: `515 passed, 16 skipped`.
+- [x] 1. `PX` CVE kind. Verified: `515 passed, 16 skipped`. Commit `1294afc`; native review
+      `review-7eb466b03d0875b0` approved and acknowledged.
 - [x] 2. Index v3: `http_status`, failure count, `roto` state, plan skips `roto`, migration.
       Verified: `536 passed, 16 skipped`. Migrated v2 errors with a stored 5xx become `roto` at once.
+      Commit `aaf93cc`; native review `review-f3bb95755a5b510b` approved (4 lenses) and acknowledged.
+      Follow-up (advisory, index.py:877): a migrated `roto` (fallos 1) retried with
+      `reintentar_rotos` that then times out or answers 4xx drops back to `error`.
 - [x] 3. Site guard: persisted error budget + cooldown, wired into client and sync.
       Verified: `593 passed, 16 skipped`. The guard replaces the v0.0.2 exponential block
       retries: a site block or 2 transport failures close the site for 75 min (or Retry-After).
-- [ ] 4. Server tools, README, version 0.0.3.
+      Commit `67a8e53`; native review `review-0daa5029660912c5` approved (4 lenses) and
+      acknowledged. Follow-ups (advisory): guard.py:285 state-file parsing, client.py:297.
+      Known limits: the state file is read-merge-written without a cross-process lock, so two
+      processes erring at the same instant can go 1-2 over the budget (still under 5).
+- [x] 4. Server tools, README, version 0.0.3. Verified: `593 passed, 16 skipped`. Commit
+      `3a06686`; native review `review-f3ca6064c6b4d09e` approved and acknowledged.
