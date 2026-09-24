@@ -68,12 +68,17 @@ proceeding: no bulk crawling of those paths (no index sync from the old portal) 
 - [x] 4. Server tools, README, version 0.0.3. Verified: `593 passed, 16 skipped`. Commit
       `3a06686`; native review `review-f3ca6064c6b4d09e` approved and acknowledged.
 - [x] 5. Sync default start 2018-01-01. Verified: `599 passed, 16 skipped`. Pre-2018 gaps are
-      reported apart as `pendientes_anteriores_2018`.
+      reported apart as `pendientes_anteriores_2018`. Commit `51405e4`; native review
+      `review-331770780bc8445c` approved (4 lenses) and acknowledged.
 - [x] 6. Old-portal client + parsers + catalog cache + own guard. Verified: `680 passed, 18 skipped`
       (2 live tests not run). Full raw catalog: 3,260 unique bulletins 1985-01-03..2021-03-12,
       1,031 from 2014; 24 pre-2014 identifiers repeat (lookup by CVE returns a list).
       Found: 14 bulletins with the same number but a different date on each site
       (e.g. BOME-B-2015-5230: 2015-12-17 on bomemelilla.es vs 2015-05-01 on melilla.es).
+      Commits `4ca8c62` (fixtures; unreviewed: over the reviewer context budget, captured data only)
+      and `3094160` (native review `review-95e41b4b5d45c8c6` approved and acknowledged; advisory:
+      antiguo.py:560-610 cached ficha validation).
 - [x] 7. Old-portal tools, README, manifest. Verified: `723 passed, 18 skipped`. 19 tools:
       `buscar_bome_antiguo`, `ver_bome_antiguo`; `listar_bomes` merges both catalogs with `origen`;
-      `leer_pdf`/`descargar_pdf` accept a validated old-portal `url` (cached as `melilla-<a>-<b>-<name>.pdf`).
+      `leer_pdf`/`descargar_pdf` accept a validated old-portal `url` (cached as `melilla-<a>-<b>-<name>.pdf`). Commit `a5b6184`; native review
+      `review-d5b56c436dfd0bfe` approved (4 lenses) and acknowledged.
