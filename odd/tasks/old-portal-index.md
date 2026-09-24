@@ -54,3 +54,4 @@ portal is a frozen legacy site that may disappear.
       then bulletins listing nothing are tried before the neighbours; at most 2 article pages per
       lookup (2 not 3: a failed lookup must leave room in the guard's 3-per-10-min budget for the
       explicit call its error suggests). Verified: `839 passed, 18 skipped`; live AX-2019-103 still OK.
+      Commit `f1b990a`; native review `review-81fa7c9c20838b4f` approved and acknowledged.
