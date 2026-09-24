@@ -14,8 +14,14 @@ its polite-delay bookkeeping) is created lazily and used under
 keeps the server polite. The local index uses one SQLite connection per
 thread (see :mod:`bome_navaja.index`) and needs no extra lock. The background
 sync owns a separate client created by the same factory, but asked for the
-slower sync pace (:func:`bome_navaja.sync.sync_settings_from_env`: its
-environment overrides are read when the sync is first used).
+slower sync pace.
+
+Settings: every site-facing tunable (sync pace, jitter and cap, interactive
+pace, guard budget, window and cooldown, pause after an error, timeout) comes
+from :mod:`bome_navaja.ajustes`, read from the environment once per process
+(:func:`_ajustes`, when a client, guard or sync is first needed; its warnings
+go to stderr then). Changing a variable needs a restart; ``estado_servidor``
+re-reads them only to report them.
 
 Two syncs, one per origin, each created lazily once per process with its own
 lease owner: :class:`~bome_navaja.sync.SincronizadorIndice` (bomemelilla.es)
@@ -68,6 +74,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
+from .ajustes import Ajustes, ajustes_desde_entorno
 from .antiguo import (
     FICHERO_CATALOGO,
     PORTAL_URL,
@@ -106,10 +113,10 @@ from .models import (
     BomeStorageError,
 )
 from .paths import data_dir, index_path, pdf_dir
-from .search import RECOMMENDED_POLITE_DELAY, BusquedaInvalidaError, articulos_del_boletin
+from .search import BusquedaInvalidaError, articulos_del_boletin
 from .search import buscar_articulos as _buscar_articulos
 from .search import buscar_bomes as _buscar_bomes
-from .sync import SincronizadorBase, SincronizadorIndice, SyncSettings, sync_settings_from_env
+from .sync import SincronizadorBase, SincronizadorIndice, sync_settings_from_env
 from .sync_antiguo import SincronizadorPortalAntiguo
 
 MAX_LISTADO = 500
@@ -167,7 +174,7 @@ Qué herramienta usar:
   sincronización a la vez por índice, sea del origen que sea.
 
 Cortafuegos del sitio: bomemelilla.es bloquea la IP tras unas 5 respuestas de error, y
-bome-navaja se protege sola (como mucho 3 errores cada 10 minutos entre todas las
+bome-navaja se protege sola (por defecto, como mucho 3 errores cada 10 minutos entre todas las
 herramientas y la sincronización). Si una herramienta responde pausa_preventiva (pausa propia,
 no un bloqueo) o sitio_bloqueando (el sitio nos bloqueó: no se le pide nada durante ~75 min),
 espera reintentar_tras_segundos antes de reintentar; no repitas la llamada en bucle ni cambies
@@ -192,13 +199,42 @@ class ArgumentoInvalidoError(BomeError, ValueError):
 # --------------------------------------------------------------------------- shared state
 
 
+_ajustes_lock = threading.Lock()
+_ajustes_proceso: Ajustes | None = None
+
+
+def _ajustes() -> Ajustes:
+    """The site-facing settings of this process (:mod:`bome_navaja.ajustes`).
+
+    Read from the environment on first use and kept until
+    :func:`close_shared_state`, so changing a variable needs a restart. The
+    first read prints its invalid-value and risk warnings to stderr. It takes
+    only its own lock, so it may run while ``_state_lock`` is held.
+    """
+    global _ajustes_proceso
+    with _ajustes_lock:
+        if _ajustes_proceso is None:
+            _ajustes_proceso = ajustes_desde_entorno(os.environ)
+            for mensaje in _ajustes_proceso.mensajes:
+                print(f"bome-navaja: {mensaje}", file=sys.stderr)
+        return _ajustes_proceso
+
+
 def _default_client_factory(
     *,
-    polite_delay: float = RECOMMENDED_POLITE_DELAY,
+    polite_delay: float | None = None,
     jitter: float = 0.0,
     guard: GuardiaSitio | None = None,
 ) -> BomeClient:
-    return BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
+    """A bomemelilla.es client with the configured timeout; ``polite_delay``
+    defaults to the configured interactive pace (``BOME_NAVAJA_QUERY_DELAY``)."""
+    ajustes = _ajustes()
+    return BomeClient(
+        polite_delay=ajustes.pausa_consultas_segundos if polite_delay is None else polite_delay,
+        jitter=jitter,
+        guard=guard,
+        timeout=ajustes.tiempo_espera_segundos,
+    )
 
 
 _client_factory: Callable[..., BomeClient] = _default_client_factory
@@ -224,7 +260,11 @@ def _default_portal_factory(
     polite_delay: float = PORTAL_POLITE_DELAY,
     jitter: float = PORTAL_JITTER,
 ) -> PortalAntiguo:
-    return PortalAntiguo(guard=guard, polite_delay=polite_delay, jitter=jitter)
+    """An old-portal client with the configured timeout; the interactive pace
+    stays the portal's own (1 s + up to 0.5 s)."""
+    return PortalAntiguo(
+        guard=guard, polite_delay=polite_delay, jitter=jitter, timeout=_ajustes().tiempo_espera_segundos
+    )
 
 
 _portal_factory: Callable[..., PortalAntiguo] = _default_portal_factory
@@ -238,9 +278,19 @@ _portal: PortalAntiguo | None = None
 _portal_guard: GuardiaSitio | None = None
 
 
+def _guard_limits(ajustes: Ajustes) -> dict[str, Any]:
+    """The configured error budget, window and cooldown, as guard keywords."""
+    return {
+        "max_errores": ajustes.guardia_max_errores,
+        "ventana_segundos": ajustes.guardia_ventana_segundos,
+        "enfriamiento_segundos": ajustes.guardia_enfriamiento_segundos,
+    }
+
+
 def _get_guard() -> GuardiaSitio:
     """The process's site guard, persisted in the data folder when there is one."""
     global _guard
+    ajustes = _ajustes()
     with _state_lock:
         if _guard is None:
             try:
@@ -252,13 +302,14 @@ def _get_guard() -> GuardiaSitio:
                     file=sys.stderr,
                 )
                 path = None
-            _guard = GuardiaSitio(path)
+            _guard = GuardiaSitio(path, **_guard_limits(ajustes))
         return _guard
 
 
 def _get_portal_guard() -> GuardiaSitio:
     """The old portal's guard (melilla.es), persisted apart from bomemelilla.es's."""
     global _portal_guard
+    ajustes = _ajustes()
     with _state_lock:
         if _portal_guard is None:
             try:
@@ -270,7 +321,7 @@ def _get_portal_guard() -> GuardiaSitio:
                     file=sys.stderr,
                 )
                 path = None
-            _portal_guard = GuardiaSitio(path, sitio=SITIO_ANTIGUO)
+            _portal_guard = GuardiaSitio(path, sitio=SITIO_ANTIGUO, **_guard_limits(ajustes))
         return _portal_guard
 
 
@@ -383,57 +434,54 @@ def _boletin_indexado(cve: Cve) -> Cve | None:
         return None
 
 
-def _sync_settings() -> SyncSettings:
-    return sync_settings_from_env(os.environ)
-
-
 def _get_sync() -> SincronizadorIndice:
     global _sync
     index = _get_index()
     guard = _get_guard()
+    settings = _ajustes()
     with _state_lock:
         if _sync is None:
-            settings = _sync_settings()
-            for warning in settings.warnings:
-                print(f"bome-navaja: {warning}", file=sys.stderr)
+            delay = settings.pausa_sincronizacion_segundos
+            jitter = settings.variacion_sincronizacion_segundos
 
             def sync_client(*, guard: GuardiaSitio | None = None) -> BomeClient:
-                return _client_factory(
-                    polite_delay=settings.polite_delay, jitter=settings.jitter, guard=guard
-                )
+                return _client_factory(polite_delay=delay, jitter=jitter, guard=guard)
 
             _sync = SincronizadorIndice(
                 index,
                 sync_client,
-                polite_delay=settings.polite_delay,
-                jitter=settings.jitter,
-                max_boletines=settings.max_boletines,
+                polite_delay=delay,
+                jitter=jitter,
+                max_boletines=settings.max_boletines_por_ejecucion,
                 guard=guard,
+                pausa_tras_error=settings.pausa_tras_error_segundos,
             )
         return _sync
 
 
 def _get_sync_antiguo() -> SincronizadorPortalAntiguo:
-    """The old-portal sync: the old-portal guard, the sync pace and cap, its own lease owner."""
+    """The old-portal sync: the old-portal guard, the sync pace, cap and pause
+    after an error, its own lease owner."""
     global _sync_antiguo
     index = _get_index()
     guard = _get_portal_guard()
+    settings = _ajustes()
     with _state_lock:
         if _sync_antiguo is None:
-            settings = _sync_settings()
-            for warning in settings.warnings:
-                print(f"bome-navaja: {warning}", file=sys.stderr)
+            delay = settings.pausa_sincronizacion_segundos
+            jitter = settings.variacion_sincronizacion_segundos
 
             def sync_portal(*, guard: GuardiaSitio) -> PortalAntiguo:
-                return _portal_factory(guard=guard, polite_delay=settings.polite_delay, jitter=settings.jitter)
+                return _portal_factory(guard=guard, polite_delay=delay, jitter=jitter)
 
             _sync_antiguo = SincronizadorPortalAntiguo(
                 index,
                 sync_portal,
-                polite_delay=settings.polite_delay,
-                jitter=settings.jitter,
-                max_boletines=settings.max_boletines,
+                polite_delay=delay,
+                jitter=jitter,
+                max_boletines=settings.max_boletines_por_ejecucion,
                 guard=guard,
+                pausa_tras_error=settings.pausa_tras_error_segundos,
             )
         return _sync_antiguo
 
@@ -450,14 +498,20 @@ def _sync_actual() -> SincronizadorBase | None:
 
 
 def close_shared_state() -> None:
-    """Stop both syncs, close the shared clients and the index (shutdown and tests)."""
+    """Stop both syncs, close the shared clients and the index (shutdown and tests).
+
+    The settings are forgotten too: the next use reads the environment again.
+    """
     global _client, _index, _sync, _sync_antiguo, _sync_reciente, _guard, _portal, _portal_guard
+    global _ajustes_proceso
     with _state_lock:
         syncs = (_sync, _sync_antiguo)
         index, client, portal = _index, _client, _portal
         _sync = _sync_antiguo = _sync_reciente = None
         _index = _client = _portal = None
         _guard = _portal_guard = None
+    with _ajustes_lock:
+        _ajustes_proceso = None
     for sync in syncs:
         if sync is not None:
             sync.cancelar()
@@ -1239,9 +1293,9 @@ def estado_indice() -> dict:
     dice qué origen sincroniza ahora cualquier proceso.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
     nos bloqueó: 403/429/503 o dos peticiones seguidas sin respuesta; lo indexado se conserva y
-    bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min: no vuelvas a
-    sincronizar antes; ver 'mensaje'). En 'mensaje' también aparecen las pausas preventivas
-    (como mucho 3 respuestas de error del sitio cada 10 minutos) y la sincronización cuenta
+    bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min por defecto: no vuelvas
+    a sincronizar antes; ver 'mensaje'). En 'mensaje' también aparecen las pausas preventivas
+    (por defecto, como mucho 3 respuestas de error del sitio cada 10 minutos) y la sincronización cuenta
     los boletines que quedaron rotos en 'rotos'.
     """
     path, exists = _index_file()
@@ -1293,7 +1347,8 @@ def sincronizar_indice(
     devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. El cortafuegos del
     sitio bloquea la IP tras unas 5 respuestas de error, así que la sincronización admite como
     mucho 3 cada 10 minutos (si llega al límite hace una pausa preventiva y va más lenta) y
-    espera 30-60 s tras una página rota. Si el sitio la bloquea (403/429/503 o dos peticiones
+    espera 30-60 s tras una página rota (valores por defecto; los que están en uso, en
+    estado_servidor, 'ajustes'). Si el sitio la bloquea (403/429/503 o dos peticiones
     seguidas sin respuesta) termina en estado "bloqueado" y bome-navaja no le pide nada durante
     reintentar_tras_segundos (~75 min): no la relances antes (terminaría "bloqueado" al
     instante).
@@ -1403,28 +1458,41 @@ def estado_servidor() -> dict:
     Versión, pid, rutas de datos, PDFs e índice (con el motivo de cada una: variable de
     entorno, XDG, LOCALAPPDATA...; las rutas relativas en BOME_NAVAJA_* se resuelven contra
     el directorio de trabajo), si existe el fichero del índice y su estado si ya está
-    abierto, versión de SQLite con FTS5/trigram, pausa de cortesía de las herramientas y de
-    la sincronización (pausa, variación aleatoria y máximo de boletines por ejecución, con
-    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas), URL base y la
-    guardia del sitio (guardia_sitio: enfriamiento_hasta, segundos_restantes y motivo si el
-    sitio nos bloqueó, durante el cual las herramientas responden sitio_bloqueando; errores
-    HTTP en la ventana de 10 minutos frente al máximo permitido, 3: con el cupo lleno
-    las herramientas responden pausa_preventiva; y su fichero estado_sitio.json,
-    compartido por todos los procesos de bome-navaja). Del portal antiguo (melilla.es):
-    url_portal_antiguo, su propia guardia (guardia_portal_antiguo, con su fichero
-    estado_sitio_melilla.json) y la caché de su catálogo (catalogo_portal_antiguo: ruta,
-    existe, fetched_at y número de boletines). La sincronización del portal antiguo
-    (sincronizar_indice con origen="melilla.es") va al mismo ritmo y con el mismo máximo por
-    ejecución que la de bomemelilla.es, con las mismas variables de entorno aplicadas:
-    cortesia_sincronizacion_portal_antiguo (el portal interactivo va a ~1-1,5 s entre
-    peticiones).
+    abierto, versión de SQLite con FTS5/trigram, URL base y:
+    - ajustes: todos los ajustes que marcan cuánto se le pide a los sitios, con las variables
+      de entorno aplicadas (un único juego para bomemelilla.es y el portal antiguo):
+      pausa_sincronizacion_segundos y variacion_sincronizacion_segundos (ritmo de la
+      sincronización), max_boletines_por_ejecucion, pausa_consultas_segundos (herramientas de
+      bomemelilla.es), guardia_max_errores, guardia_ventana_minutos y
+      guardia_enfriamiento_minutos (guardia del sitio), pausa_tras_error_segundos (la pausa
+      tras una página rota va de ese valor al doble, pausa_tras_error_max_segundos),
+      tiempo_espera_segundos; 'variables' dice qué variable BOME_NAVAJA_* fija cada uno,
+      'avisos' los valores no válidos (se usa el valor por defecto) y 'riesgos' los valores
+      más arriesgados que lo recomendado (se usan igualmente; explícale al usuario el riesgo
+      de bloqueo). Se leen al arrancar: cambiarlos exige reiniciar el servidor.
+    - cortesia_segundos (pausa de las herramientas) y cortesia_sincronizacion (pausa, variación
+      aleatoria y máximo de boletines por ejecución, con BOME_NAVAJA_SYNC_DELAY,
+      BOME_NAVAJA_SYNC_JITTER y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas, y sus avisos).
+    - guardia_sitio: enfriamiento_hasta, segundos_restantes y motivo si el sitio nos bloqueó,
+      durante el cual las herramientas responden sitio_bloqueando; errores HTTP en la ventana
+      (ventana_segundos, 10 minutos por defecto) frente al máximo permitido (max_errores, 3 por
+      defecto): con el cupo lleno las herramientas responden pausa_preventiva; y su fichero
+      estado_sitio.json, compartido por todos los procesos de bome-navaja.
+    - Del portal antiguo (melilla.es): url_portal_antiguo, su propia guardia
+      (guardia_portal_antiguo, con su fichero estado_sitio_melilla.json) y la caché de su
+      catálogo (catalogo_portal_antiguo: ruta, existe, fetched_at y número de boletines). La
+      sincronización del portal antiguo (sincronizar_indice con origen="melilla.es") va al
+      mismo ritmo y con el mismo máximo por ejecución que la de bomemelilla.es, con las mismas
+      variables de entorno aplicadas: cortesia_sincronizacion_portal_antiguo (el portal
+      interactivo va a ~1-1,5 s entre peticiones).
     """
     try:
         exists = index_path()[0].exists()
     except BomeError:
         exists = False
     index = _index
-    settings = _sync_settings()
+    ajustes = ajustes_desde_entorno(os.environ)
+    settings = sync_settings_from_env(os.environ)
     sync_pace: dict[str, Any] = {
         "pausa_segundos": settings.polite_delay,
         "variacion_segundos": settings.jitter,
@@ -1440,7 +1508,8 @@ def estado_servidor() -> dict:
         "indice": index.estado().to_dict() if index is not None else None,
         "sincronizacion": _sync_state(),
         "sqlite": _sqlite_capabilities(),
-        "cortesia_segundos": RECOMMENDED_POLITE_DELAY,
+        "ajustes": ajustes.to_dict(),
+        "cortesia_segundos": ajustes.pausa_consultas_segundos,
         "cortesia_sincronizacion": sync_pace,
         "cortesia_sincronizacion_portal_antiguo": dict(sync_pace),
         "url_base": BASE_URL,

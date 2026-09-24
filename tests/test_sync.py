@@ -584,6 +584,40 @@ def test_a_broken_page_is_followed_by_a_random_pause(site: Site, index: SumarioI
     assert state.errores == 1
 
 
+def test_the_pause_after_a_broken_page_uses_the_configured_minimum(site: Site, index: SumarioIndex) -> None:
+    draws: list[tuple[float, float]] = []
+
+    def pausa(low: float, high: float) -> float:
+        draws.append((low, high))
+        return low
+
+    waits = Waits(clock=site.clock)
+    state = run(make_sync(index, site, wait=waits, pausa_aleatoria=pausa, pausa_tras_error=5))
+    assert state.estado == "completado"
+    assert draws == [(5.0, 10.0)]  # min .. 2 * min
+    assert waits.slices == [5]
+
+
+def test_no_pause_after_a_broken_page_when_configured_to_zero(site: Site, index: SumarioIndex) -> None:
+    draws: list[tuple[float, float]] = []
+
+    def pausa(low: float, high: float) -> float:
+        draws.append((low, high))
+        return low
+
+    waits = Waits(clock=site.clock)
+    state = run(make_sync(index, site, wait=waits, pausa_aleatoria=pausa, pausa_tras_error=0))
+    assert state.estado == "completado"
+    assert draws == [(0.0, 0.0)]
+    assert [s for s in waits.slices if s] == []
+
+
+@pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), True, "30"])
+def test_the_pause_after_an_error_is_validated(site: Site, index: SumarioIndex, bad: object) -> None:
+    with pytest.raises(ValueError, match="pausa_tras_error"):
+        make_sync(index, site, pausa_tras_error=bad)
+
+
 def test_other_failures_need_no_pause(site: Site, index: SumarioIndex) -> None:
     site.fix_6415()
     site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(404)
@@ -825,15 +859,31 @@ def test_settings_accept_valid_overrides() -> None:
     assert sync_settings_from_env({"BOME_NAVAJA_SYNC_DELAY": "1"}).polite_delay == 1.0
 
 
-@pytest.mark.parametrize("value", ["0.2", "0", "-3"])
-def test_a_delay_below_one_second_is_clamped_with_a_warning(value: str) -> None:
+@pytest.mark.parametrize(("value", "expected"), [("0.2", 0.2), ("0", 0.0), ("1", 1.0), ("1.99", 1.99)])
+def test_a_delay_below_the_recommended_one_is_kept_with_a_risk_warning(value: str, expected: float) -> None:
+    # No hard floor any more (user decision 2026-09-24): the value is used as given.
     settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_DELAY": value})
-    assert settings.polite_delay == 1.0
+    assert settings.polite_delay == expected
     (warning,) = settings.warnings
-    assert "BOME_NAVAJA_SYNC_DELAY" in warning and value in warning and "1" in warning
+    assert warning.startswith(f"BOME_NAVAJA_SYNC_DELAY={expected:g} s:")
+    assert "más arriesgado que lo recomendado" in warning and "2 s o más" in warning
 
 
-@pytest.mark.parametrize("value", ["abc", "nan", "inf", "2s"])
+def test_the_sync_jitter_is_configurable() -> None:
+    settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_JITTER": "3"})
+    assert (settings.jitter, settings.warnings) == (3.0, ())
+    settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_JITTER": "0"})
+    assert settings.jitter == 0.0
+    (warning,) = settings.warnings
+    assert "BOME_NAVAJA_SYNC_JITTER=0 s" in warning and "más arriesgado" in warning
+
+
+def test_the_sync_view_ignores_the_other_settings() -> None:
+    settings = sync_settings_from_env({"BOME_NAVAJA_TIMEOUT": "x", "BOME_NAVAJA_GUARD_MAX_ERRORS": "9"})
+    assert settings == SyncSettings()
+
+
+@pytest.mark.parametrize("value", ["abc", "nan", "inf", "-inf", "2s", "-3", "-0.5"])
 def test_an_unparsable_delay_falls_back_to_the_default(value: str) -> None:
     settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_DELAY": value})
     assert settings.polite_delay == SYNC_POLITE_DELAY
@@ -841,7 +891,20 @@ def test_an_unparsable_delay_falls_back_to_the_default(value: str) -> None:
     assert "BOME_NAVAJA_SYNC_DELAY" in warning and repr(value) in warning
 
 
-@pytest.mark.parametrize("value", ["0", "-5", "abc", "2.5", "1e3"])
+@pytest.mark.parametrize(("value", "expected"), [("100.0", 100), ("250.0", 250), (" 1e2 ", 100)])
+def test_a_cap_accepts_an_integral_float(value: str, expected: int) -> None:
+    settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_MAX_BOLETINES": value})
+    assert (settings.max_boletines, settings.warnings) == (expected, ())
+
+
+def test_a_cap_above_the_recommended_one_is_kept_with_a_risk_warning() -> None:
+    settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_MAX_BOLETINES": "1e3"})
+    assert settings.max_boletines == 1000
+    (warning,) = settings.warnings
+    assert warning.startswith("BOME_NAVAJA_SYNC_MAX_BOLETINES=1000:") and "250 o menos" in warning
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc", "2.5", "250.5", "nan", "inf"])
 def test_an_invalid_cap_falls_back_to_the_default(value: str) -> None:
     settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_MAX_BOLETINES": value})
     assert settings.max_boletines == DEFAULT_MAX_BULLETINS_PER_RUN

@@ -63,6 +63,7 @@ import pypdf
 
 from .client import BomeClient
 from .cve import Cve, CveKind, InvalidCveError, parse_cve, pdf_url
+from .guard import MAX_ERRORES_EN_VENTANA, GuardiaSitio
 from .models import (
     Article,
     BomeError,
@@ -113,9 +114,11 @@ two listed neighbours of the number (a 200 page costs the site guard nothing).""
 
 MAX_INTENTOS_ARTICULO_EXTRA = 2
 """Article pages one AX lookup may fetch: each wrong guess is a 404 that the
-site guard counts. Its budget is 3 errors per 10 minutes, so a failed lookup
-leaves room for the explicit ``cve='BOME-BX-…', numero=`` call its error
-suggests."""
+site guard counts. With the default budget of 3 errors per 10 minutes a failed
+lookup leaves room for the explicit ``cve='BOME-BX-…', numero=`` call its
+error suggests. A client whose guard allows fewer errors gets fewer attempts,
+``max_errores - 1`` but never below 1 (see :func:`_intentos_articulo_extra`);
+a larger budget never raises the cap."""
 
 _MAX_BOLETINES_EN_ERROR = 10
 
@@ -676,17 +679,30 @@ def _resolver_bulletin(client: BomeClient, cve: Cve) -> Cve | None:
     return bulletin if _same_year_extra_bulletin(bulletin, cve) else None
 
 
+def _intentos_articulo_extra(client: BomeClient) -> int:
+    """Article pages an AX lookup may fetch through ``client``.
+
+    One error of the client's guard budget is left for the explicit call a
+    failed lookup suggests: ``max_errores - 1`` (never below 1), capped at
+    :data:`MAX_INTENTOS_ARTICULO_EXTRA`. Without a guard, the default budget.
+    """
+    guard = getattr(client, "guard", None)
+    budget = guard.max_errores if isinstance(guard, GuardiaSitio) else MAX_ERRORES_EN_VENTANA
+    return max(1, min(MAX_INTENTOS_ARTICULO_EXTRA, budget - 1))
+
+
 def _extra_article(client: BomeClient, cve: Cve, lookup: BoletinDeArticulo | None) -> Article:
-    """Locate an ``AX`` article with at most ``MAX_INTENTOS_ARTICULO_EXTRA`` article pages.
+    """Locate an ``AX`` article with at most :func:`_intentos_articulo_extra` article pages.
 
     The shortcuts (index, resolver) that fetch an article page count toward
     the cap; the search's candidates follow in its order. Candidates left
     untried by the cap are named in the error so the caller can go on.
     """
     tried: list[Cve] = []
+    cap = _intentos_articulo_extra(client)
 
     def attempt(bulletin: Cve | None) -> Article | None:
-        if bulletin is None or bulletin in tried or len(tried) >= MAX_INTENTOS_ARTICULO_EXTRA:
+        if bulletin is None or bulletin in tried or len(tried) >= cap:
             return None
         tried.append(bulletin)
         try:
@@ -701,7 +717,7 @@ def _extra_article(client: BomeClient, cve: Cve, lookup: BoletinDeArticulo | Non
     for candidate in search.candidatos:
         if (article := attempt(candidate)) is not None:
             return article
-    raise search.error(cve, [c for c in search.candidatos if c not in tried])
+    raise search.error(cve, [c for c in search.candidatos if c not in tried], intentos=cap)
 
 
 def _cve_list(bulletins: Sequence[Cve]) -> str:
@@ -722,7 +738,9 @@ class _BusquedaExtra:
     sin_revisar: int = 0
     """How many of ``hueco`` were never fetched."""
 
-    def error(self, cve: Cve, untried: Sequence[Cve] = ()) -> ArticuloNoLocalizadoError:
+    def error(
+        self, cve: Cve, untried: Sequence[Cve] = (), *, intentos: int = MAX_INTENTOS_ARTICULO_EXTRA
+    ) -> ArticuloNoLocalizadoError:
         checked = (
             f"{self.paginas} bulletin pages checked"
             f"{', search budget exhausted' if self.agotada else ''}"
@@ -732,7 +750,7 @@ class _BusquedaExtra:
             where = f"the site calendar lists no extraordinary bulletin in {cve.year}"
         elif untried:
             where = (
-                f"the lookup stopped after {MAX_INTENTOS_ARTICULO_EXTRA} article pages (each "
+                f"the lookup stopped after {intentos} article page{'s' if intentos != 1 else ''} (each "
                 "wrong guess is an HTTP error the site guard counts), with candidate bulletins "
                 f"left untried: {_cve_list(untried)} ({checked})"
             )

@@ -363,8 +363,15 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 
   | Variable | Por defecto | Qué hace |
   |---|---|---|
-  | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización, de los dos orígenes (mínimo 1; un valor menor se sube a 1) |
+  | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización, de los dos orígenes (un valor menor de 2 funciona, pero `estado_servidor` avisa del riesgo) |
   | `BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` | Máximo de boletines por ejecución de `sincronizar_indice`, de los dos orígenes |
+  | `BOME_NAVAJA_SYNC_JITTER` | `1` | Segundos aleatorios, como mucho, que se suman a cada pausa de la sincronización |
+  | `BOME_NAVAJA_QUERY_DELAY` | `0.5` | Segundos entre peticiones de las herramientas de bomemelilla.es |
+  | `BOME_NAVAJA_GUARD_MAX_ERRORS` | `3` | Respuestas de error del sitio que admite la guardia en su ventana antes de pausar |
+  | `BOME_NAVAJA_GUARD_WINDOW_MINUTES` | `10` | Minutos de la ventana en la que la guardia cuenta los errores |
+  | `BOME_NAVAJA_GUARD_COOLDOWN_MINUTES` | `75` | Minutos sin tocar el sitio tras una señal de bloqueo |
+  | `BOME_NAVAJA_ERROR_PAUSE_SECONDS` | `30` | Segundos mínimos de pausa de la sincronización tras una página rota (como mucho, el doble) |
+  | `BOME_NAVAJA_TIMEOUT` | `30` | Segundos de espera máxima de cada petición a los sitios |
 
 - **Guardia del sitio.** El cortafuegos de bomemelilla.es bloquea la IP (en torno a una hora) tras unas 5 respuestas de error, por despacio que vayan las peticiones, y muchas son HTTP 500 de páginas de boletín rotas del propio sitio. Para no llegar a eso:
   - Entre todas las herramientas y la sincronización se admiten como mucho **3 respuestas de error (cualquier 4xx o 5xx) cada 10 minutos**; con el cupo lleno, la sincronización espera y las herramientas responden `pausa_preventiva` con `reintentar_tras_segundos`, sin tocar el sitio.

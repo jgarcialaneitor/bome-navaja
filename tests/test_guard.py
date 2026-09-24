@@ -435,3 +435,80 @@ def test_two_sites_keep_separate_state_files(clock: Clock, tmp_path: Path) -> No
     assert portal.en_enfriamiento()
     assert not bome.en_enfriamiento()
     assert bome.comprobar(URL) is None
+
+
+# --------------------------------------------------------------------------- configured limits (sync-settings task 1)
+
+
+def test_the_limits_default_to_the_constants(clock: Clock) -> None:
+    guard = memory_guard(clock)
+    assert (guard.max_errores, guard.ventana_segundos, guard.enfriamiento_segundos) == (
+        MAX_ERRORES_EN_VENTANA,
+        VENTANA_ERRORES_SEGUNDOS,
+        ENFRIAMIENTO_SEGUNDOS,
+    )
+
+
+def test_a_configured_budget_and_window_are_honoured(clock: Clock) -> None:
+    guard = GuardiaSitio(None, clock=clock, max_errores=1, ventana_segundos=120)
+    guard.registrar(500)
+    assert guard.errores_en_ventana() == 1
+    clock.now += 30
+    with pytest.raises(BomePausaPreventivaError) as info:
+        guard.comprobar(URL)
+    assert info.value.retry_after == pytest.approx(90)
+    assert "últimos 2 min" in str(info.value)
+    clock.now = T0 + 120
+    assert guard.comprobar(URL) is None
+    assert guard.errores_en_ventana() == 0
+    assert (guard.estado()["max_errores"], guard.estado()["ventana_segundos"]) == (1, 120)
+
+
+def test_a_larger_configured_budget_allows_more_errors(clock: Clock) -> None:
+    guard = GuardiaSitio(None, clock=clock, max_errores=5)
+    for _ in range(4):
+        guard.registrar(500)
+    assert guard.comprobar(URL) is None
+    guard.registrar(500)
+    with pytest.raises(BomePausaPreventivaError):
+        guard.comprobar(URL)
+
+
+def test_a_configured_cooldown_is_honoured(clock: Clock) -> None:
+    guard = GuardiaSitio(None, clock=clock, enfriamiento_segundos=300)
+    guard.registrar(None)
+    guard.registrar(None)
+    assert guard.segundos_enfriamiento() == pytest.approx(300)
+    clock.now += 300
+    assert not guard.en_enfriamiento()
+    guard.registrar(403)
+    assert guard.segundos_enfriamiento() == pytest.approx(300)
+    guard.registrar(429, retry_after=1000)  # a longer Retry-After still wins
+    assert guard.segundos_enfriamiento() == pytest.approx(1000)
+
+
+def test_a_zero_cooldown_never_closes_the_site_but_honours_retry_after(clock: Clock) -> None:
+    guard = GuardiaSitio(None, clock=clock, enfriamiento_segundos=0, max_errores=10)
+    guard.registrar(403)
+    assert not guard.en_enfriamiento()
+    assert guard.comprobar(URL) is None
+    guard.registrar(429, retry_after=60)
+    assert guard.segundos_enfriamiento() == pytest.approx(60)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_errores": 0},
+        {"max_errores": 2.0},
+        {"max_errores": True},
+        {"ventana_segundos": 0},
+        {"ventana_segundos": -1},
+        {"ventana_segundos": float("nan")},
+        {"enfriamiento_segundos": -1},
+        {"enfriamiento_segundos": float("inf")},
+    ],
+)
+def test_impossible_limits_are_rejected(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        GuardiaSitio(None, **kwargs)

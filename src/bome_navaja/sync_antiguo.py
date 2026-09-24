@@ -60,6 +60,7 @@ from .models import BomeBlockedError, BomeError
 from .search import BusquedaInvalidaError
 from .sync import (
     DEFAULT_MAX_BULLETINS_PER_RUN,
+    PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
     SYNC_JITTER,
     SYNC_POLITE_DELAY,
     EstadoSincronizacion,
@@ -115,6 +116,7 @@ class SincronizadorPortalAntiguo(SincronizadorBase):
         wait: Callable[[float], bool] | None = None,
         guard: GuardiaSitio | None = None,
         pausa_aleatoria: Callable[[float, float], float] = random.uniform,
+        pausa_tras_error: float = PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
     ) -> None:
         """Arguments as :class:`~bome_navaja.sync.SincronizadorIndice`, except:
 
@@ -139,6 +141,7 @@ class SincronizadorPortalAntiguo(SincronizadorBase):
             stale_after=stale_after,
             wait=wait,
             pausa_aleatoria=pausa_aleatoria,
+            pausa_tras_error=pausa_tras_error,
         )
         self._portal_factory: Callable[..., PortalAntiguo] = portal_factory or (
             lambda *, guard=None: PortalAntiguo(polite_delay=polite_delay, jitter=jitter, guard=guard)

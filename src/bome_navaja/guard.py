@@ -9,20 +9,25 @@ the known-broken ones is not enough: errors themselves must be paced.
 :class:`GuardiaSitio` enforces two rules for every request of a process:
 
 * **Error budget.** Every HTTP error answer (status >= 400, 404 included, to
-  stay on the safe side) is timestamped. At most
-  :data:`MAX_ERRORES_EN_VENTANA` may fall inside a sliding window of
-  :data:`VENTANA_ERRORES_SEGUNDOS`; with the budget full, :meth:`comprobar`
-  raises :class:`~bome_navaja.models.BomePausaPreventivaError` until the oldest
+  stay on the safe side) is timestamped. At most ``max_errores`` (default
+  :data:`MAX_ERRORES_EN_VENTANA`) may fall inside a sliding window of
+  ``ventana_segundos`` (default :data:`VENTANA_ERRORES_SEGUNDOS`); with the
+  budget full, :meth:`comprobar` raises
+  :class:`~bome_navaja.models.BomePausaPreventivaError` until the oldest
   counted error leaves the window. Three per ten minutes keeps a margin of two
   against the ban.
 * **Cooldown** ("enfriamiento"). A block signal closes the site until a
   deadline: a 403/429/503 answer for ``max(Retry-After,
-  ENFRIAMIENTO_SEGUNDOS)`` (``Retry-After`` capped at
-  :data:`MAX_RETRY_AFTER_SEGUNDOS`), or :data:`FALLOS_TRANSPORTE_BLOQUEO`
+  enfriamiento_segundos)`` (``Retry-After`` capped at
+  :data:`MAX_RETRY_AFTER_SEGUNDOS`; default cooldown
+  :data:`ENFRIAMIENTO_SEGUNDOS`), or :data:`FALLOS_TRANSPORTE_BLOQUEO`
   requests in a row without any answer (timeouts, resets: what the ban looks
-  like) for :data:`ENFRIAMIENTO_SEGUNDOS`. Any answer, even an error, resets
+  like) for ``enfriamiento_segundos``. Any answer, even an error, resets
   that streak. While closed, :meth:`comprobar` raises a plain
   :class:`~bome_navaja.models.BomeBlockedError` with ``status=None``.
+
+The three limits are per guard (the server builds its guards from
+:mod:`bome_navaja.ajustes`); the defaults are the recommended values.
 
 Both refusals happen before the network is touched.
 
@@ -57,13 +62,13 @@ from typing import Any
 from .models import BomeBlockedError, BomePausaPreventivaError
 
 VENTANA_ERRORES_SEGUNDOS = 600
-"""Sliding window of the error budget."""
+"""Default sliding window of the error budget."""
 
 MAX_ERRORES_EN_VENTANA = 3
-"""HTTP error answers allowed inside the window (the site bans after the fifth)."""
+"""Default HTTP error answers allowed inside the window (the site bans after the fifth)."""
 
 ENFRIAMIENTO_SEGUNDOS = 4500
-"""Shortest cooldown after a block signal (the ban seen lasted about an hour)."""
+"""Default shortest cooldown after a block signal (the ban seen lasted about an hour)."""
 
 MAX_RETRY_AFTER_SEGUNDOS = 86_400
 """Longest ``Retry-After`` honoured, so a bogus header cannot close the site for good."""
@@ -102,7 +107,9 @@ class GuardiaSitio:
     across processes); tests inject a fake one. ``sitio`` is the host named in
     the model-facing messages: each guarded site gets its own guard and state
     file (the old portal on melilla.es uses :data:`FICHERO_ESTADO_MELILLA`).
-    Thread-safe.
+    ``max_errores`` (an integer >= 1), ``ventana_segundos`` (> 0) and
+    ``enfriamiento_segundos`` (>= 0) are the error budget, its window and the
+    cooldown; anything else is a ``ValueError``. Thread-safe.
     """
 
     def __init__(
@@ -111,9 +118,21 @@ class GuardiaSitio:
         *,
         clock: Callable[[], float] = time.time,
         sitio: str = SITIO_POR_DEFECTO,
+        max_errores: int = MAX_ERRORES_EN_VENTANA,
+        ventana_segundos: float = VENTANA_ERRORES_SEGUNDOS,
+        enfriamiento_segundos: float = ENFRIAMIENTO_SEGUNDOS,
     ) -> None:
+        if isinstance(max_errores, bool) or not isinstance(max_errores, int) or max_errores < 1:
+            raise ValueError(f"max_errores must be an integer >= 1, got {max_errores!r}")
+        if not _finite_number(ventana_segundos) or ventana_segundos <= 0:
+            raise ValueError(f"ventana_segundos must be a finite number > 0, got {ventana_segundos!r}")
+        if not _finite_number(enfriamiento_segundos) or enfriamiento_segundos < 0:
+            raise ValueError(f"enfriamiento_segundos must be a finite number >= 0, got {enfriamiento_segundos!r}")
         self.sitio = sitio
         """Host named in the messages (``bomemelilla.es`` by default)."""
+        self._max_errores = max_errores
+        self._ventana = float(ventana_segundos)
+        self._enfriamiento = float(enfriamiento_segundos)
         self._path = Path(path) if path is not None else None
         self._clock = clock
         self._lock = threading.Lock()
@@ -127,6 +146,21 @@ class GuardiaSitio:
     def path(self) -> Path | None:
         """The shared state file, or ``None`` for a memory-only guard."""
         return self._path
+
+    @property
+    def max_errores(self) -> int:
+        """HTTP error answers allowed inside the window."""
+        return self._max_errores
+
+    @property
+    def ventana_segundos(self) -> float:
+        """Sliding window of the error budget, in seconds."""
+        return self._ventana
+
+    @property
+    def enfriamiento_segundos(self) -> float:
+        """Shortest cooldown after a block signal, in seconds."""
+        return self._enfriamiento
 
     # ------------------------------------------------------------------ decisions
 
@@ -192,8 +226,8 @@ class GuardiaSitio:
                 "segundos_restantes": math.ceil(self._deadline - now) if closed else 0,
                 "motivo": self._motivo if closed else None,
                 "errores_en_ventana": self._count(now),
-                "max_errores": MAX_ERRORES_EN_VENTANA,
-                "ventana_segundos": VENTANA_ERRORES_SEGUNDOS,
+                "max_errores": self._max_errores,
+                "ventana_segundos": self._ventana,
                 "fichero": str(self._path) if self._path is not None else None,
             }
 
@@ -215,7 +249,7 @@ class GuardiaSitio:
                 self._streak = 0
                 self._refresh(now)
                 self._close(
-                    now + ENFRIAMIENTO_SEGUNDOS,
+                    now + self._enfriamiento,
                     f"{FALLOS_TRANSPORTE_BLOQUEO} peticiones seguidas sin respuesta del sitio "
                     "(tiempo de espera agotado o conexión cortada: así se ve su cortafuegos)",
                 )
@@ -228,7 +262,7 @@ class GuardiaSitio:
             self._errors[now] += 1
             if status in ESTADOS_BLOQUEO:
                 asked = retry_after if _finite_number(retry_after) and retry_after > 0 else None
-                seconds = max(min(asked or 0.0, MAX_RETRY_AFTER_SEGUNDOS), ENFRIAMIENTO_SEGUNDOS)
+                seconds = max(min(asked or 0.0, MAX_RETRY_AFTER_SEGUNDOS), self._enfriamiento)
                 hint = f" con Retry-After {asked:g} s" if asked else ""
                 self._close(now + seconds, f"el sitio respondió HTTP {status}{hint}")
             self._save(now)
@@ -236,17 +270,17 @@ class GuardiaSitio:
     # ------------------------------------------------------------------ internals (lock held)
 
     def _count(self, now: float) -> int:
-        start = now - VENTANA_ERRORES_SEGUNDOS
+        start = now - self._ventana
         return sum(n for ts, n in self._errors.items() if ts > start)
 
     def _budget_wait(self, now: float) -> float:
-        start = now - VENTANA_ERRORES_SEGUNDOS
+        start = now - self._ventana
         stamps = sorted(ts for ts in self._errors.elements() if ts > start)
-        if len(stamps) < MAX_ERRORES_EN_VENTANA:
+        if len(stamps) < self._max_errores:
             return 0.0
         # Enough errors must leave for the count to drop below the budget.
-        oldest_to_leave = stamps[len(stamps) - MAX_ERRORES_EN_VENTANA]
-        return max(oldest_to_leave + VENTANA_ERRORES_SEGUNDOS - now, 0.0)
+        oldest_to_leave = stamps[len(stamps) - self._max_errores]
+        return max(oldest_to_leave + self._ventana - now, 0.0)
 
     def _close(self, deadline: float, motivo: str) -> None:
         if deadline > self._deadline:
@@ -254,7 +288,7 @@ class GuardiaSitio:
             self._motivo = motivo
 
     def _prune(self, now: float) -> None:
-        start = now - VENTANA_ERRORES_SEGUNDOS
+        start = now - self._ventana
         for stamp in [ts for ts in self._errors if ts <= start]:
             del self._errors[stamp]
         if self._deadline <= now:
@@ -347,7 +381,7 @@ class GuardiaSitio:
         )
         return (
             f"pausa preventiva de bome-navaja, no es un bloqueo del sitio: {self.sitio} ya "
-            f"respondió {errors} errores HTTP en los últimos {VENTANA_ERRORES_SEGUNDOS // 60} min "
+            f"respondió {errors} errores HTTP en los últimos {self._ventana / 60:g} min "
             f"y {reason}, así que no se le "
             f"pide nada más hasta que pase la ventana. Reintenta dentro de {math.ceil(wait)} s."
         )

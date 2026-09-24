@@ -19,6 +19,7 @@ import pytest
 
 from bome_navaja import __version__
 from bome_navaja import server as srv
+from bome_navaja.ajustes import VARIABLES as SETTINGS_VARIABLES
 from bome_navaja.antiguo import FICHERO_CATALOGO, PortalAntiguo
 from bome_navaja.client import BomeClient
 from bome_navaja.guard import ENFRIAMIENTO_SEGUNDOS, FICHERO_ESTADO, FICHERO_ESTADO_MELILLA, GuardiaSitio
@@ -134,8 +135,8 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     target = tmp_path / "datos"
     monkeypatch.setenv("BOME_NAVAJA_DATA_DIR", str(target))
     monkeypatch.delenv("BOME_NAVAJA_PDF_DIR", raising=False)
-    monkeypatch.delenv("BOME_NAVAJA_SYNC_DELAY", raising=False)
-    monkeypatch.delenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", raising=False)
+    for name in SETTINGS_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
     srv.close_shared_state()
     yield target
     srv.close_shared_state()
@@ -539,11 +540,120 @@ def test_estado_servidor_reports_sync_overrides_and_their_warnings(
     pace = ok(srv.estado_servidor())["cortesia_sincronizacion"]
     assert pace == {"pausa_segundos": 4.5, "variacion_segundos": 1.0, "max_boletines_por_ejecucion": 40}
 
-    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "0.1")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "0.1")  # no floor any more: kept, with a risk warning
     monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "muchos")
     pace = ok(srv.estado_servidor())["cortesia_sincronizacion"]
-    assert (pace["pausa_segundos"], pace["max_boletines_por_ejecucion"]) == (1.0, 250)
+    assert (pace["pausa_segundos"], pace["max_boletines_por_ejecucion"]) == (0.1, 250)
     assert len(pace["avisos"]) == 2
+    assert "BOME_NAVAJA_SYNC_MAX_BOLETINES='muchos'" in pace["avisos"][0]
+    assert "BOME_NAVAJA_SYNC_DELAY=0.1 s: más arriesgado" in pace["avisos"][1]
+
+
+def test_estado_servidor_reports_every_setting_with_its_warnings(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ajustes = ok(srv.estado_servidor())["ajustes"]
+    assert ajustes == {
+        "pausa_sincronizacion_segundos": 2.0,
+        "variacion_sincronizacion_segundos": 1.0,
+        "max_boletines_por_ejecucion": 250,
+        "pausa_consultas_segundos": 0.5,
+        "guardia_max_errores": 3,
+        "guardia_ventana_minutos": 10.0,
+        "guardia_enfriamiento_minutos": 75.0,
+        "pausa_tras_error_segundos": 30.0,
+        "pausa_tras_error_max_segundos": 60.0,
+        "tiempo_espera_segundos": 30.0,
+        "variables": ajustes["variables"],
+        "avisos": [],
+        "riesgos": [],
+    }
+    assert sorted(ajustes["variables"].values()) == sorted(SETTINGS_VARIABLES)
+
+    monkeypatch.setenv("BOME_NAVAJA_QUERY_DELAY", "0.2")
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_MAX_ERRORS", "6")
+    monkeypatch.setenv("BOME_NAVAJA_TIMEOUT", "-3")
+    result = ok(srv.estado_servidor())
+    ajustes = result["ajustes"]
+    assert (ajustes["pausa_consultas_segundos"], ajustes["guardia_max_errores"]) == (0.2, 6)
+    assert ajustes["tiempo_espera_segundos"] == 30.0
+    assert len(ajustes["avisos"]) == 1 and "BOME_NAVAJA_TIMEOUT='-3'" in ajustes["avisos"][0]
+    assert len(ajustes["riesgos"]) == 2
+    assert "BOME_NAVAJA_QUERY_DELAY=0.2 s: más arriesgado" in ajustes["riesgos"][0]
+    assert "BOME_NAVAJA_GUARD_MAX_ERRORS=6: mucho más arriesgado" in ajustes["riesgos"][1]
+    assert result["cortesia_segundos"] == 0.2
+    assert "avisos" not in result["cortesia_sincronizacion"]  # none of these is a sync variable
+    assert not data_dir.exists()
+
+
+def test_the_settings_are_read_once_per_process_and_logged_once(
+    site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "2")
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "0.5")
+    monkeypatch.setenv("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "junk")
+    srv.ver_bome("BOME-B-2026-6416")
+    srv._get_portal_guard()
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    err = capsys.readouterr().err
+    assert err.count("BOME_NAVAJA_GUARD_WINDOW_MINUTES=2 min: más arriesgado") == 1
+    assert err.count("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES=0.5 min: mucho más arriesgado") == 1
+    assert err.count("BOME_NAVAJA_ERROR_PAUSE_SECONDS='junk' no es válido") == 1
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "20")  # needs a restart
+    assert srv._get_guard().ventana_segundos == 120
+    assert srv._ajustes().guardia_ventana_minutos == 2
+    assert capsys.readouterr().err == ""
+    srv.close_shared_state()  # a restart reads them again
+    assert srv._get_guard().ventana_segundos == 1200
+
+
+def test_both_guards_are_built_with_the_configured_limits(
+    data_dir: Path, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_MAX_ERRORS", "2.0")
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "20")
+    monkeypatch.setenv("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "90")
+    for guard in (srv._get_guard(), srv._get_portal_guard()):
+        assert (guard.max_errores, guard.ventana_segundos, guard.enfriamiento_segundos) == (2, 1200, 5400)
+    assert srv._get_portal_guard().sitio == "melilla.es"
+    result = ok(srv.estado_servidor())
+    for key in ("guardia_sitio", "guardia_portal_antiguo"):
+        assert (result[key]["max_errores"], result[key]["ventana_segundos"]) == (2, 1200)
+    guard = srv._get_guard()
+    guard.registrar(403)
+    assert guard.segundos_enfriamiento() == pytest.approx(5400)
+
+
+def test_the_default_factories_use_the_configured_pace_and_timeout(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_QUERY_DELAY", "1.5")
+    monkeypatch.setenv("BOME_NAVAJA_TIMEOUT", "45")
+    interactive = srv._default_client_factory()
+    sync = srv._default_client_factory(polite_delay=2.0, jitter=1.0)
+    portal = srv._default_portal_factory(guard=GuardiaSitio(None, sitio="melilla.es"))
+    try:
+        assert (interactive.polite_delay, interactive.jitter, interactive.timeout) == (1.5, 0.0, 45.0)
+        assert (sync.polite_delay, sync.jitter, sync.timeout) == (2.0, 1.0, 45.0)
+        assert (portal.polite_delay, portal.jitter) == (1.0, 0.5)  # the old portal keeps its own pace
+        assert portal._http.timeout == 45.0
+    finally:
+        interactive.close()
+        sync.close()
+        portal.close()
+
+
+def test_the_pause_after_an_error_reaches_both_syncs(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "12")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_JITTER", "0.25")
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    assert srv._get_sync()._error_pause == 12.0
+    assert site.paces == [{"polite_delay": 2.0, "jitter": 0.25}]
+    assert srv._get_sync_antiguo()._error_pause == 12.0
 
 
 # --------------------------------------------------------------------------- sync pace (polite-sync task 3)
@@ -588,7 +698,7 @@ def test_bad_env_overrides_are_logged_on_stderr(
     monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "todos")
     ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
     assert srv._get_sync().esperar(10)
-    assert site.paces == [{"polite_delay": 1.0, "jitter": 1.0}]
+    assert site.paces == [{"polite_delay": 0.2, "jitter": 1.0}]  # no floor: kept, with a risk warning
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "BOME_NAVAJA_SYNC_DELAY" in captured.err and "BOME_NAVAJA_SYNC_MAX_BOLETINES" in captured.err
