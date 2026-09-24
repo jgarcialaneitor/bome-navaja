@@ -16,10 +16,13 @@ Endpoint map (read-only reconnaissance, 2026-09-23):
 
 from __future__ import annotations
 
+import math
+import random
 import re
 import time
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
@@ -38,6 +41,7 @@ from .cve import (
 )
 from .models import (
     Article,
+    BomeBlockedError,
     BomeDocumentTooLargeError,
     BomeError,
     BomeHTTPError,
@@ -60,6 +64,7 @@ from .parsers import (
 )
 
 __all__ = [
+    "BomeBlockedError",
     "BomeClient",
     "BomeError",
     "BomeHTTPError",
@@ -88,11 +93,60 @@ def _today() -> date:
     return date.today()
 
 
+def _now() -> datetime:
+    """Current UTC time; a seam so tests can pin ``Retry-After`` dates."""
+    return datetime.now(UTC)
+
+
+# Answers meaning "the site is refusing us" (rate limit, WAF, overload), not
+# "this document is broken": bulk callers must stop on them.
+_BLOCKING_STATUSES = frozenset({403, 429, 503})
+
+
+def _retry_after(value: str | None) -> float | None:
+    """Seconds from a ``Retry-After`` header (delta-seconds or HTTP-date).
+
+    Absent or unparsable values give ``None``; negative values and dates in
+    the past give ``0.0``.
+    """
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        pass
+    else:
+        return max(seconds, 0.0) if math.isfinite(seconds) else None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - _now()).total_seconds(), 0.0)
+
+
 def _raise_for_status(response: httpx.Response) -> None:
-    """Map 404 to :class:`BomeNotFoundError` and other 4xx/5xx to :class:`BomeHTTPError`."""
+    """Map HTTP failures to ``BomeError``.
+
+    404 is :class:`BomeNotFoundError`; 403, 429 and 503 are
+    :class:`BomeBlockedError` (with ``Retry-After`` parsed); any other 4xx/5xx
+    is :class:`BomeHTTPError`.
+    """
     final_url = str(response.url)
     if response.status_code == 404:
         raise BomeNotFoundError(f"not found: {final_url}", status=404, url=final_url)
+    if response.status_code in _BLOCKING_STATUSES:
+        retry_after = _retry_after(response.headers.get("retry-after"))
+        hint = f"; Retry-After {retry_after:g} s" if retry_after is not None else ""
+        raise BomeBlockedError(
+            f"HTTP {response.status_code} for {final_url}: the site is refusing requests "
+            f"(rate limit or firewall){hint}",
+            status=response.status_code,
+            url=final_url,
+            retry_after=retry_after,
+        )
     if response.status_code >= 400:
         raise BomeHTTPError(
             f"HTTP {response.status_code} for {final_url}",
@@ -105,7 +159,10 @@ class BomeClient:
     """Synchronous client over :class:`httpx.Client`.
 
     ``polite_delay`` seconds are enforced between consecutive requests (use a
-    small value such as 0.5 for bulk work like index sync or drill-down).
+    small value such as 0.5 for bulk work like drill-down). ``jitter`` adds a
+    random ``uniform(0, jitter)`` seconds, drawn per request, so a long crawl
+    such as the index sync does not hit the site at a fixed rhythm; ``rng``
+    is the randomness source (tests inject a deterministic one).
     """
 
     def __init__(
@@ -115,11 +172,19 @@ class BomeClient:
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
         polite_delay: float = 0.0,
+        jitter: float = 0.0,
+        rng: random.Random | None = None,
         user_agent: str = USER_AGENT,
     ) -> None:
+        if polite_delay < 0:
+            raise ValueError(f"polite_delay must be >= 0, got {polite_delay!r}")
+        if jitter < 0:
+            raise ValueError(f"jitter must be >= 0, got {jitter!r}")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.polite_delay = polite_delay
+        self.jitter = jitter
+        self._rng = rng if rng is not None else random.Random()
         self._last_request: float | None = None
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -152,10 +217,17 @@ class BomeClient:
 
     # ------------------------------------------------------------------ transport
 
+    @property
+    def _paced(self) -> bool:
+        return self.polite_delay > 0 or self.jitter > 0
+
     def _wait_politely(self) -> None:
-        if self.polite_delay <= 0 or self._last_request is None:
+        if not self._paced or self._last_request is None:
             return
-        remaining = self.polite_delay - (time.monotonic() - self._last_request)
+        delay = self.polite_delay
+        if self.jitter > 0:
+            delay += self._rng.uniform(0.0, self.jitter)
+        remaining = delay - (time.monotonic() - self._last_request)
         if remaining > 0:
             time.sleep(remaining)
 
@@ -182,7 +254,7 @@ class BomeClient:
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
-            if self.polite_delay > 0:
+            if self._paced:
                 self._last_request = time.monotonic()
         _raise_for_status(response)
         return response
@@ -345,7 +417,7 @@ class BomeClient:
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
-            if self.polite_delay > 0:
+            if self._paced:
                 self._last_request = time.monotonic()
         content = b"".join(chunks)
         if not content.lstrip()[:4] == b"%PDF":

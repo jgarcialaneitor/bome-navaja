@@ -1,6 +1,6 @@
 [project]
 name = "bome-navaja"
-version = "0.0.1"
+version = "0.0.2"
 description = "MCP server for the Boletín Oficial de la Ciudad Autónoma de Melilla (BOME)"
 readme = "README.md"
 license = "MIT"

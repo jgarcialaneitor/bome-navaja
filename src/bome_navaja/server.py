@@ -13,7 +13,9 @@ its polite-delay bookkeeping) is created lazily and used under
 ``_client_use_lock``: site requests from tools are serialised, which also
 keeps the server polite. The local index uses one SQLite connection per
 thread (see :mod:`bome_navaja.index`) and needs no extra lock. The background
-sync owns a separate client created by the same factory.
+sync owns a separate client created by the same factory, but asked for the
+slower sync pace (:func:`bome_navaja.sync.sync_settings_from_env`: its
+environment overrides are read when the sync is first used).
 
 Nothing touches the network or the index file at import time; the index is
 opened only by the index tools, and a sync starts only through
@@ -47,6 +49,7 @@ from .documents import leer_boletin as _leer_boletin
 from .documents import leer_pdf as _leer_pdf
 from .index import SumarioIndex
 from .models import (
+    BomeBlockedError,
     BomeDocumentTooLargeError,
     BomeError,
     BomeHTTPError,
@@ -60,7 +63,7 @@ from .paths import data_dir, index_path, pdf_dir
 from .search import RECOMMENDED_POLITE_DELAY, BusquedaInvalidaError, articulos_del_boletin
 from .search import buscar_articulos as _buscar_articulos
 from .search import buscar_bomes as _buscar_bomes
-from .sync import SincronizadorIndice
+from .sync import SincronizadorIndice, SyncSettings, sync_settings_from_env
 
 MAX_LISTADO = 500
 """``listar_bomes`` returns at most this many bulletins (newest first)."""
@@ -82,7 +85,9 @@ Qué herramienta usar:
 - Buscar dentro del contenido de las páginas: buscar_bomes con ambito="contenido" (devuelve
   boletines, no artículos).
 - Explorar: listar_bomes (calendario), ver_bome (árbol de artículos), resolver_cve.
-- Índice local: sincronizar_indice (solo cuando haga falta; tarda ~20-25 min la primera vez).
+- Índice local: sincronizar_indice (solo cuando haga falta; cada ejecución indexa como mucho
+  250 boletines por defecto en ~15-20 min; el histórico completo necesita varias ejecuciones
+  espaciadas).
 
 Semántica de búsqueda del sitio: coincidencia literal por subcadena, sin distinguir tildes ni
 mayúsculas, sin sinónimos (busca "cese", no "destitución"; "nombra" encuentra
@@ -102,12 +107,16 @@ class ArgumentoInvalidoError(BomeError, ValueError):
 # --------------------------------------------------------------------------- shared state
 
 
-def _default_client_factory() -> BomeClient:
-    return BomeClient(polite_delay=RECOMMENDED_POLITE_DELAY)
+def _default_client_factory(
+    *, polite_delay: float = RECOMMENDED_POLITE_DELAY, jitter: float = 0.0
+) -> BomeClient:
+    return BomeClient(polite_delay=polite_delay, jitter=jitter)
 
 
-_client_factory: Callable[[], BomeClient] = _default_client_factory
-"""Builds every client (shared and sync). Tests replace it with a MockTransport one."""
+_client_factory: Callable[..., BomeClient] = _default_client_factory
+"""Builds every client. The shared (interactive) client is built with no
+arguments, the sync client with the sync pace as ``polite_delay``/``jitter``
+keywords. Tests replace it with a MockTransport one."""
 
 _state_lock = threading.Lock()
 _client_use_lock = threading.Lock()
@@ -172,12 +181,25 @@ def _open_index_if_present() -> SumarioIndex | None:
     return _get_index() if exists else None
 
 
+def _sync_settings() -> SyncSettings:
+    return sync_settings_from_env(os.environ)
+
+
 def _get_sync() -> SincronizadorIndice:
     global _sync
     index = _get_index()
     with _state_lock:
         if _sync is None:
-            _sync = SincronizadorIndice(index, lambda: _client_factory())
+            settings = _sync_settings()
+            for warning in settings.warnings:
+                print(f"bome-navaja: {warning}", file=sys.stderr)
+            _sync = SincronizadorIndice(
+                index,
+                lambda: _client_factory(polite_delay=settings.polite_delay, jitter=settings.jitter),
+                polite_delay=settings.polite_delay,
+                jitter=settings.jitter,
+                max_boletines=settings.max_boletines,
+            )
         return _sync
 
 
@@ -230,6 +252,13 @@ _ERRORS: tuple[tuple[type[BaseException], str, str], ...] = (
     (BomeIndexUnavailableError, "indice_no_disponible", "El índice local no está disponible"),
     (BomeDocumentTooLargeError, "documento_demasiado_grande", "El documento supera el límite de tamaño"),
     (BomeStorageError, "error_almacenamiento", "Error de almacenamiento local"),
+    (
+        BomeBlockedError,
+        "sitio_bloqueando",
+        "bomemelilla.es está rechazando nuestras peticiones (límite de peticiones o "
+        "cortafuegos); espera varios minutos antes de reintentar y no repitas la llamada "
+        "en bucle",
+    ),
     (BomeNotFoundError, "no_encontrado", "No existe en bomemelilla.es"),
     (BomeHTTPError, "error_http", "bomemelilla.es no respondió correctamente"),
     (BomeParseError, "error_formato", "La respuesta del sitio no tiene el formato esperado"),
@@ -245,6 +274,8 @@ def error_result(exc: BaseException) -> dict[str, Any]:
             if isinstance(exc, BomeHTTPError):
                 result["estado_http"] = exc.status
                 result["url"] = exc.url
+            if isinstance(exc, BomeBlockedError):
+                result["reintentar_tras_segundos"] = exc.retry_after
             return result
     raise TypeError(f"not a BomeError: {exc!r}")
 
@@ -675,6 +706,9 @@ def estado_indice() -> dict:
     Devuelve boletines indexados / sin sumarios / con error, artículos, rango de fechas,
     pendientes frente al calendario, última sincronización y el progreso de la actual
     (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
+    Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
+    rechaza las peticiones por límite de ritmo o cortafuegos: lo indexado se conserva; espera,
+    horas si es un bloqueo del cortafuegos, antes de volver a sincronizar; ver 'mensaje').
     """
     path, exists = _index_file()
     index = _open_index_if_present()
@@ -696,17 +730,24 @@ def sincronizar_indice(
     hasta: str | None = None,
     reindexar_recientes_dias: int = 7,
     reintentar_errores: bool = True,
+    max_boletines: int | None = None,
 ) -> dict:
     """Arranca en segundo plano la sincronización del índice local de sumarios y vuelve al
     instante.
 
     Recorre el calendario (por defecto 2014-01-01..hoy) del más reciente al más antiguo:
     indexa los boletines que falten, re-indexa los de los últimos reindexar_recientes_dias
-    días y, si reintentar_errores, los que fallaron. La primera sincronización completa tarda
-    ~20-25 minutos (~1900 boletines a ~0,6 s); es reanudable: si se corta, la siguiente
-    llamada continúa donde quedó. Sigue el progreso con estado_indice; mientras tanto
+    días y, si reintentar_errores, los que fallaron. Para no saturar el sitio va despacio
+    (~2-3 s entre peticiones) y cada ejecución indexa como mucho max_boletines boletines
+    (por defecto 250, los más recientes; ~15-20 minutos). El histórico completo desde 2014
+    (~1900 boletines) necesita varias ejecuciones: si el estado final trae
+    pendientes_tras_limite > 0, vuelve a llamarla más tarde (espaciar las ejecuciones es más
+    amable con el sitio). Es reanudable: si se corta, la siguiente llamada continúa donde
+    quedó. Sigue el progreso con estado_indice; mientras tanto
     buscar_en_indice da resultados parciales. Si ya hay una en curso (en este u otro proceso)
-    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide.
+    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. Si el sitio rechaza
+    las peticiones (403/429/503 o conexiones cortadas) espera y reintenta; si sigue rechazándolas
+    termina en estado "bloqueado": no la relances enseguida, espera (horas si es el cortafuegos).
     """
     sync = _get_sync()
     return sync.iniciar(
@@ -714,13 +755,15 @@ def sincronizar_indice(
         hasta=_fecha(hasta, "hasta", ArgumentoInvalidoError),
         reindexar_recientes_dias=reindexar_recientes_dias,
         reintentar_errores=reintentar_errores,
+        max_boletines=max_boletines,
     ).to_dict()
 
 
 @server.tool()
 @_herramienta
 def cancelar_sincronizacion() -> dict:
-    """Pide parar la sincronización en curso; termina tras el boletín que esté procesando.
+    """Pide parar la sincronización en curso; termina tras el boletín que esté procesando (o al
+    instante si está esperando porque el sitio la había bloqueado).
 
     Lo ya indexado se conserva y una nueva sincronizar_indice continúa desde ahí.
     """
@@ -766,13 +809,23 @@ def estado_servidor() -> dict:
     Versión, pid, rutas de datos, PDFs e índice (con el motivo de cada una: variable de
     entorno, XDG, LOCALAPPDATA...; las rutas relativas en BOME_NAVAJA_* se resuelven contra
     el directorio de trabajo), si existe el fichero del índice y su estado si ya está
-    abierto, versión de SQLite con FTS5/trigram, pausa de cortesía y URL base.
+    abierto, versión de SQLite con FTS5/trigram, pausa de cortesía de las herramientas y de
+    la sincronización (pausa, variación aleatoria y máximo de boletines por ejecución, con
+    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas) y URL base.
     """
     try:
         exists = index_path()[0].exists()
     except BomeError:
         exists = False
     index = _index
+    settings = _sync_settings()
+    sync_pace: dict[str, Any] = {
+        "pausa_segundos": settings.polite_delay,
+        "variacion_segundos": settings.jitter,
+        "max_boletines_por_ejecucion": settings.max_boletines,
+    }
+    if settings.warnings:
+        sync_pace["avisos"] = list(settings.warnings)
     return {
         "version": __version__,
         "pid": os.getpid(),
@@ -782,6 +835,7 @@ def estado_servidor() -> dict:
         "sincronizacion": _sync_state(),
         "sqlite": _sqlite_capabilities(),
         "cortesia_segundos": RECOMMENDED_POLITE_DELAY,
+        "cortesia_sincronizacion": sync_pace,
         "url_base": BASE_URL,
     }
 

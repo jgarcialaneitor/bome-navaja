@@ -48,6 +48,7 @@ from typing import Any, Literal
 from .client import BomeClient
 from .models import (
     SEARCH_PAGE_SIZE,
+    BomeBlockedError,
     BomeError,
     BomeHTTPError,
     BomeNotFoundError,
@@ -451,6 +452,8 @@ class _GroupStream:
         while True:
             try:
                 page = self.client.search_page(SEARCH_PATH, self.params, page=page_number)
+            except BomeBlockedError:
+                raise  # the site is refusing us: stop, do not record and go on
             except BomeError as exc:
                 if page_number == 1:
                     raise
@@ -563,6 +566,8 @@ def buscar_articulos(
         reviewed += 1
         try:
             bulletin = client.bulletin(ref.cve)
+        except BomeBlockedError:
+            raise  # the site is refusing us: stop the whole drill-down
         except BomeError as exc:
             errors.append(
                 ErrorBusqueda(etapa="bome", cve=ref.cve, error_code=_error_code(exc), mensaje=str(exc))
@@ -696,6 +701,8 @@ def iter_articulos_del_boletin(
         article_cve = str(parse_cve(bulletin.cve).article_cve(number))
         try:
             page = client.article(bulletin.cve, number)
+        except BomeBlockedError:
+            raise  # the site is refusing us: stop the whole drill-down
         except BomeError as exc:
             errors.append(
                 ErrorBusqueda(

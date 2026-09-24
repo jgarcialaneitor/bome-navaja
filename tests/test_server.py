@@ -56,6 +56,7 @@ class Site:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
+        self.paces: list[dict[str, float]] = []
         self.lock = threading.Lock()
         self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {}
         for path, name in {
@@ -97,7 +98,9 @@ class Site:
         handler = self.routes.get(request.url.path)
         return handler(request) if handler else httpx.Response(404, text="Not found")
 
-    def factory(self) -> BomeClient:
+    def factory(self, **pace: float) -> BomeClient:
+        """Records the requested pace (empty for interactive clients) but never waits."""
+        self.paces.append(pace)
         return BomeClient(transport=httpx.MockTransport(self), polite_delay=0)
 
 
@@ -106,6 +109,8 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     target = tmp_path / "datos"
     monkeypatch.setenv("BOME_NAVAJA_DATA_DIR", str(target))
     monkeypatch.delenv("BOME_NAVAJA_PDF_DIR", raising=False)
+    monkeypatch.delenv("BOME_NAVAJA_SYNC_DELAY", raising=False)
+    monkeypatch.delenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", raising=False)
     srv.close_shared_state()
     yield target
     srv.close_shared_state()
@@ -150,6 +155,8 @@ def test_descriptions_guide_the_model() -> None:
         assert "siguiente" in tools[name].description, name
     sync = tools["sincronizar_indice"].description
     assert "20" in sync and "estado_indice" in sync and "segundo plano" in sync
+    assert "max_boletines" in sync and "varias" in sync
+    assert "0,6 s" not in sync and "20-25" not in (srv.server.instructions or "")
     assert "sincronizar_indice" in tools["buscar_en_indice"].description
     assert "coincidencia" in tools["buscar_en_indice"].description
     assert all(tools[name].description for name in EXPECTED_TOOLS)
@@ -358,8 +365,89 @@ def test_estado_servidor_touches_neither_network_nor_index(
     assert result["sqlite"]["fts5"] is True and result["sqlite"]["trigram"] is True
     assert result["sqlite"]["version"]
     assert result["cortesia_segundos"] == 0.5
+    assert result["cortesia_sincronizacion"] == {
+        "pausa_segundos": 2.0,
+        "variacion_segundos": 1.0,
+        "max_boletines_por_ejecucion": 250,
+    }
     assert result["url_base"] == BASE
     assert not data_dir.exists()
+
+
+def test_estado_servidor_reports_sync_overrides_and_their_warnings(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "4.5")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "40")
+    pace = ok(srv.estado_servidor())["cortesia_sincronizacion"]
+    assert pace == {"pausa_segundos": 4.5, "variacion_segundos": 1.0, "max_boletines_por_ejecucion": 40}
+
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "0.1")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "muchos")
+    pace = ok(srv.estado_servidor())["cortesia_sincronizacion"]
+    assert (pace["pausa_segundos"], pace["max_boletines_por_ejecucion"]) == (1.0, 250)
+    assert len(pace["avisos"]) == 2
+
+
+# --------------------------------------------------------------------------- sync pace (polite-sync task 3)
+
+
+def test_interactive_and_sync_clients_get_their_own_pace() -> None:
+    interactive = srv._default_client_factory()
+    sync = srv._default_client_factory(polite_delay=2.0, jitter=1.0)
+    try:
+        assert (interactive.polite_delay, interactive.jitter) == (0.5, 0.0)
+        assert (sync.polite_delay, sync.jitter) == (2.0, 1.0)
+    finally:
+        interactive.close()
+        sync.close()
+
+
+def test_the_sync_client_uses_the_sync_pace(site: Site) -> None:
+    srv.ver_bome("BOME-B-2026-6416")
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    assert site.paces == [{}, {"polite_delay": 2.0, "jitter": 1.0}]  # interactive, then sync
+
+
+def test_env_overrides_reach_the_sync(
+    site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "3")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "2")
+    started = ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert started["limite_boletines"] == 2
+    assert srv._get_sync().esperar(10)
+    assert site.paces == [{"polite_delay": 3.0, "jitter": 1.0}]
+    state = ok(srv.estado_indice())["sincronizacion"]
+    assert (state["total_planificado"], state["pendientes_tras_limite"]) == (2, 6)
+    assert capsys.readouterr().err == ""
+
+
+def test_bad_env_overrides_are_logged_on_stderr(
+    site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "0.2")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "todos")
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    assert site.paces == [{"polite_delay": 1.0, "jitter": 1.0}]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "BOME_NAVAJA_SYNC_DELAY" in captured.err and "BOME_NAVAJA_SYNC_MAX_BOLETINES" in captured.err
+
+
+def test_sincronizar_indice_passes_max_boletines(site: Site) -> None:
+    started = ok(
+        srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0, max_boletines=1)
+    )
+    assert started["limite_boletines"] == 1
+    assert srv._get_sync().esperar(10)
+    state = ok(srv.estado_indice())["sincronizacion"]
+    assert state["estado"] == "completado"
+    assert (state["total_planificado"], state["pendientes_tras_limite"]) == (1, 7)
+    assert "sincronizar_indice" in state["mensaje"]
+    assert [r.url.path for r in site.requests if r.url.path.startswith("/bome/")] == ["/bome/BOME-B-2026-6416"]
 
 
 def test_import_creates_no_client_and_no_index(data_dir: Path) -> None:
@@ -385,6 +473,24 @@ def test_500_is_error_http(site: Site) -> None:
     site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(500)
     result = fail(srv.ver_bome("BOME-B-2026-6416"), "error_http")
     assert result["estado_http"] == 500
+    assert "reintentar_tras_segundos" not in result
+
+
+def test_blocking_answer_is_sitio_bloqueando(site: Site) -> None:
+    site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(
+        429, headers={"retry-after": "120"}
+    )
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
+    assert result["estado_http"] == 429
+    assert result["reintentar_tras_segundos"] == 120.0
+    assert "espera" in result["error"].lower()
+
+
+def test_blocked_drill_down_is_sitio_bloqueando(site: Site) -> None:
+    site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(403)
+    result = fail(srv.buscar_articulos(texto="relacion provisional"), "sitio_bloqueando")
+    assert result["estado_http"] == 403
+    assert result["reintentar_tras_segundos"] is None
 
 
 @pytest.mark.parametrize(
@@ -399,6 +505,7 @@ def test_500_is_error_http(site: Site) -> None:
         (lambda: srv.listar_bomes("ayer"), "argumento_invalido"),
         (lambda: srv.listar_bomes("2026-09-30", "2026-09-01"), "argumento_invalido"),
         (lambda: srv.sincronizar_indice(reindexar_recientes_dias=-1), "busqueda_invalida"),
+        (lambda: srv.sincronizar_indice(max_boletines=0), "busqueda_invalida"),
     ],
 )
 def test_validation_errors(site: Site, call: Callable[[], dict], code: str) -> None:
