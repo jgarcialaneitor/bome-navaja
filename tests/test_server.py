@@ -450,6 +450,41 @@ def test_sincronizar_indice_passes_max_boletines(site: Site) -> None:
     assert [r.url.path for r in site.requests if r.url.path.startswith("/bome/")] == ["/bome/BOME-B-2026-6416"]
 
 
+def test_broken_pages_become_rotos_and_are_skipped_unless_asked(site: Site) -> None:
+    site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(500)
+
+    def sync(**kwargs: object) -> None:
+        ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0, **kwargs))
+        assert srv._get_sync().esperar(10)
+
+    def broken_requests() -> list[str]:
+        return [r.url.path for r in site.requests if r.url.path == "/bome/BOME-B-2026-6416"]
+
+    sync()
+    sync()
+    state = ok(srv.estado_indice())
+    assert state["indice"]["boletines"]["roto"] == 1
+    assert state["sincronizacion"]["rotos"] == 1
+    found = ok(srv.buscar_en_indice("orden"))
+    assert found["cobertura"]["rotos"] == 1
+    assert "reintentar_rotos" in found["aviso"]
+    site.requests.clear()
+    sync()
+    assert broken_requests() == []
+    sync(reintentar_rotos=True)
+    assert broken_requests() == ["/bome/BOME-B-2026-6416"]
+    assert ok(srv.estado_indice())["sincronizacion"]["rotos"] == 1
+
+
+def test_sincronizar_indice_documents_reintentar_rotos() -> None:
+    description = tools_by_name()["sincronizar_indice"].description
+    assert "reintentar_rotos" in description and "500" in description
+
+
+def test_empty_index_cobertura_has_rotos(site: Site) -> None:
+    assert ok(srv.buscar_en_indice("cese"))["cobertura"]["rotos"] is None
+
+
 def test_import_creates_no_client_and_no_index(data_dir: Path) -> None:
     import importlib
 

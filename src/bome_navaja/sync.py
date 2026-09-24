@@ -5,7 +5,11 @@
 1. Read the calendar for the range (default 2014-01-01..today) and record it.
 2. Plan the bulletins not indexed yet, those published in the last
    ``reindexar_recientes_dias`` days (late corrections) and, if asked, those
-   whose last attempt failed. Newest first.
+   whose last attempt failed. Bulletins marked ``roto`` (their page answered
+   HTTP 5xx twice, see :mod:`bome_navaja.index`) are skipped, even inside the
+   recent window, unless ``reintentar_rotos``: the site's broken pages answer
+   500 deterministically and its firewall bans the client after a few 500s.
+   Newest first.
 3. For each bulletin: fetch the page, recover hidden articles
    (:func:`bome_navaja.search.articulos_del_boletin`) and store everything in
    one transaction. A bulletin without any sumario is ``sin_sumarios``
@@ -227,6 +231,8 @@ class EstadoSincronizacion(JsonModel):
     indexados: int = 0
     sin_sumarios: int = 0
     errores: int = 0
+    rotos: int = 0
+    """Of ``errores``, the bulletins this run left ``roto`` (page answered 5xx twice)."""
     cve_actual: str | None = None
     iniciado: str | None = None
     finalizado: str | None = None
@@ -317,11 +323,14 @@ class SincronizadorIndice:
         reindexar_recientes_dias: int = DEFAULT_RECENT_DAYS,
         reintentar_errores: bool = True,
         max_boletines: int | None = None,
+        reintentar_rotos: bool = False,
     ) -> EstadoSincronizacion:
         """Start a background sync and return its status at once.
 
         At most ``max_boletines`` bulletins (default: the constructor's) are
-        indexed, the newest of the plan. While a sync of this object runs,
+        indexed, the newest of the plan. ``reintentar_errores`` replans failed
+        bulletins; ``roto`` ones are only replanned with ``reintentar_rotos``
+        (each costs an HTTP 500 that the site's firewall counts). While a sync of this object runs,
         returns that job. When another
         process holds a live lease, returns ``en_curso_en_otro_proceso`` with
         the lease and starts nothing.
@@ -363,13 +372,21 @@ class SincronizadorIndice:
                 "indexados": 0,
                 "sin_sumarios": 0,
                 "errores": 0,
+                "rotos": 0,
                 "iniciado": utc_iso(),
                 "limite_boletines": cap,
                 "pendientes_tras_limite": 0,
             }
             self._thread = threading.Thread(
                 target=self._run,
-                args=(start, end, reindexar_recientes_dias, bool(reintentar_errores), cap),
+                args=(
+                    start,
+                    end,
+                    reindexar_recientes_dias,
+                    bool(reintentar_errores),
+                    bool(reintentar_rotos),
+                    cap,
+                ),
                 name="bome-navaja-index-sync",
                 daemon=True,
             )
@@ -422,12 +439,18 @@ class SincronizadorIndice:
         with self._lock:
             self._state[key] = self._state.get(key, 0) + 1
 
-    def _plan(self, refs: list[BulletinRef], recent_days: int, retry_errors: bool) -> list[BulletinRef]:
+    def _plan(
+        self, refs: list[BulletinRef], recent_days: int, retry_errors: bool, retry_broken: bool
+    ) -> list[BulletinRef]:
         known = self.index.estados_boletines()
         cutoff = self._today() - timedelta(days=recent_days)
         chosen: dict[str, BulletinRef] = {}
         for ref in refs:
             status = known.get(ref.cve)
+            if status == "roto":
+                if retry_broken:
+                    chosen[ref.cve] = ref
+                continue
             if (
                 status is None
                 or (recent_days > 0 and ref.date is not None and ref.date >= cutoff)
@@ -436,7 +459,15 @@ class SincronizadorIndice:
                 chosen[ref.cve] = ref
         return sorted(chosen.values(), key=lambda r: (r.date or date.min, r.number), reverse=True)
 
-    def _run(self, start: date, end: date, recent_days: int, retry_errors: bool, cap: int) -> None:
+    def _run(
+        self,
+        start: date,
+        end: date,
+        recent_days: int,
+        retry_errors: bool,
+        retry_broken: bool,
+        cap: int,
+    ) -> None:
         client: BomeClient | None = None
         final: dict[str, Any] = {}
         self._storage_failures = 0
@@ -445,7 +476,7 @@ class SincronizadorIndice:
             client = self._client_factory()
             refs = client.calendar(start, end)
             self.index.registrar_calendario(refs)
-            plan = self._plan(refs, recent_days, retry_errors)
+            plan = self._plan(refs, recent_days, retry_errors, retry_broken)
             deferred = max(len(plan) - cap, 0)
             plan = plan[:cap]  # newest first: the cap defers the oldest
             self._update(total_planificado=len(plan), pendientes_tras_limite=deferred)
@@ -575,11 +606,12 @@ class SincronizadorIndice:
             )
 
     def _record_failure(self, ref: BulletinRef, exc: BaseException) -> None:
-        """Store ``ref`` as ``error``; if even that fails, count it toward giving up."""
+        """Store ``ref`` as ``error`` (the index may make it ``roto``); if even that
+        fails, count it toward giving up."""
         self._bump("hechos")
         self._bump("errores")
         try:
-            self.index.guardar_boletin(ref, [], "error", error=exc)
+            stored = self.index.guardar_boletin(ref, [], "error", error=exc)
         except Exception as store_exc:
             self._storage_failures += 1
             self._update(
@@ -592,6 +624,8 @@ class SincronizadorIndice:
                 ) from store_exc
             return
         self._storage_failures = 0
+        if stored == "roto":
+            self._bump("rotos")
         self._update(ultimo_error=f"{ref.cve}: {exc}")
 
 

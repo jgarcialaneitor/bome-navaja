@@ -116,7 +116,7 @@ def test_full_run(site: Site, index: SumarioIndex) -> None:
     state = sync.estado()
     assert state.estado == "completado"
     assert (state.total_planificado, state.hechos) == (4, 4)
-    assert (state.indexados, state.sin_sumarios, state.errores) == (2, 1, 1)
+    assert (state.indexados, state.sin_sumarios, state.errores, state.rotos) == (2, 1, 1, 0)
     assert state.cve_actual is None
     assert state.iniciado and state.finalizado
     assert "BOME-B-2026-6415" in (state.ultimo_error or "")
@@ -132,7 +132,7 @@ def test_full_run(site: Site, index: SumarioIndex) -> None:
     assert paths[-1] == "/bome/BOME-B-2014-5092"
 
     stored = index.estado()
-    assert stored.boletines == {"indexado": 2, "sin_sumarios": 1, "error": 1, "total": 4}
+    assert stored.boletines == {"indexado": 2, "sin_sumarios": 1, "error": 1, "roto": 0, "total": 4}
     assert stored.articulos == 13 + 2 + 4
     assert stored.calendario_conocidos == 4
     assert stored.pendientes == 1
@@ -671,3 +671,91 @@ def test_an_invalid_cap_falls_back_to_the_default(value: str) -> None:
 def test_both_bad_overrides_give_two_warnings() -> None:
     settings = sync_settings_from_env({"BOME_NAVAJA_SYNC_DELAY": "x", "BOME_NAVAJA_SYNC_MAX_BOLETINES": "y"})
     assert len(settings.warnings) == 2
+
+
+# --------------------------------------------------------------------------- broken pages (site-guard task 2)
+
+B6415 = "/bome/BOME-B-2026-6415"
+
+
+def failure(index: SumarioIndex, cve: str) -> tuple[str, int | None, int]:
+    row = index._conn().execute(
+        "SELECT estado, http_status, fallos_5xx FROM bulletins WHERE cve = ?", (cve,)
+    ).fetchone()
+    return (row[0], row[1], row[2])
+
+
+def test_a_bulletin_page_500_is_an_error_with_its_status(site: Site, index: SumarioIndex) -> None:
+    state = run(make_sync(index, site))
+    assert (state.errores, state.rotos) == (1, 0)
+    assert failure(index, "BOME-B-2026-6415") == ("error", 500, 1)
+
+
+def test_a_second_500_in_a_later_run_makes_the_page_roto_and_it_is_skipped(
+    site: Site, index: SumarioIndex
+) -> None:
+    sync = make_sync(index, site)
+    run(sync)
+    site.requests.clear()
+    state = run(sync, reindexar_recientes_dias=0)
+    assert site.bulletin_paths() == [B6415]  # the error is retried once more...
+    assert (state.hechos, state.errores, state.rotos) == (1, 1, 1)
+    assert failure(index, "BOME-B-2026-6415") == ("roto", 500, 2)
+    assert index.estado().ultima_sincronizacion["rotos"] == 1
+    # ...and then never again: not as an error, not even inside the recent window.
+    site.requests.clear()
+    state = run(sync)
+    assert B6415 not in site.bulletin_paths()
+    assert state.total_planificado == 2  # 6416 and BX-41 of the recent window
+    assert state.rotos == 0
+    site.requests.clear()
+    state = run(sync, reindexar_recientes_dias=0)
+    assert (state.total_planificado, site.bulletin_paths()) == (0, [])
+    assert index.estado().pendientes == 0
+
+
+def test_reintentar_rotos_requests_broken_pages_again(site: Site, index: SumarioIndex) -> None:
+    sync = make_sync(index, site)
+    run(sync)
+    run(sync, reindexar_recientes_dias=0)
+    assert index.estado_boletin("BOME-B-2026-6415") == "roto"
+    site.requests.clear()
+    state = run(sync, reindexar_recientes_dias=0, reintentar_errores=False, reintentar_rotos=True)
+    assert site.bulletin_paths() == [B6415]
+    assert (state.errores, state.rotos) == (1, 1)  # still broken
+    assert failure(index, "BOME-B-2026-6415") == ("roto", 500, 3)
+    site.fix_6415()
+    site.requests.clear()
+    state = run(sync, reindexar_recientes_dias=0, reintentar_rotos=True)
+    assert site.bulletin_paths() == [B6415]
+    assert (state.indexados, state.errores, state.rotos) == (1, 0, 0)
+    assert failure(index, "BOME-B-2026-6415") == ("indexado", None, 0)
+
+
+def test_errors_and_rotos_follow_their_own_switch(site: Site, index: SumarioIndex) -> None:
+    site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(404)
+    sync = make_sync(index, site)
+    run(sync)
+    run(sync, reindexar_recientes_dias=0)
+    assert index.estado_boletin("BOME-B-2026-6415") == "roto"
+    assert failure(index, "BOME-BX-2026-41") == ("error", 404, 0)
+    site.requests.clear()
+    run(sync, reindexar_recientes_dias=0)
+    assert site.bulletin_paths() == ["/bome/BOME-BX-2026-41"]
+    site.requests.clear()
+    run(sync, reindexar_recientes_dias=0, reintentar_errores=False, reintentar_rotos=True)
+    assert site.bulletin_paths() == [B6415]
+    site.requests.clear()
+    run(sync, reindexar_recientes_dias=0, reintentar_errores=False)
+    assert site.bulletin_paths() == []
+
+
+def test_timeouts_never_make_a_page_roto(site: Site, index: SumarioIndex) -> None:
+    site.routes[B6415] = sequence(lambda request: httpx.Response(500), dropped)
+    sync = make_sync(index, site, wait=Waits())
+    for _ in range(3):
+        state = run(sync, reindexar_recientes_dias=0)
+        assert state.rotos == 0
+    assert site.bulletin_paths().count(B6415) == 3  # timeouts keep being retried
+    assert failure(index, "BOME-B-2026-6415") == ("error", None, 1)
+

@@ -626,6 +626,12 @@ def _index_aviso(cobertura: dict[str, Any], sync_state: str | None) -> str | Non
             f"{cobertura['pendientes']} boletines del calendario están pendientes o con error; "
             "sincronizar_indice los reintenta."
         )
+    if cobertura.get("rotos"):
+        notes.append(
+            f"{cobertura['rotos']} boletines están rotos (su página respondió con error interno "
+            "del sitio dos veces): no se indexan ni se reintentan salvo con "
+            "sincronizar_indice(reintentar_rotos=True)."
+        )
     return " ".join(notes) or None
 
 
@@ -666,6 +672,7 @@ def buscar_en_indice(
             "fecha_min": None,
             "fecha_max": None,
             "pendientes": None,
+            "rotos": None,
             "ultima_sincronizacion": None,
             "sincronizacion_en_curso": False,
         }
@@ -703,8 +710,9 @@ def buscar_en_indice(
 def estado_indice() -> dict:
     """Estado del índice local de sumarios y de su sincronización (no toca el sitio).
 
-    Devuelve boletines indexados / sin sumarios / con error, artículos, rango de fechas,
-    pendientes frente al calendario, última sincronización y el progreso de la actual
+    Devuelve boletines indexados / sin sumarios / con error / rotos (páginas que el sitio
+    respondió con error interno dos veces; no cuentan como pendientes), artículos, rango de
+    fechas, pendientes frente al calendario, última sincronización y el progreso de la actual
     (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
     rechaza las peticiones por límite de ritmo o cortafuegos: lo indexado se conserva; espera,
@@ -731,6 +739,7 @@ def sincronizar_indice(
     reindexar_recientes_dias: int = 7,
     reintentar_errores: bool = True,
     max_boletines: int | None = None,
+    reintentar_rotos: bool = False,
 ) -> dict:
     """Arranca en segundo plano la sincronización del índice local de sumarios y vuelve al
     instante.
@@ -748,6 +757,9 @@ def sincronizar_indice(
     devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. Si el sitio rechaza
     las peticiones (403/429/503 o conexiones cortadas) espera y reintenta; si sigue rechazándolas
     termina en estado "bloqueado": no la relances enseguida, espera (horas si es el cortafuegos).
+    Los boletines "rotos" (su página respondió con error interno, HTTP 500, dos veces) se
+    saltan; reintentar_rotos=True los vuelve a pedir: úsalo solo para comprobar si el sitio
+    los arregló, porque cada uno cuesta un HTTP 500 que el cortafuegos del sitio cuenta.
     """
     sync = _get_sync()
     return sync.iniciar(
@@ -756,6 +768,7 @@ def sincronizar_indice(
         reindexar_recientes_dias=reindexar_recientes_dias,
         reintentar_errores=reintentar_errores,
         max_boletines=max_boletines,
+        reintentar_rotos=reintentar_rotos,
     ).to_dict()
 
 
