@@ -46,7 +46,11 @@ portal is a frozen legacy site that may disappear.
       PX → PDF URL with a note. Commit `87d1129`; native review `review-d8cd303051b078b4` approved
       (4 lenses) and acknowledged. Follow-up (advisory, documents.py:748): an extraordinary bulletin
       whose page lists no articles is skipped by the search, so an article hidden in it is not found.
-- [ ] 5. Follow-up of task 4 (user request): find an AX article that sits in an extraordinary
+- [x] 5. Follow-up of task 4 (user request): find an AX article that sits in an extraordinary
       bulletin whose page lists no articles. Today the binary search only tries the two listed
       neighbours when the number falls between their ranges. Live 2026-09-24: an article number
       under the wrong BX bulletin answers 404 (not 500), which the site guard still counts.
+      Fix: gap bulletins between the listed neighbours are read as pages first (200s, budget 4),
+      then bulletins listing nothing are tried before the neighbours; at most 2 article pages per
+      lookup (2 not 3: a failed lookup must leave room in the guard's 3-per-10-min budget for the
+      explicit call its error suggests). Verified: `839 passed, 18 skipped`; live AX-2019-103 still OK.

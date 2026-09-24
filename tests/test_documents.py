@@ -663,6 +663,148 @@ def test_ax_article_hidden_between_two_bulletins_is_tried_in_both(site: Site) ->
     assert articles == ["/bome/BOME-BX-2019-23/articulo/101", "/bome/BOME-BX-2019-24/articulo/101"]
 
 
+def article_fetches(site: Site) -> list[str]:
+    return [p for p in site.paths() if "/articulo/" in p]
+
+
+def listed_except(overrides: dict[int, tuple[int, int] | None]) -> Callable[[int], tuple[int, int] | None]:
+    """``four_per_bulletin`` except for the bulletins in ``overrides``."""
+    return lambda k: overrides[k] if k in overrides else four_per_bulletin(k)
+
+
+def first_three_unfetched(
+    listed: dict[int, tuple[int, int] | None],
+) -> Callable[[int], tuple[int, int] | None]:
+    """8 BX bulletins, BX-4..BX-8 list nothing: the binary search spends its 5
+    pages on them (ceil(log2(8)) + 2) and never fetches BX-1..BX-3."""
+    return lambda k: listed.get(k)
+
+
+def test_ax_article_in_a_bulletin_whose_page_lists_nothing_is_found(site: Site) -> None:
+    # BX-24 lists nothing: 103 falls between BX-23 (98..101) and BX-25 (106..109).
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({24: None}))
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-103")
+    assert result.cve == "BOME-AX-2019-103"
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-24"
+    # The empty bulletin is tried before the listed neighbours.
+    assert article_fetches(site) == ["/bome/BOME-BX-2019-24/articulo/103"]
+
+
+def test_ax_article_in_the_second_of_two_empty_bulletins_is_found(site: Site) -> None:
+    # BX-24 and BX-25 list nothing; 106 lives in BX-25.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({23: (98, 101), 24: None, 25: None}))
+    serve_article(site, "BOME-AX-2019-106", "BOME-BX-2019-25")
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-B-2019-5625/articulo/106"}
+    )
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-106")
+    assert result.cve == "BOME-AX-2019-106"
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-25"
+    assert article_fetches(site) == [
+        "/bome/BOME-BX-2019-24/articulo/106",
+        "/bome/BOME-BX-2019-25/articulo/106",
+    ]
+
+
+def test_ax_article_hidden_at_the_lower_edge_is_still_found(site: Site) -> None:
+    # BX-23 lists 98..100 and hides 101; BX-24 lists nothing.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({23: (98, 100), 24: None}))
+    serve_article(site, "BOME-AX-2019-101", "BOME-BX-2019-23")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-101")
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-23"
+    assert article_fetches(site) == [
+        "/bome/BOME-BX-2019-24/articulo/101",
+        "/bome/BOME-BX-2019-23/articulo/101",
+    ]
+
+
+def test_ax_unfetched_gap_bulletin_listing_the_number_is_used_directly(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 8, first_three_unfetched({1: (1, 3), 2: (4, 6)}))
+    serve_article(site, "BOME-AX-2019-5", "BOME-BX-2019-2")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-5")
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-2"
+    # Gap pages are read first (200s); no article guess, so no 404 for the site guard.
+    assert article_fetches(site) == ["/bome/BOME-BX-2019-2/articulo/5"]
+    assert bulletin_fetches(site)[-2:] == ["/bome/BOME-BX-2019-1", "/bome/BOME-BX-2019-2"]
+
+
+def test_ax_listed_gap_page_without_the_number_is_dropped(site: Site) -> None:
+    # BX-1 (1..2) is superseded by BX-2 (3..4) as the lower neighbour of 6;
+    # BX-3 (7..8) is the upper one and hides 6 at its start.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 8, first_three_unfetched({1: (1, 2), 2: (3, 4), 3: (7, 8)}))
+    serve_article(site, "BOME-AX-2019-6", "BOME-BX-2019-3")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-6")
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-3"
+    assert article_fetches(site) == [
+        "/bome/BOME-BX-2019-2/articulo/6",
+        "/bome/BOME-BX-2019-3/articulo/6",
+    ]
+
+
+def test_ax_lookup_stops_after_two_article_pages_and_lists_the_rest(site: Site) -> None:
+    # Candidates for 106: BX-24, BX-25 (list nothing), BX-23 (below), BX-26 (above).
+    # Two wrong guesses (404s) leave one error of the site guard's 3-per-10-min
+    # budget for the explicit call the error suggests.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({23: (98, 101), 24: None, 25: None}))
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(client, "BOME-AX-2019-106")
+    assert documents_module.MAX_INTENTOS_ARTICULO_EXTRA == 2
+    assert article_fetches(site) == [
+        "/bome/BOME-BX-2019-24/articulo/106",
+        "/bome/BOME-BX-2019-25/articulo/106",
+    ]
+    message = str(caught.value)
+    assert "BOME-BX-2019-23" in message and "BOME-BX-2019-26" in message
+    assert "cve='BOME-BX-2019-23'" in message and "numero=106" in message
+
+
+def test_ax_shortcut_article_pages_count_toward_the_cap(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({23: (98, 101), 24: None, 25: None}))
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(
+                client,
+                "BOME-AX-2019-106",
+                boletin_de_articulo=lambda cve: documents_module.parse_cve("BOME-BX-2019-10"),
+            )
+    assert article_fetches(site) == [
+        "/bome/BOME-BX-2019-10/articulo/106",
+        "/bome/BOME-BX-2019-24/articulo/106",
+    ]
+    message = str(caught.value)
+    assert all(f"BOME-BX-2019-{n}" in message for n in (25, 23, 26))
+
+
+def test_ax_gap_page_budget_exhausted_is_a_clear_error(site: Site) -> None:
+    # 16 BX bulletins listing nothing: 6 search pages, then 4 gap pages, 6 left unchecked.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 16, lambda k: None)
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(client, "BOME-AX-2019-103")
+    assert documents_module.BUSQUEDA_EXTRA_HUECO == 4
+    assert len(bulletin_fetches(site)) == 6 + 4
+    assert article_fetches(site) == []  # no blind guess spends the site guard's error budget
+    message = str(caught.value)
+    assert "6 bulletins" in message and "unchecked" in message
+    assert "BOME-BX-2019-1 " in message and "BOME-BX-2019-16" in message
+    assert "numero=103" in message
+
+
 def test_ax_binary_search_is_bounded_and_ends_in_a_clear_error(site: Site) -> None:
     # Worst case: 64 BX bulletins whose pages list nothing.
     site_bug_resolver(site)
@@ -671,7 +813,7 @@ def test_ax_binary_search_is_bounded_and_ends_in_a_clear_error(site: Site) -> No
         with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
             leer_articulo(client, "BOME-AX-2019-103")
     assert isinstance(caught.value, BomeNotFoundError)
-    assert len(bulletin_fetches(site)) <= 8  # ceil(log2(64)) + 2
+    assert len(bulletin_fetches(site)) <= 8 + 4  # ceil(log2(64)) + 2, then the gap budget
     message = str(caught.value)
     assert "BOME-AX-2019-103" in message and "numero" in message and "BOME-BX-2019-" in message
     assert "/bome/BOME-B-2019-5625/articulo/103" not in site.paths()

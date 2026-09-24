@@ -107,6 +107,18 @@ BoletinDeArticulo = Callable[[Cve], Cve | None]
 BUSQUEDA_EXTRA_MARGEN = 2
 """Bulletin pages the AX search may fetch beyond ``ceil(log2(#BX))``."""
 
+BUSQUEDA_EXTRA_HUECO = 4
+"""Bulletin pages the AX search may fetch, after its binary search, between the
+two listed neighbours of the number (a 200 page costs the site guard nothing)."""
+
+MAX_INTENTOS_ARTICULO_EXTRA = 2
+"""Article pages one AX lookup may fetch: each wrong guess is a 404 that the
+site guard counts. Its budget is 3 errors per 10 minutes, so a failed lookup
+leaves room for the explicit ``cve='BOME-BX-…', numero=`` call its error
+suggests."""
+
+_MAX_BOLETINES_EN_ERROR = 10
+
 
 # --------------------------------------------------------------------------- models
 
@@ -586,9 +598,12 @@ def localizar_articulo(
     it (it sends those to ordinary bulletins, see the module docstring): it
     asks ``boletin_de_articulo`` first (optional, e.g. the local index), then
     the resolver only if it answers an extraordinary bulletin of the same
-    year, then :func:`_buscar_boletin_extra`. For an article CVE the fetched
-    page must show that very CVE, else :class:`ArticuloDistintoError`; an
-    ``AX`` found nowhere raises :class:`ArticuloNoLocalizadoError`.
+    year, then the candidates of :func:`_buscar_boletin_extra`, fetching at
+    most ``MAX_INTENTOS_ARTICULO_EXTRA`` article pages in all (shortcuts
+    included: each wrong guess is a 404 the site guard counts). For an
+    article CVE the fetched page must show that very CVE, else
+    :class:`ArticuloDistintoError`; an ``AX`` not found raises
+    :class:`ArticuloNoLocalizadoError`, naming any candidate left untried.
     """
     cve = parse_cve(cve_boletin_o_articulo)
     if cve.kind.is_bulletin:
@@ -662,12 +677,18 @@ def _resolver_bulletin(client: BomeClient, cve: Cve) -> Cve | None:
 
 
 def _extra_article(client: BomeClient, cve: Cve, lookup: BoletinDeArticulo | None) -> Article:
-    tried: set[Cve] = set()
+    """Locate an ``AX`` article with at most ``MAX_INTENTOS_ARTICULO_EXTRA`` article pages.
+
+    The shortcuts (index, resolver) that fetch an article page count toward
+    the cap; the search's candidates follow in its order. Candidates left
+    untried by the cap are named in the error so the caller can go on.
+    """
+    tried: list[Cve] = []
 
     def attempt(bulletin: Cve | None) -> Article | None:
-        if bulletin is None or bulletin in tried:
+        if bulletin is None or bulletin in tried or len(tried) >= MAX_INTENTOS_ARTICULO_EXTRA:
             return None
-        tried.add(bulletin)
+        tried.append(bulletin)
         try:
             return _verified_article(client, bulletin, cve.number, cve)
         except BomeNotFoundError:  # includes ArticuloDistintoError: not in this bulletin
@@ -680,7 +701,13 @@ def _extra_article(client: BomeClient, cve: Cve, lookup: BoletinDeArticulo | Non
     for candidate in search.candidatos:
         if (article := attempt(candidate)) is not None:
             return article
-    raise search.error(cve)
+    raise search.error(cve, [c for c in search.candidatos if c not in tried])
+
+
+def _cve_list(bulletins: Sequence[Cve]) -> str:
+    shown = ", ".join(str(bulletin) for bulletin in bulletins[:_MAX_BOLETINES_EN_ERROR])
+    rest = len(bulletins) - _MAX_BOLETINES_EN_ERROR
+    return f"{shown} and {rest} more" if rest > 0 else shown
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,20 +717,41 @@ class _BusquedaExtra:
     paginas: int
     agotada: bool
     url: str
+    hueco: tuple[Cve, ...] = ()
+    """The bulletins between the listed neighbours when the gap budget ran out."""
+    sin_revisar: int = 0
+    """How many of ``hueco`` were never fetched."""
 
-    def error(self, cve: Cve) -> ArticuloNoLocalizadoError:
+    def error(self, cve: Cve, untried: Sequence[Cve] = ()) -> ArticuloNoLocalizadoError:
+        checked = (
+            f"{self.paginas} bulletin pages checked"
+            f"{', search budget exhausted' if self.agotada else ''}"
+        )
+        example = f"cve='BOME-BX-{cve.year}-N', numero={cve.number}"
         if self.boletines == 0:
             where = f"the site calendar lists no extraordinary bulletin in {cve.year}"
-        else:
+        elif untried:
             where = (
-                f"it is not in the {self.boletines} extraordinary bulletins of {cve.year} "
-                f"({self.paginas} bulletin pages checked"
-                f"{', search budget exhausted' if self.agotada else ''})"
+                f"the lookup stopped after {MAX_INTENTOS_ARTICULO_EXTRA} article pages (each "
+                "wrong guess is an HTTP error the site guard counts), with candidate bulletins "
+                f"left untried: {_cve_list(untried)} ({checked})"
             )
+            example = f"cve='{untried[0]}', numero={cve.number}" + (
+                ", then the other untried bulletins" if len(untried) > 1 else ""
+            )
+        elif self.sin_revisar:
+            where = (
+                f"it can only be in the {len(self.hueco)} extraordinary bulletins from "
+                f"{self.hueco[0]} to {self.hueco[-1]}, but the gap page budget ran out with "
+                f"{self.sin_revisar} bulletins unchecked, so no article page was guessed "
+                f"({checked})"
+            )
+        else:
+            where = f"it is not in the {self.boletines} extraordinary bulletins of {cve.year} ({checked})"
         return ArticuloNoLocalizadoError(
             f"{cve} could not be located: {where}. The site's CVE resolver cannot be used for "
             f"it (it sends extraordinary articles to ordinary bulletins). Give the bulletin CVE "
-            f"plus 'numero' instead: cve='BOME-BX-{cve.year}-N', numero={cve.number} "
+            f"plus 'numero' instead, calling leer_articulo with {example} "
             "(find the bulletin with listar_bomes, ver_bome or buscar_bomes)",
             status=None,
             url=self.url,
@@ -715,17 +763,30 @@ class _BudgetExhausted(Exception):
 
 
 def _buscar_boletin_extra(client: BomeClient, cve: Cve) -> _BusquedaExtra:
-    """Candidate extraordinary bulletins for an ``AX`` CVE, by binary search.
+    """Candidate extraordinary bulletins for an ``AX`` CVE, in the order to try them.
 
     Extraordinary article numbers are consecutive within a year and
     extraordinary bulletins are numbered in publication order, so the
     bulletins of the year (from the calendar, sorted by number) cover
     increasing article-number ranges. Each bulletin page fetched gives its
     listed range min..max; a number inside it belongs to that bulletin (pages
-    may hide articles). A page listing nothing is skipped rightwards. At most
-    ``ceil(log2(#BX)) + BUSQUEDA_EXTRA_MARGEN`` pages are fetched. When the
-    number falls between two ranges (a hidden article at a bulletin edge) both
-    neighbours are candidates, lower first.
+    may hide articles).
+
+    1. Binary search: a page listing nothing is skipped rightwards; at most
+       ``ceil(log2(#BX)) + BUSQUEDA_EXTRA_MARGEN`` pages are fetched.
+    2. Without a hit, the gap is the bulletins strictly between the last
+       listed range below the number and the first listed range above it
+       (the start/end of the year when absent). Gap pages never fetched are
+       fetched now, nearest to the lower neighbour first, at most
+       ``BUSQUEDA_EXTRA_HUECO`` of them (a 200 page costs the site guard
+       nothing, a wrong article guess costs a 404): a range containing the
+       number is the answer; any other listed range becomes the new, closer
+       neighbour, so the gap shrinks and the pages it leaves are dropped.
+       If pages remain unfetched when that budget runs out, no candidate is
+       returned (guessing blind would only spend the guard's error budget).
+    3. Candidates: the gap bulletins whose page lists nothing (nearest to
+       the lower neighbour first), then the lower neighbour, then the upper
+       one (a hidden article at a bulletin edge).
     """
     year, target = cve.year, cve.number
     start, end = date(year, 1, 1), date(year, 12, 31)
@@ -743,23 +804,34 @@ def _buscar_boletin_extra(client: BomeClient, cve: Cve) -> _BusquedaExtra:
         return _BusquedaExtra((), 0, 0, False, url)
     budget = math.ceil(math.log2(len(bulletins))) + BUSQUEDA_EXTRA_MARGEN
     spans: dict[int, tuple[int, int] | None] = {}
+    exhausted = False
+
+    def fetch(index: int) -> tuple[int, int] | None:
+        bulletin = bulletins[index]
+        numbers = [
+            ref.number
+            for ref in client.bulletin(bulletin).articles
+            if ref.cve == str(bulletin.article_cve(ref.number))
+        ]
+        spans[index] = (min(numbers), max(numbers)) if numbers else None
+        return spans[index]
 
     def span(index: int) -> tuple[int, int] | None:
         if index not in spans:
             if len(spans) >= budget:
                 raise _BudgetExhausted
-            bulletin = bulletins[index]
-            numbers = [
-                ref.number
-                for ref in client.bulletin(bulletin).articles
-                if ref.cve == str(bulletin.article_cve(ref.number))
-            ]
-            spans[index] = (min(numbers), max(numbers)) if numbers else None
+            fetch(index)
         return spans[index]
 
-    def result(candidates: Sequence[int], exhausted: bool = False) -> _BusquedaExtra:
+    def result(candidates: Sequence[int], gap: Sequence[int] = (), unchecked: int = 0) -> _BusquedaExtra:
         return _BusquedaExtra(
-            tuple(bulletins[i] for i in candidates), len(bulletins), len(spans), exhausted, url
+            tuple(bulletins[i] for i in candidates),
+            len(bulletins),
+            len(spans),
+            exhausted,
+            url,
+            tuple(bulletins[i] for i in gap),
+            unchecked,
         )
 
     low, high = 0, len(bulletins) - 1
@@ -780,11 +852,24 @@ def _buscar_boletin_extra(client: BomeClient, cve: Cve) -> _BusquedaExtra:
             else:
                 low = probe + 1
     except _BudgetExhausted:
-        return result([], exhausted=True)
-    listed = {i: s for i, s in spans.items() if s is not None}
-    below = max((i for i, s in listed.items() if s[1] < target), default=None)
-    above = min((i for i, s in listed.items() if s[0] > target), default=None)
-    return result([i for i in (below, above) if i is not None])
+        exhausted = True
+    gap_pages = 0
+    while True:
+        listed = {i: s for i, s in spans.items() if s is not None}
+        below = max((i for i, s in listed.items() if s[1] < target), default=None)
+        above = min((i for i, s in listed.items() if s[0] > target), default=None)
+        gap = range(0 if below is None else below + 1, len(bulletins) if above is None else above)
+        unfetched = [i for i in gap if i not in spans]
+        if not unfetched:
+            break
+        if gap_pages >= BUSQUEDA_EXTRA_HUECO:
+            return result([], gap, len(unfetched))
+        gap_pages += 1
+        listed_span = fetch(unfetched[0])
+        if listed_span is not None and listed_span[0] <= target <= listed_span[1]:
+            return result([unfetched[0]])
+    empty = [i for i in gap if spans[i] is None]
+    return result([*empty, *(i for i in (below, above) if i is not None)])
 
 
 def _article_metadata(article: Article, base_url: str) -> dict[str, Any]:
@@ -930,7 +1015,9 @@ def leer_boletin(
 
 
 __all__ = [
+    "BUSQUEDA_EXTRA_HUECO",
     "BUSQUEDA_EXTRA_MARGEN",
+    "MAX_INTENTOS_ARTICULO_EXTRA",
     "DEFAULT_MAX_CARACTERES",
     "MAX_MAX_CARACTERES",
     "MAX_PDF_BYTES",
