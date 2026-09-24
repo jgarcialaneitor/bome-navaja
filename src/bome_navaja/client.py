@@ -437,6 +437,33 @@ class BomeClient:
         """
         path = pdf_path(cve)
         url = self.base_url + path
+        content, response = self.fetch_bytes("GET", path, max_bytes=max_bytes)
+        if not content.lstrip()[:4] == b"%PDF":
+            content_type = response.headers.get("content-type")
+            raise BomeParseError(f"{url} did not return a PDF (content-type {content_type!r})")
+        return content
+
+    def fetch_bytes(
+        self,
+        method: Literal["GET", "POST"],
+        path: str,
+        *,
+        params: Sequence[tuple[str, str]] | dict[str, str] | None = None,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, httpx.Response]:
+        """Low-level streamed request with the full client discipline.
+
+        Asks the guard, waits politely, streams the body, reports the outcome
+        to the guard and maps failures like :meth:`_request`. With
+        ``max_bytes`` it aborts with :class:`BomeDocumentTooLargeError` as
+        soon as the announced ``Content-Length`` or the bytes received exceed
+        it. Returns the body and the (closed) response, whose status, final
+        URL and headers stay readable. ``path`` is site-relative or absolute.
+        Shared with :class:`~bome_navaja.antiguo.PortalAntiguo`.
+        """
+        url = path if path.startswith(("http://", "https://")) else self.base_url + path
         if self._client.is_closed:
             raise BomeHTTPError(f"client is closed; cannot request {url}", status=None, url=url)
         self._ask_guard(url)
@@ -444,7 +471,9 @@ class BomeClient:
         chunks: list[bytes] = []
         received = 0
         try:
-            with self._client.stream("GET", path) as response:
+            with self._client.stream(
+                method, path, params=params, content=content, headers=headers
+            ) as response:
                 self._check_answer(response)
                 announced = response.headers.get("content-length", "")
                 if max_bytes is not None and announced.isdigit() and int(announced) > max_bytes:
@@ -462,17 +491,13 @@ class BomeClient:
                             limit=max_bytes,
                         )
                     chunks.append(chunk)
-                content_type = response.headers.get("content-type")
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             self._no_answer(exc)
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
             if self._paced:
                 self._last_request = time.monotonic()
-        content = b"".join(chunks)
-        if not content.lstrip()[:4] == b"%PDF":
-            raise BomeParseError(f"{url} did not return a PDF (content-type {content_type!r})")
-        return content
+        return b"".join(chunks), response
 
     # ------------------------------------------------------------------ search
 

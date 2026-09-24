@@ -69,5 +69,9 @@ proceeding: no bulk crawling of those paths (no index sync from the old portal) 
       `3a06686`; native review `review-f3ca6064c6b4d09e` approved and acknowledged.
 - [x] 5. Sync default start 2018-01-01. Verified: `599 passed, 16 skipped`. Pre-2018 gaps are
       reported apart as `pendientes_anteriores_2018`.
-- [ ] 6. Old-portal client + parsers + catalog cache + own guard.
+- [x] 6. Old-portal client + parsers + catalog cache + own guard. Verified: `680 passed, 18 skipped`
+      (2 live tests not run). Full raw catalog: 3,260 unique bulletins 1985-01-03..2021-03-12,
+      1,031 from 2014; 24 pre-2014 identifiers repeat (lookup by CVE returns a list).
+      Found: 14 bulletins with the same number but a different date on each site
+      (e.g. BOME-B-2015-5230: 2015-12-17 on bomemelilla.es vs 2015-05-01 on melilla.es).
 - [ ] 7. Old-portal tools, README, manifest.

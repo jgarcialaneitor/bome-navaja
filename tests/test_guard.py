@@ -394,3 +394,44 @@ def test_the_guard_is_thread_safe(clock: Clock, tmp_path: Path) -> None:
 
 def test_the_default_clock_is_the_wall_clock() -> None:
     assert GuardiaSitio(None)._clock is guard_module.time.time
+
+
+# --------------------------------------------------------------------------- other sites (old portal on melilla.es)
+
+
+def test_the_old_portal_has_its_own_state_file_name() -> None:
+    assert guard_module.FICHERO_ESTADO_MELILLA == "estado_sitio_melilla.json"
+    assert guard_module.FICHERO_ESTADO_MELILLA != FICHERO_ESTADO
+
+
+def test_the_default_site_is_bomemelilla(clock: Clock) -> None:
+    guard = memory_guard(clock)
+    assert guard.sitio == "bomemelilla.es"
+    guard.registrar(403)
+    with pytest.raises(BomeBlockedError) as info:
+        guard.comprobar(URL)
+    assert "bomemelilla.es" in str(info.value)
+
+
+def test_messages_name_the_guarded_site(clock: Clock) -> None:
+    guard = GuardiaSitio(None, clock=clock, sitio="melilla.es")
+    assert guard.sitio == "melilla.es"
+    for _ in range(3):
+        guard.registrar(500)
+    with pytest.raises(BomePausaPreventivaError) as pause:
+        guard.comprobar(URL)
+    guard.registrar(429)
+    with pytest.raises(BomeBlockedError) as block:
+        guard.comprobar(URL)
+    for text in (str(pause.value), str(block.value)):
+        assert "melilla.es" in text and "bomemelilla.es" not in text
+    assert "pausa preventiva" in str(pause.value) and "no es un bloqueo" in str(pause.value)
+
+
+def test_two_sites_keep_separate_state_files(clock: Clock, tmp_path: Path) -> None:
+    bome = GuardiaSitio(tmp_path / FICHERO_ESTADO, clock=clock)
+    portal = GuardiaSitio(tmp_path / guard_module.FICHERO_ESTADO_MELILLA, clock=clock, sitio="melilla.es")
+    portal.registrar(403)
+    assert portal.en_enfriamiento()
+    assert not bome.en_enfriamiento()
+    assert bome.comprobar(URL) is None

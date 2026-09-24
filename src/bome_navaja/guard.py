@@ -77,6 +77,12 @@ ESTADOS_BLOQUEO = frozenset({403, 429, 503})
 FICHERO_ESTADO = "estado_sitio.json"
 """Name of the shared state file inside the data folder."""
 
+FICHERO_ESTADO_MELILLA = "estado_sitio_melilla.json"
+"""State file of the old BOME portal on melilla.es (its own budget and cooldown)."""
+
+SITIO_POR_DEFECTO = "bomemelilla.es"
+"""Site named in the model-facing messages unless another ``sitio`` is given."""
+
 _FORMAT_VERSION = 1
 
 
@@ -93,12 +99,21 @@ class GuardiaSitio:
 
     ``path`` is the shared state file (``None``: memory only, e.g. tests or no
     data folder). ``clock`` returns wall-clock seconds (it must be comparable
-    across processes); tests inject a fake one. Thread-safe.
+    across processes); tests inject a fake one. ``sitio`` is the host named in
+    the model-facing messages: each guarded site gets its own guard and state
+    file (the old portal on melilla.es uses :data:`FICHERO_ESTADO_MELILLA`).
+    Thread-safe.
     """
 
     def __init__(
-        self, path: str | os.PathLike[str] | None = None, *, clock: Callable[[], float] = time.time
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        clock: Callable[[], float] = time.time,
+        sitio: str = SITIO_POR_DEFECTO,
     ) -> None:
+        self.sitio = sitio
+        """Host named in the messages (``bomemelilla.es`` by default)."""
         self._path = Path(path) if path is not None else None
         self._clock = clock
         self._lock = threading.Lock()
@@ -318,18 +333,22 @@ class GuardiaSitio:
     def _block_message(self, remaining: float) -> str:
         until = _utc(self._deadline).strftime("%Y-%m-%d %H:%M")
         return (
-            f"bloqueo del sitio: bome-navaja no hará ninguna petición a bomemelilla.es hasta las "
+            f"bloqueo del sitio: bome-navaja no hará ninguna petición a {self.sitio} hasta las "
             f"{until} UTC (faltan {math.ceil(remaining)} s) porque el sitio nos está bloqueando "
             f"({self._motivo or 'motivo desconocido'}). No es un fallo de este documento; "
             "reintenta pasado ese tiempo."
         )
 
-    @staticmethod
-    def _pause_message(errors: int, wait: float) -> str:
+    def _pause_message(self, errors: int, wait: float) -> str:
+        reason = (
+            "su cortafuegos bloquea la IP durante horas a partir del quinto"
+            if self.sitio == SITIO_POR_DEFECTO
+            else "bome-navaja limita los errores para no provocar un bloqueo de la IP"
+        )
         return (
-            "pausa preventiva de bome-navaja, no es un bloqueo del sitio: bomemelilla.es ya "
+            f"pausa preventiva de bome-navaja, no es un bloqueo del sitio: {self.sitio} ya "
             f"respondió {errors} errores HTTP en los últimos {VENTANA_ERRORES_SEGUNDOS // 60} min "
-            "y su cortafuegos bloquea la IP durante horas a partir del quinto, así que no se le "
+            f"y {reason}, así que no se le "
             f"pide nada más hasta que pase la ventana. Reintenta dentro de {math.ceil(wait)} s."
         )
 
@@ -339,8 +358,10 @@ __all__ = [
     "ESTADOS_BLOQUEO",
     "FALLOS_TRANSPORTE_BLOQUEO",
     "FICHERO_ESTADO",
+    "FICHERO_ESTADO_MELILLA",
     "MAX_ERRORES_EN_VENTANA",
     "MAX_RETRY_AFTER_SEGUNDOS",
+    "SITIO_POR_DEFECTO",
     "VENTANA_ERRORES_SEGUNDOS",
     "GuardiaSitio",
 ]

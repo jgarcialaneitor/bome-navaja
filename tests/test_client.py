@@ -640,3 +640,45 @@ def test_a_successful_download_resets_the_streak(recorder: Recorder) -> None:
         bome.download("BOME-P-2026-4784")
     guard.registrar(None)
     assert not guard.en_enfriamiento()
+
+
+# --------------------------------------------------------------------------- fetch_bytes (shared with the old portal)
+
+
+def test_fetch_bytes_posts_content_through_the_guard(recorder: Recorder) -> None:
+    seen: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"<html>ok</html>", headers={"content-type": "text/html"})
+
+    recorder.routes["/form"] = answer
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        content, response = bome.fetch_bytes(
+            "POST",
+            "/form",
+            params={"a": "1"},
+            content=b"q=x",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+    assert content == b"<html>ok</html>" and response.status_code == 200
+    (request,) = seen
+    assert request.method == "POST" and request.content == b"q=x"
+    assert request.url.params["a"] == "1"
+    assert request.headers["content-type"] == "application/x-www-form-urlencoded"
+
+
+def test_fetch_bytes_caps_the_size_and_records_errors(recorder: Recorder) -> None:
+    from bome_navaja.models import BomeDocumentTooLargeError
+
+    recorder.routes["/big"] = lambda request: httpx.Response(200, content=b"x" * 5000)
+    recorder.routes["/broken"] = lambda request: httpx.Response(500)
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        with pytest.raises(BomeDocumentTooLargeError) as info:
+            bome.fetch_bytes("GET", "/big", max_bytes=1000)
+        assert info.value.limit == 1000
+        with pytest.raises(BomeHTTPError):
+            bome.fetch_bytes("GET", "/broken")
+    assert guard.errores_en_ventana() == 1
