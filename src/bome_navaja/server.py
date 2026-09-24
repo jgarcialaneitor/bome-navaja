@@ -97,7 +97,15 @@ Qué herramienta usar:
 - Explorar: listar_bomes (calendario), ver_bome (árbol de artículos), resolver_cve.
 - Índice local: sincronizar_indice (solo cuando haga falta; cada ejecución indexa como mucho
   250 boletines por defecto en ~15-20 min; el histórico completo necesita varias ejecuciones
-  espaciadas).
+  espaciadas). Los boletines "rotos" (su página da error interno del sitio) se saltan;
+  reintentar_rotos solo para comprobar si el sitio los arregló.
+
+Cortafuegos del sitio: bomemelilla.es bloquea la IP tras unas 5 respuestas de error, y
+bome-navaja se protege sola (como mucho 3 errores cada 10 minutos entre todas las
+herramientas y la sincronización). Si una herramienta responde pausa_preventiva (pausa propia,
+no un bloqueo) o sitio_bloqueando (el sitio nos bloqueó: no se le pide nada durante ~75 min),
+espera reintentar_tras_segundos antes de reintentar; no repitas la llamada en bucle ni cambies
+de herramienta para esquivarlo. estado_servidor muestra la guardia en guardia_sitio.
 
 Semántica de búsqueda del sitio: coincidencia literal por subcadena, sin distinguir tildes ni
 mayúsculas, sin sinónimos (busca "cese", no "destitución"; "nombra" encuentra
@@ -765,8 +773,11 @@ def estado_indice() -> dict:
     fechas, pendientes frente al calendario, última sincronización y el progreso de la actual
     (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
-    rechaza las peticiones por límite de ritmo o cortafuegos: lo indexado se conserva; espera,
-    horas si es un bloqueo del cortafuegos, antes de volver a sincronizar; ver 'mensaje').
+    nos bloqueó: 403/429/503 o dos peticiones seguidas sin respuesta; lo indexado se conserva y
+    bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min: no vuelvas a
+    sincronizar antes; ver 'mensaje'). En 'mensaje' también aparecen las pausas preventivas
+    (como mucho 3 respuestas de error del sitio cada 10 minutos) y la sincronización cuenta
+    los boletines que quedaron rotos en 'rotos'.
     """
     path, exists = _index_file()
     index = _open_index_if_present()
@@ -804,9 +815,13 @@ def sincronizar_indice(
     amable con el sitio). Es reanudable: si se corta, la siguiente llamada continúa donde
     quedó. Sigue el progreso con estado_indice; mientras tanto
     buscar_en_indice da resultados parciales. Si ya hay una en curso (en este u otro proceso)
-    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. Si el sitio rechaza
-    las peticiones (403/429/503 o conexiones cortadas) espera y reintenta; si sigue rechazándolas
-    termina en estado "bloqueado": no la relances enseguida, espera (horas si es el cortafuegos).
+    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. El cortafuegos del
+    sitio bloquea la IP tras unas 5 respuestas de error, así que la sincronización admite como
+    mucho 3 cada 10 minutos (si llega al límite hace una pausa preventiva y va más lenta) y
+    espera 30-60 s tras una página rota. Si el sitio la bloquea (403/429/503 o dos peticiones
+    seguidas sin respuesta) termina en estado "bloqueado" y bome-navaja no le pide nada durante
+    reintentar_tras_segundos (~75 min): no la relances antes (terminaría "bloqueado" al
+    instante).
     Los boletines "rotos" (su página respondió con error interno, HTTP 500, dos veces) se
     saltan; reintentar_rotos=True los vuelve a pedir: úsalo solo para comprobar si el sitio
     los arregló, porque cada uno cuesta un HTTP 500 que el cortafuegos del sitio cuenta.
@@ -826,7 +841,7 @@ def sincronizar_indice(
 @_herramienta
 def cancelar_sincronizacion() -> dict:
     """Pide parar la sincronización en curso; termina tras el boletín que esté procesando (o al
-    instante si está esperando porque el sitio la había bloqueado).
+    instante si está en una pausa: preventiva o tras una página rota del sitio).
 
     Lo ya indexado se conserva y una nueva sincronizar_indice continúa desde ahí.
     """
@@ -875,8 +890,11 @@ def estado_servidor() -> dict:
     abierto, versión de SQLite con FTS5/trigram, pausa de cortesía de las herramientas y de
     la sincronización (pausa, variación aleatoria y máximo de boletines por ejecución, con
     BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas), URL base y la
-    guardia del sitio (guardia_sitio: enfriamiento_hasta y segundos_restantes si el sitio
-    nos bloqueó, errores HTTP en la ventana frente al máximo permitido y su fichero).
+    guardia del sitio (guardia_sitio: enfriamiento_hasta, segundos_restantes y motivo si el
+    sitio nos bloqueó, durante el cual las herramientas responden sitio_bloqueando; errores
+    HTTP en la ventana de 10 minutos frente al máximo permitido, 3: con el cupo lleno
+    las herramientas responden pausa_preventiva; y su fichero estado_sitio.json,
+    compartido por todos los procesos de bome-navaja).
     """
     try:
         exists = index_path()[0].exists()

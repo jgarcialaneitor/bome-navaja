@@ -45,7 +45,7 @@
 
 ## 🧰 Herramientas
 
-Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `error_http`, `sitio_bloqueando`, `indice_no_disponible`…); nunca rompen la conversación con una excepción.
+Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `error_http`, `sitio_bloqueando`, `pausa_preventiva`, `indice_no_disponible`…); nunca rompen la conversación con una excepción.
 
 | Grupo | Herramienta | Para qué sirve |
 | --- | --- | --- |
@@ -136,18 +136,22 @@ En los dos modos se ignoran tildes y mayúsculas, y un `*` final se acepta pero 
 
 - **Solo se sincroniza cuando el modelo llama a `sincronizar_indice`.** El servidor nunca recorre el sitio por su cuenta, ni al arrancar.
 - La herramienta vuelve al instante; la sincronización sigue **en segundo plano**, del boletín más reciente al más antiguo.
-- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos. El histórico completo (~1.900 boletines desde 2014) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
-- Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`).
-- Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
-- `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está esperando por un bloqueo); lo ya indexado se conserva.
-- Si el sitio **rechaza las peticiones** (403, 429 o 503: límite de ritmo o cortafuegos), la sincronización no marca esos boletines como error: espera (respetando `Retry-After`, con esperas crecientes de 1, 2… hasta 15 minutos) y reintenta. Si el rechazo sigue, o tres boletines seguidos se quedan sin respuesta, termina en estado **`bloqueado`**. En ese caso no la relances enseguida: si es el cortafuegos, espera unas horas.
+- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos (más si el sitio responde con errores; ver abajo). El histórico completo (~1.900 boletines desde 2014) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
+- Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`), salvo los `roto`.
+- Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`, `rotos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
+- `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está en una pausa); lo ya indexado se conserva.
+- **Cuida el cortafuegos del sitio**, que bloquea la IP tras unas 5 respuestas de error (detalle en [Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio)):
+  - No pasa de **3 respuestas de error cada 10 minutos**: si llega al límite, hace una pausa preventiva (la indica `mensaje`), así que puede ir más lenta.
+  - Tras una página de boletín rota (HTTP 500) hace una pausa de **30–60 s**.
+  - Un boletín cuya página respondió 500 dos veces queda como **`roto`**: las sincronizaciones normales lo saltan y `estado_indice` lo cuenta aparte, no como pendiente. `reintentar_rotos: true` los vuelve a pedir, pero cada uno cuesta un 500 que el cortafuegos cuenta: úsalo solo para comprobar si el sitio los arregló.
+  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), termina en estado **`bloqueado`** y `bome-navaja` no vuelve a pedirle nada durante **75 minutos** (o más, si el sitio lo pide con `Retry-After`); `reintentar_tras_segundos` dice cuánto falta. Relánzala pasado ese tiempo: continúa donde quedó.
 - Si tienes **dos clientes** abiertos con `bome-navaja` (por ejemplo, Claude Desktop y Claude Code), solo uno sincroniza: el otro recibe `en_curso_en_otro_proceso`. El turno se considera abandonado si su dueño deja de dar señales durante 3 minutos.
 
 Cada respuesta de `buscar_en_indice` trae un bloque `cobertura` (rango de fechas indexado, boletines indexados y pendientes, última sincronización, si hay una en curso). Si el índice está vacío, devuelve 0 resultados y un `aviso` que sugiere sincronizar o usar `buscar_articulos` mientras tanto.
 
 ### Dónde está y cómo rehacerlo
 
-El índice es el fichero `sumarios.sqlite3` dentro de la [carpeta de datos](#-dónde-guarda-los-datos); `estado_servidor` y `estado_indice` muestran su ruta. Para rehacerlo desde cero, cierra el cliente, borra `sumarios.sqlite3` (y `sumarios.sqlite3-wal` / `sumarios.sqlite3-shm` si existen) y vuelve a llamar a `sincronizar_indice`. Un índice de una versión anterior de `bome-navaja` se migra solo al abrirlo, sin volver a descargar nada.
+El índice es el fichero `sumarios.sqlite3` dentro de la [carpeta de datos](#-dónde-guarda-los-datos); `estado_servidor` y `estado_indice` muestran su ruta. Para rehacerlo desde cero, cierra el cliente, borra `sumarios.sqlite3` (y `sumarios.sqlite3-wal` / `sumarios.sqlite3-shm` si existen) y vuelve a llamar a `sincronizar_indice`. Un índice de una versión anterior de `bome-navaja` se migra solo al abrirlo, sin volver a descargar nada; los boletines que tenían anotado un HTTP 500 pasan a `roto`.
 
 ---
 
@@ -187,7 +191,7 @@ Para seguir leyendo, pasa `desde_pagina` y `desde_caracter` tal cual vienen en `
 | macOS | `~/Library/Application Support/bome-navaja` |
 | Linux y otros | `$XDG_DATA_HOME/bome-navaja` o, si no está definida, `~/.local/share/bome-navaja` |
 
-Dentro están el índice (`sumarios.sqlite3`) y los PDF (`pdfs/`). Nada se crea hasta que hace falta.
+Dentro están el índice (`sumarios.sqlite3`), los PDF (`pdfs/`) y el estado de la [guardia del sitio](#-seguridad-y-cortesía-con-el-sitio) (`estado_sitio.json`). Nada se crea hasta que hace falta.
 
 | Variable | Efecto |
 | --- | --- |
@@ -308,13 +312,19 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 
 - **Pausa de cortesía** de ~0,5 s entre peticiones en las herramientas, con tiempos de espera acotados.
 - **Un único cliente serializado** para todas las herramientas: aunque el modelo lance varias a la vez, las peticiones al sitio salen de una en una.
-- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio empieza a rechazarla. Puedes ajustarla con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion`):
+- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio la bloquea. Puedes ajustarla con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion`):
 
   | Variable | Por defecto | Qué hace |
   |---|---|---|
   | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización (mínimo 1; un valor menor se sube a 1) |
   | `BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` | Máximo de boletines por ejecución de `sincronizar_indice` |
 
+- **Guardia del sitio.** El cortafuegos de bomemelilla.es bloquea la IP (en torno a una hora) tras unas 5 respuestas de error, por despacio que vayan las peticiones, y muchas son HTTP 500 de páginas de boletín rotas del propio sitio. Para no llegar a eso:
+  - Entre todas las herramientas y la sincronización se admiten como mucho **3 respuestas de error (cualquier 4xx o 5xx) cada 10 minutos**; con el cupo lleno, la sincronización espera y las herramientas responden `pausa_preventiva` con `reintentar_tras_segundos`, sin tocar el sitio.
+  - La sincronización hace una pausa de **30–60 s** tras una página rota y no vuelve a pedir un boletín **`roto`** (su página respondió 500 dos veces) salvo con `reintentar_rotos`.
+  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), `bome-navaja` **deja de tocarlo durante 75 minutos** (o más, si pide `Retry-After`): las herramientas responden `sitio_bloqueando` con `reintentar_tras_segundos` y la sincronización termina `bloqueado`.
+
+  Todos los procesos de `bome-navaja` comparten esta guardia y se conserva entre reinicios: vive en `estado_sitio.json`, en la [carpeta de datos](#-dónde-guarda-los-datos). `estado_servidor` la muestra en `guardia_sitio`.
 - **No recorre el sitio si no se le pide**: nada al arrancar, y la sincronización solo con `sincronizar_indice`. Dos procesos nunca sincronizan a la vez.
 - Se identifica con un **User-Agent de navegador real** y no usa ni guarda credenciales.
 - **El modelo no elige dónde se escribe**: los PDF se nombran por su CVE canónico dentro de la carpeta configurada, y las rutas solo las cambias tú con variables de entorno.
