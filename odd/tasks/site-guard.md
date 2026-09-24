@@ -82,3 +82,17 @@ proceeding: no bulk crawling of those paths (no index sync from the old portal) 
       `buscar_bome_antiguo`, `ver_bome_antiguo`; `listar_bomes` merges both catalogs with `origen`;
       `leer_pdf`/`descargar_pdf` accept a validated old-portal `url` (cached as `melilla-<a>-<b>-<name>.pdf`). Commit `a5b6184`; native review
       `review-d5b56c436dfd0bfe` approved (4 lenses) and acknowledged.
+
+## Delivery
+
+- 2026-09-24 (user decision): [PR #3](https://github.com/jgarcialaneitor/bome-navaja/pull/3), CI green
+  on all 4 jobs, merged into `main` with a merge commit (`7fb4b34`). Suite on `main`:
+  `723 passed, 18 skipped`.
+- Bundle built from `main`: `bome-navaja-0.0.3.mcpb` (115,550 bytes, sha256 `21f108b2…f8ab`);
+  independent verify PASS (19 files byte-identical to `7fb4b34`, 19 tools, version 0.0.3, both site
+  guards idle, no network). Release
+  [v0.0.3](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.3) tagged on `7fb4b34`;
+  downloaded asset sha256 verified identical.
+- Not verified: install inside Claude Desktop; any tool against the real sites (live tests skipped).
+- Follow-up noted by the verifier: `uv.lock` is not bundled, so dependency versions resolve fresh
+  on each install.
