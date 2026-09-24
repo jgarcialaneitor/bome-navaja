@@ -54,10 +54,9 @@ Out of scope:
       takes the newest planned bulletins, and recent re-indexes plus retried errors come first,
       so more persistent `error` bulletins than the cap could starve older unindexed ones.
 
-## Pending decisions
+## Decisions
 
-- User-Agent: still a spoofed Chrome UA (point 5 of the proposal); the user has not decided.
-- `.mcpb` manifest does not expose the two sync overrides as user settings yet.
+- 2026-09-24: User-Agent and `.mcpb` sync settings stay as they are (user decision).
 
 ## Delivery
 
@@ -67,4 +66,11 @@ Out of scope:
 - Local bundle `dist/bome-navaja-0.0.2.mcpb` built from `4428ece` (82,624 bytes, sha256
   `0bab5d22…a412`); independent verify PASS: 17 files, no strays, unpacked bundle answers 17
   tools, version 0.0.2, `cortesia_sincronizacion` 2.0 s / 1.0 s / 250. Not verified: install inside
-  Claude Desktop, any network tool (the user's IP is blocked by the site). Not merged, not released.
+  Claude Desktop, any network tool (the user's IP is blocked by the site).
+- 2026-09-24 (user decision): PR #2 merged into `main` with a merge commit (`5721f7d`), like PR #1.
+  Suite on `main`: `510 passed, 16 skipped`. Bundle rebuilt from `main` (82,624 bytes, sha256
+  `b54130e9…61cc`; every bundled file byte-identical to `5721f7d`; unpacked bundle answers 17
+  tools, version 0.0.2). Release
+  [v0.0.2](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.2) tagged on
+  `5721f7d` with `bome-navaja-0.0.2.mcpb`; downloaded asset sha256 verified identical.
+- User decision 2026-09-24: leave the User-Agent and the `.mcpb` sync settings as they are.
