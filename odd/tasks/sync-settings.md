@@ -56,6 +56,17 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
       `uv.lock` staged; no `--frozen` (a stale lock would then install silently). Verified:
       `992 passed, 18 skipped`. Commit `5f12f41`; native review `review-c7b65e4e98b89bc6` approved
       and acknowledged. Not verified: how the Claude Desktop settings UI handles decimals and `min`.
-- [ ] 3. README section on the settings and responsible use; version 0.0.5 (with the re-locked
+- [x] 3. README section on the settings and responsible use; version 0.0.5 (with the re-locked
       `uv.lock`); hardening: accept a decimal comma (`0,5`) and reject values that overflow to
       infinity once converted (advisory from task 1); tests.
+      README `### Ajustes de ritmo y protección` with a responsible-use warning and one row per
+      setting; fixed numbers elsewhere now say they are defaults. Parent decision: a time above one
+      year is technically invalid (it crashed sockets, the guard deadline and `time.sleep`), so it
+      falls back to the default; this is validity, not a safety limit. Verified:
+      `1068 passed, 18 skipped`; `uv lock --check` OK. Commit `f48c07b`; native review
+      `review-6524c4135285f9b7` approved and acknowledged.
+
+## Delivery
+
+- Pending (user decisions): push, PR, merge, build and verify the `.mcpb`, release v0.0.5.
+- Not verified: the settings screen inside Claude Desktop (decimals, `min`, the decimal comma).
