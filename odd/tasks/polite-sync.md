@@ -21,7 +21,9 @@ In scope (user decision 2026-09-24: "adelante con los cambios", points 1-4):
    the prudent values as defaults.
 
 Out of scope:
-- Changing the User-Agent (point 5): pending user decision.
+- Changing the User-Agent (point 5): decided, it stays as is (browser-like User-Agent). User
+  decision in v0.0.2, confirmed in v0.0.3 and again on 2026-09-24 after v0.0.4. Reopen only if
+  the site owner asks for identification or blocks start being tied to the User-Agent.
 - Push, PR, merge: user decisions.
 
 ## Design
