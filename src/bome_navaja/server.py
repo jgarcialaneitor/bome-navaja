@@ -685,6 +685,9 @@ def estado_indice() -> dict:
     Devuelve boletines indexados / sin sumarios / con error, artículos, rango de fechas,
     pendientes frente al calendario, última sincronización y el progreso de la actual
     (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
+    Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
+    rechaza las peticiones por límite de ritmo o cortafuegos: lo indexado se conserva; espera,
+    horas si es un bloqueo del cortafuegos, antes de volver a sincronizar; ver 'mensaje').
     """
     path, exists = _index_file()
     index = _open_index_if_present()
@@ -716,7 +719,9 @@ def sincronizar_indice(
     ~20-25 minutos (~1900 boletines a ~0,6 s); es reanudable: si se corta, la siguiente
     llamada continúa donde quedó. Sigue el progreso con estado_indice; mientras tanto
     buscar_en_indice da resultados parciales. Si ya hay una en curso (en este u otro proceso)
-    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide.
+    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. Si el sitio rechaza
+    las peticiones (403/429/503 o conexiones cortadas) espera y reintenta; si sigue rechazándolas
+    termina en estado "bloqueado": no la relances enseguida, espera (horas si es el cortafuegos).
     """
     sync = _get_sync()
     return sync.iniciar(
@@ -730,7 +735,8 @@ def sincronizar_indice(
 @server.tool()
 @_herramienta
 def cancelar_sincronizacion() -> dict:
-    """Pide parar la sincronización en curso; termina tras el boletín que esté procesando.
+    """Pide parar la sincronización en curso; termina tras el boletín que esté procesando (o al
+    instante si está esperando porque el sitio la había bloqueado).
 
     Lo ya indexado se conserva y una nueva sincronizar_indice continúa desde ahí.
     """
