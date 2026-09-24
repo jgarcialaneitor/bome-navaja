@@ -72,8 +72,20 @@ __all__ = [
     "BomeHTTPError",
     "BomeNotFoundError",
     "BomeParseError",
+    "ResolucionIncoherenteError",
     "SearchPath",
 ]
+
+
+class ResolucionIncoherenteError(BomeNotFoundError):
+    """The CVE resolver sent a CVE to a document of the other bulletin kind.
+
+    Known site bug (verified live 2026-09-24): ``/buscar-cve`` drops the X of
+    extraordinary article and page CVEs, e.g. ``BOME-AX-2019-103`` →
+    ``/bome/BOME-B-2019-5625/articulo/103`` (an ordinary bulletin). Such a
+    target is never requested nor returned as the CVE's page.
+    """
+
 
 DEFAULT_TIMEOUT = 30.0
 
@@ -88,6 +100,7 @@ USER_AGENT = (
 SearchPath = Literal["/buscar", "/buscador-avanzado"]
 _SEARCH_PATHS: frozenset[str] = frozenset({"/buscar", "/buscador-avanzado"})
 _GENERIC_CVE = re.compile(r"BOME-[A-Z]{1,2}-\d{4}-\d+")
+_TARGET_DOCUMENT = re.compile(r"^/bome/(BOME-[A-Z]{1,2}-\d{4}-\d+)(?:/|$)")
 
 
 def _today() -> date:
@@ -400,7 +413,10 @@ class BomeClient:
 
         Raises :class:`BomeNotFoundError` when the site does not redirect,
         redirects off-site or to the home page, or the target page is missing.
-        An off-site target is never requested.
+        An off-site target is never requested. A target whose bulletin kind
+        contradicts the CVE's (extraordinary CVE → ordinary bulletin, the
+        site's known bug for ``AX``/``PX``, or the reverse) raises
+        :class:`ResolucionIncoherenteError` without being requested.
 
         ``confirm=False`` skips the confirmation GET and returns the redirect
         target as is; use it when the caller fetches that page next anyway
@@ -423,10 +439,34 @@ class BomeClient:
             raise BomeNotFoundError(
                 f"CVE {text} resolved to the home page", status=response.status_code, url=url
             )
+        self._check_target_kind(text, target, status=response.status_code, url=url)
         if not confirm:
             return target
         confirmation = self._request(target)
         return str(confirmation.url)
+
+    @staticmethod
+    def _check_target_kind(text: str, target: str, *, status: int, url: str) -> None:
+        """Refuse a resolver target of the other bulletin kind (see :meth:`resolve_cve`)."""
+        try:
+            requested = parse_cve(text)
+        except InvalidCveError:
+            return  # an unknown kind has no bulletin kind to contradict
+        match = _TARGET_DOCUMENT.match(urlsplit(target).path)
+        if match is None:
+            return
+        try:
+            document = parse_cve(match.group(1))
+        except InvalidCveError:
+            return
+        if document.kind.is_extraordinary != requested.kind.is_extraordinary:
+            raise ResolucionIncoherenteError(
+                f"the site's CVE resolver sent {requested} to {target}, a document of "
+                f"{'an ordinary' if requested.kind.is_extraordinary else 'an extraordinary'} "
+                f"bulletin ({document}); known site bug, that page is not {requested}",
+                status=status,
+                url=url,
+            )
 
     def download(self, cve: str | Cve, *, max_bytes: int | None = None) -> bytes:
         """PDF bytes of any CVE (bulletin, sumario, article or page).

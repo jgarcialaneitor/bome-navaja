@@ -491,6 +491,223 @@ def test_leer_articulo_by_article_cve_resolves_without_double_fetch(site: Site) 
     assert site.requests[0].url.params["cve"] == "BOME-A-2026-1051"
 
 
+# --------------------------------------------------------------------------- extraordinary articles
+
+
+BX41 = (FIXTURES / "bx41.html").read_text("utf-8")
+ART1051 = (FIXTURES / "art1051.html").read_text("utf-8")
+
+
+def bx_page(year: int, number: int, first: int | None, last: int | None) -> str:
+    """bx41.html as ``BOME-BX-{year}-{number}`` listing AX ``first`` and ``last`` (or nothing)."""
+    html = BX41.replace("BOME-BX-2026-41", f"BOME-BX-{year}-{number}")
+    if first is None or last is None:
+        return html.replace("(CVE: BOME-AX-2026-102)", "").replace("(CVE: BOME-AX-2026-103)", "")
+    for old, new in ((102, first), (103, last)):
+        html = html.replace(f"BOME-AX-2026-{old}", f"BOME-AX-{year}-{new}")
+        html = html.replace(f"/articulo/{old}'", f"/articulo/{new}'")
+        html = html.replace(f"ARTÍCULO {old}", f"ARTÍCULO {new}")
+    return html
+
+
+def article_page(article_cve: str, bulletin_cve: str) -> str:
+    """art1051.html re-labelled as ``article_cve`` of ``bulletin_cve``."""
+    number = article_cve.rsplit("-", 1)[1]
+    return (
+        ART1051.replace("BOME-A-2026-1051", article_cve)
+        .replace("ARTÍCULO 1051", f"ARTÍCULO {number}")
+        .replace("BOME-B-2026-6416", bulletin_cve)
+    )
+
+
+def calendar_json(year: int, extraordinary: int, ordinary: int = 3) -> str:
+    items = [
+        {"title": f"Nº {5600 + n}", "start": f"{year}-01-{n + 1:02d}", "url": f"/bome/BOME-B-{year}-{5600 + n}"}
+        for n in range(ordinary)
+    ]
+    # Deliberately out of order: the search sorts the bulletins itself.
+    items += [
+        {"title": f"Nº {n}", "start": f"{year}-{1 + n // 28:02d}-{1 + n % 28:02d}", "url": f"/bome/BOME-BX-{year}-{n}"}
+        for n in reversed(range(1, extraordinary + 1))
+    ]
+    return json.dumps(items)
+
+
+def extraordinary_year(
+    site: Site, year: int, count: int, listed: Callable[[int], tuple[int, int] | None]
+) -> None:
+    """Calendar with ``count`` BX bulletins of ``year``; bulletin k lists ``listed(k)``."""
+    body = calendar_json(year, count)
+    site.routes["/api/bomes/calendar"] = lambda request: httpx.Response(200, text=body)
+    for k in range(1, count + 1):
+        span = listed(k)
+        html = bx_page(year, k, *(span if span is not None else (None, None)))
+        site.routes[f"/bome/BOME-BX-{year}-{k}"] = lambda request, html=html: httpx.Response(200, text=html)
+
+
+def bulletin_fetches(site: Site) -> list[str]:
+    return [p for p in site.paths() if p.startswith("/bome/BOME-BX-") and "/articulo/" not in p]
+
+
+def site_bug_resolver(site: Site) -> None:
+    """The live resolver bug: the X of an AX CVE is dropped (verified 2026-09-24)."""
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-B-2019-5625/articulo/103"}
+    )
+    impostor = article_page("BOME-A-2019-103", "BOME-B-2019-5625")
+    site.routes["/bome/BOME-B-2019-5625/articulo/103"] = lambda request: httpx.Response(200, text=impostor)
+
+
+def serve_article(site: Site, article_cve: str, bulletin_cve: str) -> None:
+    html = article_page(article_cve, bulletin_cve)
+    number = article_cve.rsplit("-", 1)[1]
+    site.routes[f"/bome/{bulletin_cve}/articulo/{number}"] = lambda request: httpx.Response(200, text=html)
+
+
+def four_per_bulletin(k: int) -> tuple[int, int]:
+    """BX k lists 4k+6..4k+9, so 103 is hidden inside BX-24 (102..105)."""
+    return 4 * k + 6, 4 * k + 9
+
+
+def test_ax_article_is_never_the_ordinary_one_the_resolver_points_to(site: Site) -> None:
+    # Bug report 2026-09-24: BOME-AX-2019-103 came back as the ordinary A-2019-103.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, four_per_bulletin)
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-103")
+    assert result.cve == "BOME-AX-2019-103"
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-24"
+    assert result.url == f"{BASE}/bome/BOME-BX-2019-24/articulo/103"
+    # The ordinary page the resolver points to is never even fetched.
+    assert "/bome/BOME-B-2019-5625/articulo/103" not in site.paths()
+    calendar = next(r for r in site.requests if r.url.path == "/api/bomes/calendar")
+    assert (calendar.url.params["start"], calendar.url.params["end"]) == ("2019-01-01", "2019-12-31")
+    # Binary search over 30 BX bulletins: at most ceil(log2(30)) + 2 pages.
+    assert 1 <= len(bulletin_fetches(site)) <= 7
+    assert site.paths()[-1] == "/bome/BOME-BX-2019-24/articulo/103"
+
+
+def test_ax_article_uses_the_index_shortcut_without_resolver_or_calendar(site: Site) -> None:
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    asked: list[str] = []
+
+    def indexed(cve: object) -> object:
+        asked.append(str(cve))
+        return documents_module.parse_cve("BOME-BX-2019-24")
+
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-103", boletin_de_articulo=indexed)
+    assert result.cve == "BOME-AX-2019-103"
+    assert asked == ["BOME-AX-2019-103"]
+    assert site.paths() == ["/bome/BOME-BX-2019-24/articulo/103"]
+
+
+def test_ax_article_with_a_stale_index_hint_falls_back_to_the_search(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, four_per_bulletin)
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    wrong = article_page("BOME-AX-2019-99", "BOME-BX-2019-23")
+    site.routes["/bome/BOME-BX-2019-23/articulo/103"] = lambda request: httpx.Response(200, text=wrong)
+    with site.client() as client:
+        result = leer_articulo(
+            client,
+            "BOME-AX-2019-103",
+            boletin_de_articulo=lambda cve: documents_module.parse_cve("BOME-BX-2019-23"),
+        )
+    assert result.cve == "BOME-AX-2019-103"
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-24"
+
+
+def test_ax_index_hint_of_another_kind_or_year_is_ignored(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, four_per_bulletin)
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    for hint in ("BOME-B-2019-5625", "BOME-BX-2018-24"):
+        site.requests.clear()
+        with site.client() as client:
+            result = leer_articulo(
+                client,
+                "BOME-AX-2019-103",
+                boletin_de_articulo=lambda cve, hint=hint: documents_module.parse_cve(hint),
+            )
+        assert result.cve == "BOME-AX-2019-103"
+        assert not any(p.startswith(("/bome/BOME-B-", "/bome/BOME-BX-2018")) for p in site.paths())
+
+
+def test_ax_article_resolved_to_an_extraordinary_bulletin_is_used(site: Site) -> None:
+    # Should the site fix its resolver, its (verified) answer is taken as is.
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-BX-2019-24/articulo/103"}
+    )
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-103")
+    assert result.cve == "BOME-AX-2019-103"
+    assert site.paths() == ["/buscar-cve", "/bome/BOME-BX-2019-24/articulo/103"]
+
+
+def test_ax_article_hidden_between_two_bulletins_is_tried_in_both(site: Site) -> None:
+    # BX k lists 4k+6..4k+8: 101 falls between BX-23 (98..100) and BX-24 (102..104).
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, lambda k: (4 * k + 6, 4 * k + 8))
+    serve_article(site, "BOME-AX-2019-101", "BOME-BX-2019-24")
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-B-2019-5625/articulo/101"}
+    )
+    with site.client() as client:
+        result = leer_articulo(client, "BOME-AX-2019-101")
+    assert result.cve == "BOME-AX-2019-101"
+    assert result.metadatos["bome_cve"] == "BOME-BX-2019-24"
+    articles = [p for p in site.paths() if "/articulo/" in p]
+    assert articles == ["/bome/BOME-BX-2019-23/articulo/101", "/bome/BOME-BX-2019-24/articulo/101"]
+
+
+def test_ax_binary_search_is_bounded_and_ends_in_a_clear_error(site: Site) -> None:
+    # Worst case: 64 BX bulletins whose pages list nothing.
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 64, lambda k: None)
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(client, "BOME-AX-2019-103")
+    assert isinstance(caught.value, BomeNotFoundError)
+    assert len(bulletin_fetches(site)) <= 8  # ceil(log2(64)) + 2
+    message = str(caught.value)
+    assert "BOME-AX-2019-103" in message and "numero" in message and "BOME-BX-2019-" in message
+    assert "/bome/BOME-B-2019-5625/articulo/103" not in site.paths()
+
+
+def test_ax_number_beyond_every_listed_article_is_not_found(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, four_per_bulletin)
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError):
+            leer_articulo(client, "BOME-AX-2019-900")
+    assert len(bulletin_fetches(site)) <= 7
+
+
+def test_ax_year_without_extraordinary_bulletins_is_not_found(site: Site) -> None:
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 0, four_per_bulletin)
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(client, "BOME-AX-2019-103")
+    assert "numero" in str(caught.value)
+    assert bulletin_fetches(site) == []
+
+
+def test_article_cve_whose_page_shows_another_article_is_an_error(site: Site) -> None:
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-B-2026-6416/articulo/1050"}
+    )
+    site.page("/bome/BOME-B-2026-6416/articulo/1050", "art1051.html")  # shows BOME-A-2026-1051
+    with site.client() as client:
+        with pytest.raises(documents_module.ArticuloDistintoError) as caught:
+            leer_articulo(client, "BOME-A-2026-1050")
+    assert isinstance(caught.value, BomeNotFoundError)
+    assert "BOME-A-2026-1050" in str(caught.value) and "BOME-A-2026-1051" in str(caught.value)
+
+
 def test_leer_articulo_argument_validation(site: Site) -> None:
     with site.client() as client:
         with pytest.raises(LecturaInvalidaError):

@@ -82,8 +82,9 @@ from .antiguo import DEFAULT_JITTER as PORTAL_JITTER
 from .antiguo import DEFAULT_POLITE_DELAY as PORTAL_POLITE_DELAY
 from .antiguo import SITIO as SITIO_ANTIGUO
 from .client import BomeClient
-from .cve import BASE_URL, InvalidCveError, parse_cve
+from .cve import BASE_URL, Cve, CveKind, InvalidCveError, parse_cve, pdf_url
 from .documents import LecturaInvalidaError
+from .documents import localizar_articulo as _localizar_articulo
 from .documents import descargar_pdf as _descargar_pdf
 from .documents import descargar_pdf_antiguo as _descargar_pdf_antiguo
 from .documents import leer_articulo as _leer_articulo
@@ -366,6 +367,20 @@ def _open_index_if_present() -> SumarioIndex | None:
         return _index
     _path, exists = _index_file()
     return _get_index() if exists else None
+
+
+def _boletin_indexado(cve: Cve) -> Cve | None:
+    """Bulletin of an article CVE according to the local index, if present and it knows it.
+
+    The shortcut the readers use for ``BOME-AX`` (the site's resolver sends those to
+    ordinary bulletins). Any index problem just means "unknown": it is optional.
+    """
+    try:
+        index = _open_index_if_present()
+        found = index.boletin_de_articulo(str(cve)) if index is not None else None
+        return parse_cve(found) if found is not None else None
+    except (BomeError, sqlite3.Error, OSError):
+        return None
 
 
 def _sync_settings() -> SyncSettings:
@@ -734,10 +749,31 @@ def resolver_cve(cve: str) -> dict:
     """Devuelve la URL canónica de cualquier CVE (boletín, artículo, sumario o página).
 
     Útil para citar o para saber a qué boletín y artículo pertenece un CVE de artículo
-    (BOME-A-...) o de página (BOME-P-... / BOME-PX-...). Comprueba que la página exista.
+    (BOME-A-...) o de página (BOME-P-...). Comprueba que la página exista. El resolutor del
+    sitio confunde los extraordinarios con los ordinarios: un BOME-AX se localiza sin él
+    (índice local o calendario del año y páginas de sus boletines extraordinarios; puede
+    costar unas peticiones más) y se comprueba el artículo; para un BOME-PX se devuelve la
+    URL de su PDF, con un aviso. Nunca se da por buena una redirección a un boletín del otro
+    tipo (extraordinario frente a ordinario).
     """
-    canonical = str(parse_cve(cve))
+    parsed = parse_cve(cve)
+    canonical = str(parsed)
     client = _cliente()
+    if parsed.kind is CveKind.EXTRA_ARTICLE:
+        article = _localizar_articulo(client, parsed, boletin_de_articulo=_boletin_indexado)
+        return {"cve": canonical, "url": article.url}
+    if parsed.kind is CveKind.EXTRA_PAGE:
+        return {
+            "cve": canonical,
+            "url": pdf_url(parsed, base_url=client.base_url),
+            "aviso": (
+                "El resolutor de CVE de bomemelilla.es confunde las páginas de boletines "
+                "extraordinarios (BOME-PX) con las de boletines ordinarios y lleva a un "
+                "artículo equivocado, así que no se usa: esta es la URL del PDF de la página, "
+                "que no pasa por el resolutor (no se ha comprobado que exista). Para leerla usa "
+                "leer_pdf."
+            ),
+        }
     url = client.resolve_cve(canonical)
     return {"cve": canonical, "url": url}
 
@@ -777,7 +813,11 @@ def leer_articulo(
     """Texto completo de un artículo (anuncio), página a página.
 
     cve: el CVE del artículo (BOME-A-2026-1051) o el del boletín (BOME-B-...) junto con
-    numero (el número del artículo). Los artículos de 2014-2016 no tienen texto en el sitio:
+    numero (el número del artículo). Un artículo extraordinario (BOME-AX-...) se localiza sin
+    el resolutor del sitio, que lo confunde con el artículo ordinario del mismo número: se usa
+    el índice local si lo tiene y, si no, el calendario del año y las páginas de sus boletines
+    extraordinarios (puede costar unas peticiones más). Nunca se devuelve un artículo distinto
+    del pedido. Los artículos de 2014-2016 no tienen texto en el sitio:
     fuente="ninguna" y un aviso. Paginación: devuelve páginas enteras hasta max_caracteres
     (1000-100000, por defecto 20000), siempre al menos una; una página
     más larga que max_caracteres se corta ahí (cortada=true). Si 'siguiente' no es null, vuelve
@@ -792,6 +832,7 @@ def leer_articulo(
         desde_pagina=desde_pagina,
         desde_caracter=desde_caracter,
         max_caracteres=max_caracteres,
+        boletin_de_articulo=_boletin_indexado,
     ).to_dict()
 
 

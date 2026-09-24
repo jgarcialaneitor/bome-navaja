@@ -319,6 +319,83 @@ def test_resolver_cve(site: Site) -> None:
     assert result == {"ok": True, "cve": "BOME-A-2026-1051", "url": f"{BASE}/bome/BOME-B-2026-6416/articulo/1051"}
 
 
+def extraordinary_2019(site: Site) -> None:
+    """The live resolver bug plus a 2019 calendar whose BX-24 holds AX-2019-103."""
+    from test_documents import extraordinary_year, four_per_bulletin, serve_article, site_bug_resolver
+
+    site_bug_resolver(site)  # type: ignore[arg-type]
+    extraordinary_year(site, 2019, 30, four_per_bulletin)  # type: ignore[arg-type]
+    serve_article(site, "BOME-AX-2019-103", "BOME-BX-2019-24")  # type: ignore[arg-type]
+
+
+def index_bx24(data_dir: Path) -> None:
+    """An index file where AX-2019-103 belongs to BX-2019-24."""
+    from bome_navaja.index import SumarioIndex
+    from bome_navaja.models import BulletinRef
+    from bome_navaja.search import ArticuloEncontrado
+
+    ref = BulletinRef("BOME-BX-2019-24", 24, date(2019, 6, 1), True, f"{BASE}/bome/BOME-BX-2019-24")
+    article = ArticuloEncontrado(
+        bome_cve=ref.cve, bome_numero=24, bome_fecha=ref.date, bome_extraordinario=True,
+        cve="BOME-AX-2019-103", numero=103, sumario="Decreto", departamento="D", consejeria="C",
+        organismo="O", url=f"{BASE}/bome/BOME-BX-2019-24/articulo/103", pdf_url=None,
+    )
+    index = SumarioIndex(data_dir / "sumarios.sqlite3")
+    try:
+        index.guardar_boletin(ref, [article], "indexado")
+    finally:
+        index.close()
+
+
+def test_leer_articulo_ax_is_not_the_ordinary_article_of_the_resolver(site: Site) -> None:
+    extraordinary_2019(site)
+    result = ok(srv.leer_articulo("BOME-AX-2019-103"))
+    assert result["cve"] == "BOME-AX-2019-103"
+    assert result["metadatos"]["bome_cve"] == "BOME-BX-2019-24"
+    assert "/bome/BOME-B-2019-5625/articulo/103" not in [r.url.path for r in site.requests]
+
+
+def test_resolver_cve_ax_gives_the_extraordinary_article(site: Site) -> None:
+    extraordinary_2019(site)
+    result = ok(srv.resolver_cve("bome-ax-2019-103"))
+    assert (result["cve"], result["url"]) == ("BOME-AX-2019-103", f"{BASE}/bome/BOME-BX-2019-24/articulo/103")
+    assert "/bome/BOME-B-2019-5625/articulo/103" not in [r.url.path for r in site.requests]
+
+
+def test_ax_tools_use_the_local_index_when_it_knows_the_article(site: Site, data_dir: Path) -> None:
+    extraordinary_2019(site)
+    index_bx24(data_dir)
+    reading = ok(srv.leer_articulo("BOME-AX-2019-103"))
+    resolved = ok(srv.resolver_cve("BOME-AX-2019-103"))
+    assert reading["metadatos"]["bome_cve"] == "BOME-BX-2019-24"
+    assert resolved["url"] == f"{BASE}/bome/BOME-BX-2019-24/articulo/103"
+    assert [r.url.path for r in site.requests] == ["/bome/BOME-BX-2019-24/articulo/103"] * 2
+
+
+def test_resolver_cve_px_gives_the_pdf_without_the_site_resolver(site: Site) -> None:
+    result = ok(srv.resolver_cve("BOME-PX-2021-362"))
+    assert result["cve"] == "BOME-PX-2021-362"
+    assert result["url"] == f"{BASE}/bome/descargar/BOME-PX-2021-362.pdf"
+    assert "extraordinari" in result["aviso"] and "ordinari" in result["aviso"]
+    assert site.requests == []
+
+
+def test_resolver_cve_never_returns_a_target_of_the_other_bulletin_kind(site: Site) -> None:
+    site.routes["/buscar-cve"] = lambda request: httpx.Response(
+        302, headers={"location": "/bome/BOME-B-2019-5625/sumario"}
+    )
+    result = fail(srv.resolver_cve("BOME-SX-2019-24"), "no_encontrado")
+    assert "BOME-SX-2019-24" in result["error"]
+    assert [r.url.path for r in site.requests] == ["/buscar-cve"]
+
+
+def test_reading_tool_docs_explain_the_extraordinary_resolution() -> None:
+    tools = tools_by_name()
+    for name in ("leer_articulo", "resolver_cve"):
+        assert "BOME-AX" in tools[name].description, name
+    assert "BOME-PX" in tools["resolver_cve"].description
+
+
 # --------------------------------------------------------------------------- index tools
 
 

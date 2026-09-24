@@ -6,6 +6,8 @@ Public entry points, designed to be exposed 1:1 as MCP tools (task 6):
 * :func:`leer_pdf` — text of any PDF, page by page, with a cursor.
 * :func:`leer_articulo` — article text from its web page (``#pagina-N``
   blocks), falling back to its PDF for old articles without HTML text.
+* :func:`localizar_articulo` — the verified article page of an article CVE
+  (``BOME-AX`` resolved without the site's buggy CVE resolver, see below).
 * :func:`leer_boletin` — the whole bulletin PDF text plus bulletin metadata.
 * :func:`descargar_pdf_antiguo` / :func:`leer_pdf_antiguo` — the same for a
   PDF of the old portal on melilla.es, given by its whitelisted ``mandar.php``
@@ -31,17 +33,27 @@ Site facts (verified live 2026-09-23): an ordinary bulletin PDF is ~4 MB /
 ~66-265 KB / 1-4 pages, a page PDF ~66 KB / 1 page, all with a text layer.
 PDFs of 2014-2016 bulletins and articles answer 404
 (BOME-B-2014-5092, BOME-B-2015-5272, BOME-B-2016-5397, BOME-A-2014-2).
+
+Resolver bug (verified live 2026-09-24): ``/buscar-cve`` drops the X of
+extraordinary article and page CVEs (``BOME-AX-2019-103`` →
+``/bome/BOME-B-2019-5625/articulo/103``, an ordinary article). So an ``AX`` is
+located through the local index when it knows it, else the resolver only when it
+answers an extraordinary bulletin, else a binary search over the year's
+extraordinary bulletins; and every article fetched for an article CVE must show
+that very CVE (:class:`ArticuloDistintoError` otherwise).
 """
 
 from __future__ import annotations
 
 import hashlib
 import io
+import math
 import os
 import re
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -50,7 +62,7 @@ from urllib.parse import urlsplit
 import pypdf
 
 from .client import BomeClient
-from .cve import Cve, CveKind, parse_cve, pdf_url
+from .cve import Cve, CveKind, InvalidCveError, parse_cve, pdf_url
 from .models import (
     Article,
     BomeError,
@@ -79,6 +91,21 @@ Fuente = Literal["pdf", "html", "ninguna"]
 
 class LecturaInvalidaError(BomeError, ValueError):
     """Invalid reading arguments (CVE kind, number, cursor or budget)."""
+
+
+class ArticuloDistintoError(BomeNotFoundError):
+    """The page fetched for an article CVE shows another article: never returned."""
+
+
+class ArticuloNoLocalizadoError(BomeNotFoundError):
+    """An extraordinary article (``BOME-AX``) was not found in its year's bulletins."""
+
+
+BoletinDeArticulo = Callable[[Cve], Cve | None]
+"""Optional lookup article CVE → bulletin CVE (e.g. the local index), ``None`` if unknown."""
+
+BUSQUEDA_EXTRA_MARGEN = 2
+"""Bulletin pages the AX search may fetch beyond ``ceil(log2(#BX))``."""
 
 
 # --------------------------------------------------------------------------- models
@@ -546,28 +573,218 @@ def leer_pdf_antiguo(
     )
 
 
-def _article_target(client: BomeClient, cve: Cve, numero: int | None) -> tuple[Cve, int]:
+def localizar_articulo(
+    client: BomeClient,
+    cve_boletin_o_articulo: str | Cve,
+    numero: int | None = None,
+    *,
+    boletin_de_articulo: BoletinDeArticulo | None = None,
+) -> Article:
+    """The article page of an article CVE, or of a bulletin CVE plus ``numero``.
+
+    ``BOME-A`` goes through the site's CVE resolver. ``BOME-AX`` never trusts
+    it (it sends those to ordinary bulletins, see the module docstring): it
+    asks ``boletin_de_articulo`` first (optional, e.g. the local index), then
+    the resolver only if it answers an extraordinary bulletin of the same
+    year, then :func:`_buscar_boletin_extra`. For an article CVE the fetched
+    page must show that very CVE, else :class:`ArticuloDistintoError`; an
+    ``AX`` found nowhere raises :class:`ArticuloNoLocalizadoError`.
+    """
+    cve = parse_cve(cve_boletin_o_articulo)
     if cve.kind.is_bulletin:
         if numero is None:
             raise LecturaInvalidaError("give 'numero' (the article number) with a bulletin CVE")
         number = _int_arg(numero, "numero")
         if number < 1:
             raise LecturaInvalidaError(f"'numero' must be positive, got {number}")
-        return cve, number
-    if cve.kind in (CveKind.ARTICLE, CveKind.EXTRA_ARTICLE):
-        if numero is not None:
-            raise LecturaInvalidaError("'numero' is implied by an article CVE; leave it empty")
-        # Article numbers are independent of bulletin numbers, so the bulletin
-        # can only be learnt from the site's resolver (302 to the article page).
-        location = client.resolve_cve(cve, confirm=False)
-        match = _ARTICLE_PATH.search(urlsplit(location).path)
-        if match is None:
-            raise BomeParseError(f"{cve} resolved to {location}, not an article page")
-        return parse_cve(match.group(1)), int(match.group(2))
-    raise LecturaInvalidaError(
-        f"{cve} is not an article: give an article CVE (BOME-A/BOME-AX) or a bulletin "
-        "CVE (BOME-B/BOME-BX) plus 'numero'; use leer_pdf for sumario and page CVEs"
+        return client.article(cve, number)
+    if cve.kind not in (CveKind.ARTICLE, CveKind.EXTRA_ARTICLE):
+        raise LecturaInvalidaError(
+            f"{cve} is not an article: give an article CVE (BOME-A/BOME-AX) or a bulletin "
+            "CVE (BOME-B/BOME-BX) plus 'numero'; use leer_pdf for sumario and page CVEs"
+        )
+    if numero is not None:
+        raise LecturaInvalidaError("'numero' is implied by an article CVE; leave it empty")
+    if cve.kind is CveKind.EXTRA_ARTICLE:
+        return _extra_article(client, cve, boletin_de_articulo)
+    # Article numbers are independent of bulletin numbers, so the bulletin of
+    # an ordinary article is learnt from the site's resolver (302 to its page).
+    location = client.resolve_cve(cve, confirm=False)
+    match = _ARTICLE_PATH.search(urlsplit(location).path)
+    if match is None:
+        raise BomeParseError(f"{cve} resolved to {location}, not an article page")
+    return _verified_article(client, parse_cve(match.group(1)), int(match.group(2)), cve)
+
+
+def _verified_article(client: BomeClient, bulletin: Cve, number: int, expected: Cve) -> Article:
+    """Article ``number`` of ``bulletin``, which must be ``expected`` itself."""
+    article = client.article(bulletin, number)
+    if article.cve != str(expected):
+        url = f"{client.base_url}/bome/{bulletin}/articulo/{number}"
+        raise ArticuloDistintoError(
+            f"the page {url} shows {article.cve}, not {expected}; that other article is not "
+            "returned",
+            status=None,
+            url=url,
+        )
+    return article
+
+
+def _same_year_extra_bulletin(bulletin: Cve | None, cve: Cve) -> bool:
+    return (
+        bulletin is not None
+        and bulletin.kind is CveKind.EXTRA_BULLETIN
+        and bulletin.year == cve.year
     )
+
+
+def _indexed_bulletin(cve: Cve, lookup: BoletinDeArticulo | None) -> Cve | None:
+    if lookup is None:
+        return None
+    try:
+        bulletin = lookup(cve)
+    except BomeError:  # the lookup is an optional shortcut, never a reason to fail
+        return None
+    return bulletin if _same_year_extra_bulletin(bulletin, cve) else None
+
+
+def _resolver_bulletin(client: BomeClient, cve: Cve) -> Cve | None:
+    """The resolver's bulletin for an ``AX``, only when it is extraordinary (the site's bug)."""
+    try:
+        location = client.resolve_cve(cve, confirm=False)
+    except BomeNotFoundError:  # includes ResolucionIncoherenteError: the known bug
+        return None
+    match = _ARTICLE_PATH.search(urlsplit(location).path)
+    if match is None or int(match.group(2)) != cve.number:
+        return None
+    bulletin = parse_cve(match.group(1))
+    return bulletin if _same_year_extra_bulletin(bulletin, cve) else None
+
+
+def _extra_article(client: BomeClient, cve: Cve, lookup: BoletinDeArticulo | None) -> Article:
+    tried: set[Cve] = set()
+
+    def attempt(bulletin: Cve | None) -> Article | None:
+        if bulletin is None or bulletin in tried:
+            return None
+        tried.add(bulletin)
+        try:
+            return _verified_article(client, bulletin, cve.number, cve)
+        except BomeNotFoundError:  # includes ArticuloDistintoError: not in this bulletin
+            return None
+
+    for shortcut in (lambda: _indexed_bulletin(cve, lookup), lambda: _resolver_bulletin(client, cve)):
+        if (article := attempt(shortcut())) is not None:
+            return article
+    search = _buscar_boletin_extra(client, cve)
+    for candidate in search.candidatos:
+        if (article := attempt(candidate)) is not None:
+            return article
+    raise search.error(cve)
+
+
+@dataclass(frozen=True, slots=True)
+class _BusquedaExtra:
+    candidatos: tuple[Cve, ...]
+    boletines: int
+    paginas: int
+    agotada: bool
+    url: str
+
+    def error(self, cve: Cve) -> ArticuloNoLocalizadoError:
+        if self.boletines == 0:
+            where = f"the site calendar lists no extraordinary bulletin in {cve.year}"
+        else:
+            where = (
+                f"it is not in the {self.boletines} extraordinary bulletins of {cve.year} "
+                f"({self.paginas} bulletin pages checked"
+                f"{', search budget exhausted' if self.agotada else ''})"
+            )
+        return ArticuloNoLocalizadoError(
+            f"{cve} could not be located: {where}. The site's CVE resolver cannot be used for "
+            f"it (it sends extraordinary articles to ordinary bulletins). Give the bulletin CVE "
+            f"plus 'numero' instead: cve='BOME-BX-{cve.year}-N', numero={cve.number} "
+            "(find the bulletin with listar_bomes, ver_bome or buscar_bomes)",
+            status=None,
+            url=self.url,
+        )
+
+
+class _BudgetExhausted(Exception):
+    pass
+
+
+def _buscar_boletin_extra(client: BomeClient, cve: Cve) -> _BusquedaExtra:
+    """Candidate extraordinary bulletins for an ``AX`` CVE, by binary search.
+
+    Extraordinary article numbers are consecutive within a year and
+    extraordinary bulletins are numbered in publication order, so the
+    bulletins of the year (from the calendar, sorted by number) cover
+    increasing article-number ranges. Each bulletin page fetched gives its
+    listed range min..max; a number inside it belongs to that bulletin (pages
+    may hide articles). A page listing nothing is skipped rightwards. At most
+    ``ceil(log2(#BX)) + BUSQUEDA_EXTRA_MARGEN`` pages are fetched. When the
+    number falls between two ranges (a hidden article at a bulletin edge) both
+    neighbours are candidates, lower first.
+    """
+    year, target = cve.year, cve.number
+    start, end = date(year, 1, 1), date(year, 12, 31)
+    url = f"{client.base_url}/api/bomes/calendar?start={start.isoformat()}&end={end.isoformat()}"
+    found: set[Cve] = set()
+    for ref in client.calendar(start, end):
+        try:
+            bulletin = parse_cve(ref.cve)
+        except InvalidCveError:
+            continue
+        if _same_year_extra_bulletin(bulletin, cve):
+            found.add(bulletin)
+    bulletins = sorted(found, key=lambda bulletin: bulletin.number)
+    if not bulletins:
+        return _BusquedaExtra((), 0, 0, False, url)
+    budget = math.ceil(math.log2(len(bulletins))) + BUSQUEDA_EXTRA_MARGEN
+    spans: dict[int, tuple[int, int] | None] = {}
+
+    def span(index: int) -> tuple[int, int] | None:
+        if index not in spans:
+            if len(spans) >= budget:
+                raise _BudgetExhausted
+            bulletin = bulletins[index]
+            numbers = [
+                ref.number
+                for ref in client.bulletin(bulletin).articles
+                if ref.cve == str(bulletin.article_cve(ref.number))
+            ]
+            spans[index] = (min(numbers), max(numbers)) if numbers else None
+        return spans[index]
+
+    def result(candidates: Sequence[int], exhausted: bool = False) -> _BusquedaExtra:
+        return _BusquedaExtra(
+            tuple(bulletins[i] for i in candidates), len(bulletins), len(spans), exhausted, url
+        )
+
+    low, high = 0, len(bulletins) - 1
+    try:
+        while low <= high:
+            middle = (low + high) // 2
+            probe = middle
+            while probe <= high and span(probe) is None:
+                probe += 1
+            if probe > high:  # nothing listed from middle to high
+                high = middle - 1
+                continue
+            first, last = spans[probe]  # type: ignore[misc]
+            if first <= target <= last:
+                return result([probe])
+            if target < first:
+                high = probe - 1
+            else:
+                low = probe + 1
+    except _BudgetExhausted:
+        return result([], exhausted=True)
+    listed = {i: s for i, s in spans.items() if s is not None}
+    below = max((i for i, s in listed.items() if s[1] < target), default=None)
+    above = min((i for i, s in listed.items() if s[0] > target), default=None)
+    return result([i for i in (below, above) if i is not None])
 
 
 def _article_metadata(article: Article, base_url: str) -> dict[str, Any]:
@@ -593,18 +810,22 @@ def leer_articulo(
     desde_pagina: int = 1,
     desde_caracter: int = 0,
     max_caracteres: int = DEFAULT_MAX_CARACTERES,
+    boletin_de_articulo: BoletinDeArticulo | None = None,
 ) -> TextoPaginado:
     """Full text of an article from its web page, one printed page per unit.
 
-    Accepts an article CVE (``BOME-A-2026-1051``, resolved through the site's
-    CVE resolver) or a bulletin CVE plus ``numero``. Old articles without
-    HTML text (2014-2016) fall back to the article PDF when the page links
-    one; otherwise the result has ``fuente: "ninguna"``, no pages and an
-    ``aviso`` pointing to the bulletin PDF.
+    Accepts an article CVE (``BOME-A-2026-1051`` through the site's CVE
+    resolver; ``BOME-AX-2019-103`` located without trusting it, see
+    :func:`localizar_articulo`, optionally helped by ``boletin_de_articulo``)
+    or a bulletin CVE plus ``numero``. Old articles without HTML text
+    (2014-2016) fall back to the article PDF when the page links one;
+    otherwise the result has ``fuente: "ninguna"``, no pages and an ``aviso``
+    pointing to the bulletin PDF.
     """
     budget = _budget(max_caracteres)
-    bulletin_cve, number = _article_target(client, parse_cve(cve_boletin_o_articulo), numero)
-    article = client.article(bulletin_cve, number)
+    article = localizar_articulo(
+        client, cve_boletin_o_articulo, numero, boletin_de_articulo=boletin_de_articulo
+    )
     metadata = _article_metadata(article, client.base_url)
     if article.text is not None:
         return _chunk(
@@ -709,10 +930,14 @@ def leer_boletin(
 
 
 __all__ = [
+    "BUSQUEDA_EXTRA_MARGEN",
     "DEFAULT_MAX_CARACTERES",
     "MAX_MAX_CARACTERES",
     "MAX_PDF_BYTES",
     "MIN_MAX_CARACTERES",
+    "ArticuloDistintoError",
+    "ArticuloNoLocalizadoError",
+    "BoletinDeArticulo",
     "Cursor",
     "DescargaPdf",
     "LecturaInvalidaError",
@@ -724,6 +949,7 @@ __all__ = [
     "leer_boletin",
     "leer_pdf",
     "leer_pdf_antiguo",
+    "localizar_articulo",
     "nombre_pdf_antiguo",
     "paginar",
 ]

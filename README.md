@@ -55,7 +55,7 @@ Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `err
 | **Navegar** | `listar_bomes` | Boletines publicados entre dos fechas (por defecto, los últimos 30 días; como mucho 500, del más reciente al más antiguo), cada uno con su `origen`; antes del 13 de marzo de 2021 añade los que solo tiene el portal antiguo |
 | | `ver_bome` | Un boletín con su árbol departamento → consejería → organismo → artículos; con `recuperar_ocultos` busca los artículos que la página omite |
 | | `ver_sumario` | La vista web del sumario, con la primera página de cada artículo (algunos sumarios son texto libre y dan 0 entradas: usa `ver_bome`) |
-| | `resolver_cve` | URL canónica de cualquier CVE (boletín, artículo, sumario o página) |
+| | `resolver_cve` | URL canónica de cualquier CVE (boletín, artículo, sumario o página). El resolutor del sitio confunde los artículos y páginas de extraordinarios (`BOME-AX`, `BOME-PX`) con los ordinarios: para `BOME-AX` el boletín se busca aparte, y para `BOME-PX` se devuelve la URL de su PDF |
 | | `listar_consejerias` | Consejerías de un departamento con su id, para filtrar búsquedas |
 | | `listar_organismos` | Organismos de una consejería con su id, para filtrar búsquedas |
 | **Leer y descargar** | `leer_articulo` | Texto completo de un artículo, paginado |

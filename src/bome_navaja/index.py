@@ -1158,6 +1158,19 @@ class SumarioIndex:
         return row[0] if row else None
 
     @_reading
+    def boletin_de_articulo(self, cve: str) -> str | None:
+        """Bulletin CVE of an article CVE as bomemelilla.es listed it, or ``None``.
+
+        Only bomemelilla.es rows count: old-portal rows use synthetic keys.
+        Used to read an extraordinary article (``BOME-AX``) without the site's
+        CVE resolver, which sends those to ordinary bulletins.
+        """
+        row = self._conn().execute(
+            "SELECT bulletin_cve FROM articles WHERE cve = ? AND origen = ?", (cve, ORIGEN_BOME)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    @_reading
     def estados_boletines(self, origen: str | None = None) -> dict[str, str]:
         """``key → estado`` for every processed bulletin, or only those stored by ``origen``.
 
