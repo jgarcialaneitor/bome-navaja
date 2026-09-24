@@ -87,8 +87,81 @@ def test_user_config_data_directory_is_optional() -> None:
     # "${user_config.directorio_datos}" (a relative path). Blank means unset in paths.py.
     assert setting["default"] == ""
     assert manifest["server"]["mcp_config"]["env"] == {
-        "BOME_NAVAJA_DATA_DIR": "${user_config.directorio_datos}"
+        "BOME_NAVAJA_DATA_DIR": "${user_config.directorio_datos}",
+        "BOME_NAVAJA_SYNC_DELAY": "${user_config.pausa_sincronizacion_segundos}",
+        "BOME_NAVAJA_SYNC_JITTER": "${user_config.variacion_sincronizacion_segundos}",
+        "BOME_NAVAJA_SYNC_MAX_BOLETINES": "${user_config.max_boletines_por_sincronizacion}",
+        "BOME_NAVAJA_QUERY_DELAY": "${user_config.pausa_consultas_segundos}",
+        "BOME_NAVAJA_GUARD_MAX_ERRORS": "${user_config.errores_tolerados}",
+        "BOME_NAVAJA_GUARD_WINDOW_MINUTES": "${user_config.ventana_errores_minutos}",
+        "BOME_NAVAJA_GUARD_COOLDOWN_MINUTES": "${user_config.espera_tras_bloqueo_minutos}",
+        "BOME_NAVAJA_ERROR_PAUSE_SECONDS": "${user_config.pausa_tras_error_segundos}",
+        "BOME_NAVAJA_TIMEOUT": "${user_config.tiempo_espera_segundos}",
     }
+
+
+_USER_CONFIG_REF = re.compile(r"^\$\{user_config\.([a-z0-9_]+)\}$")
+
+
+def _env_keys(manifest: dict) -> dict[str, str]:
+    """Env var -> the user_config key its value is taken from."""
+    keys = {}
+    for variable, value in manifest["server"]["mcp_config"]["env"].items():
+        match = _USER_CONFIG_REF.match(value)
+        assert match, f"{variable} is not taken from a user_config key: {value!r}"
+        keys[variable] = match.group(1)
+    return keys
+
+
+def test_every_site_setting_has_one_numeric_user_config_field() -> None:
+    from bome_navaja.ajustes import VARIABLES, Ajustes, ajustes_desde_entorno
+
+    manifest = _template()
+    user_config = manifest["user_config"]
+    env_keys = _env_keys(manifest)
+    defaults = Ajustes().to_dict()
+    field_of_variable = {variable: field for field, variable in defaults["variables"].items()}
+    assert set(field_of_variable) == set(VARIABLES) and len(VARIABLES) == 9
+
+    keys = [env_keys[variable] for variable in VARIABLES if variable in env_keys]
+    assert len(keys) == len(set(keys)) == len(VARIABLES), "one user_config field per setting"
+    for variable in VARIABLES:
+        key = env_keys[variable]
+        setting = user_config[key]
+        assert setting["type"] == "number", key
+        assert setting["required"] is False, key
+        assert "max" not in setting, f"{key}: no hard limits (user decision)"
+        default = setting["default"]
+        assert isinstance(default, int | float) and not isinstance(default, bool), key
+        assert default == defaults[field_of_variable[variable]], key
+        assert setting["title"].strip(), key
+        description = setting["description"]
+        assert description.strip() and "\n" not in description, key
+        assert "Recomendado" in description, key
+        assert "responsabilidad" in description, key
+        # The minimum only rules out values the server would reject anyway.
+        if "min" in setting:
+            assert not ajustes_desde_entorno({variable: str(setting["min"])}).avisos, key
+        # The default reaches the server as mcpb renders it (String(value)) and
+        # is accepted as the recommended value, silently.
+        rendered = json.dumps(default)
+        parsed = ajustes_desde_entorno({variable: rendered})
+        assert not parsed.avisos and not parsed.riesgos, (key, rendered)
+
+
+def test_every_bome_navaja_env_var_maps_to_a_declared_user_config_key() -> None:
+    manifest = _template()
+    env_keys = _env_keys(manifest)
+    assert all(variable.startswith("BOME_NAVAJA_") for variable in env_keys)
+    assert set(env_keys.values()) <= set(manifest["user_config"])
+    # Every declared field reaches the server through exactly one variable.
+    assert sorted(env_keys.values()) == sorted(manifest["user_config"])
+
+
+def test_long_description_asks_for_responsible_use() -> None:
+    long_description = _template()["long_description"]
+    assert "\n" not in long_description
+    assert "responsable" in long_description and "bloquee tu IP" in long_description
 
 
 # --------------------------------------------------------------------------- generate_manifest
@@ -153,6 +226,7 @@ def test_staging_includes_files_required_by_pyproject(tmp_path: Path) -> None:
         "manifest.json",
         "bome_navaja_mcpb.py",
         ".mcpbignore",
+        "uv.lock",
     ]
     for name in required:
         assert (out / name).is_file(), f"staged bundle is missing {name}"
@@ -165,6 +239,15 @@ def test_staging_includes_files_required_by_pyproject(tmp_path: Path) -> None:
     assert not any("__pycache__" in part or part.endswith(".pyc") for part in staged)
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == project["project"]["version"]
+
+
+def test_staging_ships_the_lockfile_unchanged_and_unignored(tmp_path: Path) -> None:
+    build = _load_build_script()
+    out = tmp_path / "mcpb"
+    build.stage(out)
+    assert (out / "uv.lock").read_bytes() == (REPO_ROOT / "uv.lock").read_bytes()
+    patterns = {line.strip() for line in (MCPB_DIR / ".mcpbignore").read_text(encoding="utf-8").splitlines()}
+    assert not {"uv.lock", "*.lock", "*.lock*"} & patterns
 
 
 def test_staging_refuses_to_replace_populated_non_bundle_dir(tmp_path: Path) -> None:

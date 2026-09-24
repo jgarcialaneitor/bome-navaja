@@ -6,8 +6,13 @@ and run the server, then leaves the actual ``.mcpb`` packing to
 ``npx @anthropic-ai/mcpb pack`` (see ``build_mcpb.sh`` / ``build_mcpb.ps1``).
 
 Ported from navaja's ``scripts/build_mcpb.py``, including its safety guards.
-Like navaja, ``uv.lock`` is not staged: uv resolves the dependencies from
-``pyproject.toml`` on first launch.
+Unlike navaja, ``uv.lock`` is staged next to ``pyproject.toml`` (user decision
+2026-09-24): ``uv run --directory`` in the installed bundle then installs the
+dependency versions the test suite ran against instead of resolving the
+newest ones allowed by ``pyproject.toml``. The launch command does not pass
+``--frozen`` or ``--locked``: when the lock matches ``pyproject.toml`` uv uses
+it as is, and when it does not, uv re-locks preferring the locked versions
+instead of failing the first launch.
 """
 
 from __future__ import annotations
@@ -89,8 +94,9 @@ def _ensure_safe_staging_target(bundle_root: Path) -> None:
 def stage(bundle_root: Path) -> None:
     """Stage the bundle inputs into *bundle_root* and write ``manifest.json``.
 
-    Copies ``pyproject.toml``, ``README.md`` and ``LICENSE`` (pyproject
-    declares them, and hatchling refuses to build without them), the ``src/``
+    Copies ``pyproject.toml`` with its ``uv.lock`` (the tested dependency
+    versions), ``README.md`` and ``LICENSE`` (pyproject declares them, and
+    hatchling refuses to build without them), the ``src/``
     tree without caches, the launcher and ``.mcpbignore``. Previous staged
     contents are removed first so repeated builds are deterministic; unsafe
     targets are refused with :class:`ValueError` before anything is deleted.
@@ -103,7 +109,7 @@ def stage(bundle_root: Path) -> None:
         shutil.rmtree(bundle_root)
     bundle_root.mkdir(parents=True)
 
-    for name in ("pyproject.toml", "README.md", "LICENSE"):
+    for name in ("pyproject.toml", "uv.lock", "README.md", "LICENSE"):
         shutil.copy2(PROJECT_ROOT / name, bundle_root / name)
     shutil.copytree(PROJECT_ROOT / "src", bundle_root / "src", ignore=_SKIP)
     shutil.copy2(PROJECT_ROOT / "mcpb" / LAUNCHER, bundle_root / LAUNCHER)

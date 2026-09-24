@@ -39,9 +39,16 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
 
 ## Tasks
 
-- [ ] 1. Settings module: read every setting from `BOME_NAVAJA_*` env vars (blank = unset,
+- [x] 1. Settings module: read every setting from `BOME_NAVAJA_*` env vars (blank = unset,
       tolerant numbers such as `250.0`), no hard floors, risk warnings; wire into sync, both site
       guards, clients and error pause; `estado_servidor` reports values and warnings; tests.
+      New module `ajustes.py`; new vars `BOME_NAVAJA_SYNC_JITTER`, `_QUERY_DELAY`,
+      `_GUARD_MAX_ERRORS`, `_GUARD_WINDOW_MINUTES`, `_GUARD_COOLDOWN_MINUTES`,
+      `_ERROR_PAUSE_SECONDS`, `_TIMEOUT`. The AX lookup cap follows the guard budget
+      (`max(1, min(2, max_errores - 1))`). Verified: `988 passed, 18 skipped`. Commit `aafbc00`;
+      native review `review-d190a663d5477e7a` approved (4 lenses) and acknowledged. Follow-up
+      (advisory, ajustes.py:85-92): huge finite minute values overflow to infinity when turned
+      into seconds.
 - [ ] 2. Bundle: one numeric `user_config` field per setting in the manifest (title, description
       with effect, consequence and recommendation), mapped to its env var; stage `uv.lock`; tests.
 - [ ] 3. README section on the settings and responsible use; version 0.0.5; tests.
