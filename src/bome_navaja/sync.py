@@ -70,10 +70,18 @@ bulletins, so it takes effect after the bulletin in flight (a few polite
 requests, typically 1-3 s), or at once during a back-off wait; the client's
 polite delay itself is not interrupted, which keeps the client untouched.
 
-Two server processes never crawl at the same time: the sync holds a lease row
-in the index (owner + heartbeat, renewed before every bulletin, considered
-dead after :data:`bome_navaja.index.LEASE_STALE_SECONDS`). A second process's
-:meth:`SincronizadorIndice.iniciar` answers ``en_curso_en_otro_proceso``.
+Two syncs never crawl at the same time: the sync holds a lease row in the
+index (owner + heartbeat, renewed before every bulletin, considered dead after
+:data:`bome_navaja.index.LEASE_STALE_SECONDS`). The lease is per index, not per
+site, so it is shared with the old-portal sync of :mod:`bome_navaja.sync_antiguo`
+(both write the same index): while either runs, the other's ``iniciar``, like a
+second process's, answers ``en_curso_en_otro_proceso`` with the holder and the
+``origen`` it syncs.
+
+The run loop (lease, cancellation, guard, pauses, cap, progress, summary) lives
+in :class:`SincronizadorBase`; :class:`SincronizadorIndice` only supplies the
+bomemelilla.es source (calendar plan, bulletin pages). Every state carries
+``origen`` and the final summary is stored per origin.
 
 The sync owns its :class:`BomeClient` (built by ``client_factory`` inside the
 worker thread) because a client is not shared across threads.
@@ -95,7 +103,7 @@ from typing import Any, Literal, cast
 
 from .client import BomeClient
 from .guard import VENTANA_ERRORES_SEGUNDOS, GuardiaSitio
-from .index import LEASE_STALE_SECONDS, SYNC_DEFAULT_START, SumarioIndex, utc_iso
+from .index import LEASE_STALE_SECONDS, ORIGEN_BOME, SYNC_DEFAULT_START, SumarioIndex, utc_iso
 from .models import (
     Article,
     BomeBlockedError,
@@ -154,7 +162,7 @@ MAX_PAUSAS_PREVENTIVAS_SEGUIDAS = 6
 error budget is considered stuck and the sync ends as ``bloqueado``."""
 
 _BLOCKED_MESSAGE = (
-    "the BOME site is refusing our requests (rate limit or firewall){detail}. "
+    "{site} is refusing our requests (rate limit or firewall){detail}. "
     "Bulletins already indexed are kept. bome-navaja will not ask the site anything for "
     "{wait} s (reintentar_tras_segundos); sync again after that, the next sync continues "
     "where this one stopped."
@@ -326,8 +334,10 @@ class EstadoSincronizacion(JsonModel):
     pendientes_tras_limite: int = 0
     """Planned bulletins deferred to a later run by the cap."""
     lease: dict[str, Any] | None = None
-    """Holder of the lease when another process is syncing."""
+    """Holder of the lease (with the ``origen`` it syncs) when another sync runs."""
     propietario: str | None = field(default=None)
+    origen: str | None = None
+    """Site this job syncs from: ``bomemelilla.es`` or ``melilla.es`` (the old portal)."""
 
 
 def _default_owner() -> str:
@@ -347,38 +357,51 @@ def _date(value: date | str | None, name: str) -> date | None:
     raise BusquedaInvalidaError(f"'{name}' must be an ISO date YYYY-MM-DD, got {value!r}")
 
 
-class SincronizadorIndice:
-    """Runs one background sync at a time for a :class:`SumarioIndex`."""
+def _lease_message(held: Mapping[str, Any]) -> str:
+    holder = held.get("origen")
+    who = f"a sync of {holder}" if holder else "another sync"
+    return (
+        f"{who} is already writing this index (in this or another bome-navaja process); "
+        "only one sync runs at a time per index"
+    )
+
+
+class SincronizadorBase:
+    """The run loop shared by the syncs of every origin.
+
+    One background job at a time: lease (shared by every origin: one sync per
+    index), cancellation, site guard (stop on a cooldown, wait out the error
+    budget, resume a step after a preventive pause), the random pause after a
+    page answered 5xx, the per-run cap, progress/ETA and the final summary.
+
+    A subclass names its :attr:`origen` and the site (:attr:`_sitio`) and
+    provides the source: :meth:`_open_client` (built inside the worker
+    thread), :meth:`_plan_run` (the planned items, newest first, fetching what
+    the plan needs through :meth:`_guarded`), :meth:`_label`,
+    :meth:`_process` (one item) and :meth:`_store_failure`.
+    """
+
+    origen: str = ORIGEN_BOME
+    _sitio: str = "the BOME site"
+    """Names the site in the ``bloqueado`` message."""
+    _capped_message: str = _CAPPED_MESSAGE
+    _thread_name: str = "bome-navaja-index-sync"
 
     def __init__(
         self,
         index: SumarioIndex,
-        client_factory: Callable[..., BomeClient] | None = None,
         *,
-        polite_delay: float = SYNC_POLITE_DELAY,
-        jitter: float = SYNC_JITTER,
-        max_boletines: int = DEFAULT_MAX_BULLETINS_PER_RUN,
-        owner: str | None = None,
-        hoy: Callable[[], date] = date.today,
-        clock: Callable[[], float] = time.time,
-        stale_after: float = LEASE_STALE_SECONDS,
-        wait: Callable[[float], bool] | None = None,
-        guard: GuardiaSitio | None = None,
-        pausa_aleatoria: Callable[[float, float], float] = random.uniform,
+        guard: GuardiaSitio,
+        max_boletines: int,
+        owner: str | None,
+        hoy: Callable[[], date],
+        clock: Callable[[], float],
+        stale_after: float,
+        wait: Callable[[float], bool] | None,
+        pausa_aleatoria: Callable[[float, float], float],
     ) -> None:
-        """``wait(seconds)`` performs one pause slice and returns ``True`` when
-        cancelled; it defaults to waiting on the cancellation event (tests inject
-        a fake so they never sleep). ``guard`` is the site guard (default: a
-        memory-only one); ``client_factory`` is called as
-        ``client_factory(guard=guard)`` and must wire it into the client.
-        ``pausa_aleatoria(low, high)`` draws the pause after a broken page.
-        ``polite_delay`` and ``jitter`` only shape the default client;
-        ``max_boletines`` is the cap of runs started without one."""
         self.index = index
-        self.guard = guard if guard is not None else GuardiaSitio(None)
-        self._client_factory: Callable[..., BomeClient] = client_factory or (
-            lambda *, guard=None: BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
-        )
+        self.guard = guard
         self._max_boletines = _check_cap(max_boletines)
         self.owner = owner or _default_owner()
         self._today = hoy
@@ -395,84 +418,6 @@ class SincronizadorIndice:
         self._pending_pause: str | None = None
 
     # ------------------------------------------------------------------ public API
-
-    def iniciar(
-        self,
-        desde: date | str | None = None,
-        hasta: date | str | None = None,
-        reindexar_recientes_dias: int = DEFAULT_RECENT_DAYS,
-        reintentar_errores: bool = True,
-        max_boletines: int | None = None,
-        reintentar_rotos: bool = False,
-    ) -> EstadoSincronizacion:
-        """Start a background sync and return its status at once.
-
-        At most ``max_boletines`` bulletins (default: the constructor's) are
-        indexed, the newest of the plan. Without ``desde`` the range starts at
-        :data:`SYNC_DEFAULT_START`; an earlier ``desde`` is honoured.
-        ``reintentar_errores`` replans failed bulletins; ``roto`` ones are only replanned with ``reintentar_rotos``
-        (each costs an HTTP 500 that the site's firewall counts). While a sync of this object runs,
-        returns that job. When another
-        process holds a live lease, returns ``en_curso_en_otro_proceso`` with
-        the lease and starts nothing.
-        """
-        start = _date(desde, "desde") or SYNC_DEFAULT_START
-        end = _date(hasta, "hasta") or self._today()
-        if end < start:
-            raise BusquedaInvalidaError(f"'hasta' ({end}) is before 'desde' ({start})")
-        if (
-            isinstance(reindexar_recientes_dias, bool)
-            or not isinstance(reindexar_recientes_dias, int)
-            or reindexar_recientes_dias < 0
-        ):
-            raise BusquedaInvalidaError(
-                f"'reindexar_recientes_dias' must be an integer >= 0, got {reindexar_recientes_dias!r}"
-            )
-        cap = self._max_boletines if max_boletines is None else _check_cap(max_boletines)
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return self._snapshot()
-            held = self.index.adquirir_lease(
-                self.owner, now=self._clock(), stale_after=self._stale_after
-            )
-            if held is not None:
-                return EstadoSincronizacion(
-                    estado="en_curso_en_otro_proceso",
-                    lease=held,
-                    propietario=self.owner,
-                    mensaje="another bome-navaja process is already syncing this index",
-                )
-            self._cancel.clear()
-            self._started_clock = self._clock()
-            self._state = {
-                "estado": "en_curso",
-                "desde": start.isoformat(),
-                "hasta": end.isoformat(),
-                "total_planificado": 0,
-                "hechos": 0,
-                "indexados": 0,
-                "sin_sumarios": 0,
-                "errores": 0,
-                "rotos": 0,
-                "iniciado": utc_iso(),
-                "limite_boletines": cap,
-                "pendientes_tras_limite": 0,
-            }
-            self._thread = threading.Thread(
-                target=self._run,
-                args=(
-                    start,
-                    end,
-                    reindexar_recientes_dias,
-                    bool(reintentar_errores),
-                    bool(reintentar_rotos),
-                    cap,
-                ),
-                name="bome-navaja-index-sync",
-                daemon=True,
-            )
-            self._thread.start()
-            return self._snapshot()
 
     def estado(self) -> EstadoSincronizacion:
         """Current progress (safe to call from any thread)."""
@@ -492,7 +437,66 @@ class SincronizadorIndice:
         thread.join(timeout)
         return not thread.is_alive()
 
+    # ------------------------------------------------------------------ source hooks
+
+    def _open_client(self) -> Any:
+        """The client of this run (closed at the end), built in the worker thread."""
+        raise NotImplementedError
+
+    def _plan_run(self, client: Any, *args: Any) -> list[Any]:
+        """Every item this run would process, newest first (the cap applies after)."""
+        raise NotImplementedError
+
+    def _label(self, item: Any) -> str:
+        """Key of ``item`` in the index, for ``cve_actual`` and the messages."""
+        raise NotImplementedError
+
+    def _process(self, client: Any, item: Any) -> None:
+        """Fetch and store one item (see :meth:`SincronizadorIndice._process`)."""
+        raise NotImplementedError
+
+    def _store_failure(self, item: Any, exc: BaseException) -> bool:
+        """Record ``item`` as ``error``; ``True`` when this failure left it ``roto``."""
+        raise NotImplementedError
+
     # ------------------------------------------------------------------ internals
+
+    def _arrancar(self, fields: Mapping[str, Any], cap: int, args: tuple[Any, ...]) -> EstadoSincronizacion:
+        """Take the lease and start the worker; the running job or the lease holder otherwise."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self._snapshot()
+            held = self.index.adquirir_lease(
+                self.owner, now=self._clock(), stale_after=self._stale_after, origen=self.origen
+            )
+            if held is not None:
+                return EstadoSincronizacion(
+                    estado="en_curso_en_otro_proceso",
+                    lease=held,
+                    propietario=self.owner,
+                    origen=self.origen,
+                    mensaje=_lease_message(held),
+                )
+            self._cancel.clear()
+            self._started_clock = self._clock()
+            self._state = {
+                "estado": "en_curso",
+                **fields,
+                "total_planificado": 0,
+                "hechos": 0,
+                "indexados": 0,
+                "sin_sumarios": 0,
+                "errores": 0,
+                "rotos": 0,
+                "iniciado": utc_iso(),
+                "limite_boletines": cap,
+                "pendientes_tras_limite": 0,
+            }
+            self._thread = threading.Thread(
+                target=self._run, args=(cap, *args), name=self._thread_name, daemon=True
+            )
+            self._thread.start()
+            return self._snapshot()
 
     def _snapshot(self) -> EstadoSincronizacion:
         state = dict(self._state)
@@ -510,6 +514,7 @@ class SincronizadorIndice:
             segundos_por_boletin=per_bulletin,
             eta_segundos=eta,
             propietario=self.owner,
+            origen=self.origen,
         )
 
     def _update(self, **changes: Any) -> None:
@@ -520,64 +525,34 @@ class SincronizadorIndice:
         with self._lock:
             self._state[key] = self._state.get(key, 0) + 1
 
-    def _plan(
-        self, refs: list[BulletinRef], recent_days: int, retry_errors: bool, retry_broken: bool
-    ) -> list[BulletinRef]:
-        known = self.index.estados_boletines()
-        cutoff = self._today() - timedelta(days=recent_days)
-        chosen: dict[str, BulletinRef] = {}
-        for ref in refs:
-            status = known.get(ref.cve)
-            if status == "roto":
-                if retry_broken:
-                    chosen[ref.cve] = ref
-                continue
-            if (
-                status is None
-                or (recent_days > 0 and ref.date is not None and ref.date >= cutoff)
-                or (retry_errors and status == "error")
-            ):
-                chosen[ref.cve] = ref
-        return sorted(chosen.values(), key=lambda r: (r.date or date.min, r.number), reverse=True)
-
-    def _run(
-        self,
-        start: date,
-        end: date,
-        recent_days: int,
-        retry_errors: bool,
-        retry_broken: bool,
-        cap: int,
-    ) -> None:
-        client: BomeClient | None = None
+    def _run(self, cap: int, *args: Any) -> None:
+        client: Any = None
         final: dict[str, Any] = {}
         self._storage_failures = 0
         self._pending_pause = None
         try:
             self._stop_if_closed()  # a closed site gets no request at all
-            self._wait_for_budget("the calendar")
-            client = self._client_factory(guard=self.guard)
-            refs = self._guarded("the calendar", lambda: client.calendar(start, end))
-            self.index.registrar_calendario(refs)
-            plan = self._plan(refs, recent_days, retry_errors, retry_broken)
+            client = self._open_client()
+            plan = self._plan_run(client, *args)
             deferred = max(len(plan) - cap, 0)
             plan = plan[:cap]  # newest first: the cap defers the oldest
             self._update(total_planificado=len(plan), pendientes_tras_limite=deferred)
             final = {"estado": "completado"}
             if deferred:
-                final["mensaje"] = _CAPPED_MESSAGE.format(cap=cap, left=deferred)
-            for ref in plan:
+                final["mensaje"] = self._capped_message.format(cap=cap, left=deferred)
+            for item in plan:
                 if self._cancel.is_set():
                     final = {"estado": "cancelado", "mensaje": "cancelled by request"}
                     break
                 if not self.index.renovar_lease(self.owner, now=self._clock()):
                     final = {"estado": "fallido", "mensaje": "sync lease lost to another process"}
                     break
+                label = self._label(item)
                 self._stop_if_closed()
                 self._pause_after_error()
-                self._wait_for_budget(ref.cve)
-                self._update(cve_actual=ref.cve)
-                self._process(client, ref)
+                self._wait_for_budget(label)
+                self._update(cve_actual=label)
+                self._process(client, item)
         except _StopSync as stop:
             final = stop.final
         except BaseException as exc:  # noqa: BLE001 - the worker must always report
@@ -600,40 +575,8 @@ class SincronizadorIndice:
                 pass
             self.index.cerrar_conexion_hilo()
 
-    def _process(self, client: BomeClient, ref: BulletinRef) -> None:
-        """Fetch and store one bulletin; any failure becomes that bulletin's ``error``.
-
-        Raises :class:`_StopSync` when the site blocks us (or the guard is closed
-        after this bulletin), the sync is cancelled during a pause or the lease is
-        lost meanwhile.
-        """
-        memo = _BulletinMemo(client)
-        try:
-            articles, errors = self._guarded(
-                ref.cve, lambda: articulos_del_boletin(cast(BomeClient, memo), memo.bulletin(ref.cve))
-            )
-        except _StopSync:
-            raise
-        except Exception as exc:  # a bad bulletin must not stop the crawl
-            self._record_failure(ref, exc)
-            if _broken_page(exc):
-                self._pending_pause = f"an HTTP {cast(BomeHTTPError, exc).status} on {ref.cve}"
-            self._stop_if_closed()  # e.g. a second request in a row without any answer
-            return
-        has_text = any(article.sumario and article.sumario.strip() for article in articles)
-        estado = "indexado" if has_text else "sin_sumarios"
-        note = f"{errors[0].error_code}: {errors[0].mensaje}" if errors else None
-        try:
-            self.index.guardar_boletin(ref, articles, estado, error=note)
-        except Exception as exc:  # e.g. a row the index rejects: record, go on
-            self._record_failure(ref, exc)
-            return
-        self._storage_failures = 0
-        self._bump("hechos")
-        self._bump("indexados" if has_text else "sin_sumarios")
-
     def _guarded(self, what: str, step: Callable[[], Any]) -> Any:
-        """Run ``step`` (the calendar or one bulletin) under the site guard.
+        """Run ``step`` (a plan request or one bulletin) under the site guard.
 
         A preventive pause raised inside ``step`` is waited out and ``step`` runs
         again (a bulletin replays the answers it already has); any other block
@@ -698,7 +641,9 @@ class SincronizadorIndice:
             raise _StopSync(
                 {
                     "estado": "bloqueado",
-                    "mensaje": _BLOCKED_MESSAGE.format(detail=f": {motivo}", wait=math.ceil(remaining)),
+                    "mensaje": _BLOCKED_MESSAGE.format(
+                        site=self._sitio, detail=f": {motivo}", wait=math.ceil(remaining)
+                    ),
                     "reintentar_tras_segundos": remaining,
                 }
             )
@@ -713,7 +658,9 @@ class SincronizadorIndice:
         return {
             "estado": "bloqueado",
             "mensaje": _BLOCKED_MESSAGE.format(
-                detail=detail, wait=math.ceil(wait) if wait is not None else "a while"
+                site=self._sitio,
+                detail=detail,
+                wait=math.ceil(wait) if wait is not None else "a while",
             ),
             "ultimo_error": f"{what}: {exc}",
             "reintentar_tras_segundos": wait,
@@ -741,17 +688,26 @@ class SincronizadorIndice:
             if not self.index.renovar_lease(self.owner, now=self._clock()):
                 raise _StopSync({"estado": "fallido", "mensaje": "sync lease lost to another process"})
 
-    def _record_failure(self, ref: BulletinRef, exc: BaseException) -> None:
-        """Store ``ref`` as ``error`` (the index may make it ``roto``); if even that
+    def _failed(self, item: Any, exc: BaseException) -> None:
+        """A bulletin that could not be fetched: record it, schedule the pause owed
+        after a 5xx page and stop when the guard closed meanwhile."""
+        self._record_failure(item, exc)
+        if _broken_page(exc):
+            self._pending_pause = f"an HTTP {cast(BomeHTTPError, exc).status} on {self._label(item)}"
+        self._stop_if_closed()  # e.g. a second request in a row without any answer
+
+    def _record_failure(self, item: Any, exc: BaseException) -> None:
+        """Store ``item`` as ``error`` (the index may make it ``roto``); if even that
         fails, count it toward giving up."""
+        label = self._label(item)
         self._bump("hechos")
         self._bump("errores")
         try:
-            stored = self.index.guardar_boletin(ref, [], "error", error=exc)
+            broken = self._store_failure(item, exc)
         except Exception as store_exc:
             self._storage_failures += 1
             self._update(
-                ultimo_error=f"{ref.cve}: {exc} (the error could not be recorded: {store_exc})"
+                ultimo_error=f"{label}: {exc} (the error could not be recorded: {store_exc})"
             )
             if self._storage_failures >= MAX_CONSECUTIVE_STORAGE_FAILURES:
                 raise _IndexUnwritable(
@@ -760,9 +716,167 @@ class SincronizadorIndice:
                 ) from store_exc
             return
         self._storage_failures = 0
-        if stored == "roto":
+        if broken:
             self._bump("rotos")
-        self._update(ultimo_error=f"{ref.cve}: {exc}")
+        self._update(ultimo_error=f"{label}: {exc}")
+
+
+class SincronizadorIndice(SincronizadorBase):
+    """Runs one background sync of bomemelilla.es at a time for a :class:`SumarioIndex`."""
+
+    origen = ORIGEN_BOME
+
+    def __init__(
+        self,
+        index: SumarioIndex,
+        client_factory: Callable[..., BomeClient] | None = None,
+        *,
+        polite_delay: float = SYNC_POLITE_DELAY,
+        jitter: float = SYNC_JITTER,
+        max_boletines: int = DEFAULT_MAX_BULLETINS_PER_RUN,
+        owner: str | None = None,
+        hoy: Callable[[], date] = date.today,
+        clock: Callable[[], float] = time.time,
+        stale_after: float = LEASE_STALE_SECONDS,
+        wait: Callable[[float], bool] | None = None,
+        guard: GuardiaSitio | None = None,
+        pausa_aleatoria: Callable[[float, float], float] = random.uniform,
+    ) -> None:
+        """``wait(seconds)`` performs one pause slice and returns ``True`` when
+        cancelled; it defaults to waiting on the cancellation event (tests inject
+        a fake so they never sleep). ``guard`` is the site guard (default: a
+        memory-only one); ``client_factory`` is called as
+        ``client_factory(guard=guard)`` and must wire it into the client.
+        ``pausa_aleatoria(low, high)`` draws the pause after a broken page.
+        ``polite_delay`` and ``jitter`` only shape the default client;
+        ``max_boletines`` is the cap of runs started without one."""
+        super().__init__(
+            index,
+            guard=guard if guard is not None else GuardiaSitio(None),
+            max_boletines=max_boletines,
+            owner=owner,
+            hoy=hoy,
+            clock=clock,
+            stale_after=stale_after,
+            wait=wait,
+            pausa_aleatoria=pausa_aleatoria,
+        )
+        self._client_factory: Callable[..., BomeClient] = client_factory or (
+            lambda *, guard=None: BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
+        )
+
+    def iniciar(
+        self,
+        desde: date | str | None = None,
+        hasta: date | str | None = None,
+        reindexar_recientes_dias: int = DEFAULT_RECENT_DAYS,
+        reintentar_errores: bool = True,
+        max_boletines: int | None = None,
+        reintentar_rotos: bool = False,
+    ) -> EstadoSincronizacion:
+        """Start a background sync and return its status at once.
+
+        At most ``max_boletines`` bulletins (default: the constructor's) are
+        indexed, the newest of the plan. Without ``desde`` the range starts at
+        :data:`SYNC_DEFAULT_START`; an earlier ``desde`` is honoured.
+        ``reintentar_errores`` replans failed bulletins; ``roto`` ones are only replanned with ``reintentar_rotos``
+        (each costs an HTTP 500 that the site's firewall counts). While a sync of this object runs,
+        returns that job. When another sync (of any origin, in this or another
+        process) holds a live lease, returns ``en_curso_en_otro_proceso`` with
+        the lease and starts nothing.
+        """
+        start = _date(desde, "desde") or SYNC_DEFAULT_START
+        end = _date(hasta, "hasta") or self._today()
+        if end < start:
+            raise BusquedaInvalidaError(f"'hasta' ({end}) is before 'desde' ({start})")
+        if (
+            isinstance(reindexar_recientes_dias, bool)
+            or not isinstance(reindexar_recientes_dias, int)
+            or reindexar_recientes_dias < 0
+        ):
+            raise BusquedaInvalidaError(
+                f"'reindexar_recientes_dias' must be an integer >= 0, got {reindexar_recientes_dias!r}"
+            )
+        cap = self._max_boletines if max_boletines is None else _check_cap(max_boletines)
+        return self._arrancar(
+            {"desde": start.isoformat(), "hasta": end.isoformat()},
+            cap,
+            (start, end, reindexar_recientes_dias, bool(reintentar_errores), bool(reintentar_rotos)),
+        )
+
+    # ------------------------------------------------------------------ source hooks
+
+    def _open_client(self) -> BomeClient:
+        return self._client_factory(guard=self.guard)
+
+    def _label(self, item: BulletinRef) -> str:
+        return item.cve
+
+    def _plan_run(
+        self,
+        client: BomeClient,
+        start: date,
+        end: date,
+        recent_days: int,
+        retry_errors: bool,
+        retry_broken: bool,
+    ) -> list[BulletinRef]:
+        self._wait_for_budget("the calendar")
+        refs = self._guarded("the calendar", lambda: client.calendar(start, end))
+        self.index.registrar_calendario(refs)
+        return self._plan(refs, recent_days, retry_errors, retry_broken)
+
+    def _plan(
+        self, refs: list[BulletinRef], recent_days: int, retry_errors: bool, retry_broken: bool
+    ) -> list[BulletinRef]:
+        known = self.index.estados_boletines()
+        cutoff = self._today() - timedelta(days=recent_days)
+        chosen: dict[str, BulletinRef] = {}
+        for ref in refs:
+            status = known.get(ref.cve)
+            if status == "roto":
+                if retry_broken:
+                    chosen[ref.cve] = ref
+                continue
+            if (
+                status is None
+                or (recent_days > 0 and ref.date is not None and ref.date >= cutoff)
+                or (retry_errors and status == "error")
+            ):
+                chosen[ref.cve] = ref
+        return sorted(chosen.values(), key=lambda r: (r.date or date.min, r.number), reverse=True)
+
+    def _process(self, client: BomeClient, ref: BulletinRef) -> None:
+        """Fetch and store one bulletin; any failure becomes that bulletin's ``error``.
+
+        Raises :class:`_StopSync` when the site blocks us (or the guard is closed
+        after this bulletin), the sync is cancelled during a pause or the lease is
+        lost meanwhile.
+        """
+        memo = _BulletinMemo(client)
+        try:
+            articles, errors = self._guarded(
+                ref.cve, lambda: articulos_del_boletin(cast(BomeClient, memo), memo.bulletin(ref.cve))
+            )
+        except _StopSync:
+            raise
+        except Exception as exc:  # a bad bulletin must not stop the crawl
+            self._failed(ref, exc)
+            return
+        has_text = any(article.sumario and article.sumario.strip() for article in articles)
+        estado = "indexado" if has_text else "sin_sumarios"
+        note = f"{errors[0].error_code}: {errors[0].mensaje}" if errors else None
+        try:
+            self.index.guardar_boletin(ref, articles, estado, error=note)
+        except Exception as exc:  # e.g. a row the index rejects: record, go on
+            self._record_failure(ref, exc)
+            return
+        self._storage_failures = 0
+        self._bump("hechos")
+        self._bump("indexados" if has_text else "sin_sumarios")
+
+    def _store_failure(self, ref: BulletinRef, exc: BaseException) -> bool:
+        return self.index.guardar_boletin(ref, [], "error", error=exc) == "roto"
 
 
 __all__ = [
@@ -780,6 +894,7 @@ __all__ = [
     "SYNC_DEFAULT_START",
     "SYNC_POLITE_DELAY",
     "EstadoSincronizacion",
+    "SincronizadorBase",
     "SincronizadorIndice",
     "SyncSettings",
     "sync_settings_from_env",

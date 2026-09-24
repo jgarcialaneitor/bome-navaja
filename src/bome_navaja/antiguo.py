@@ -26,8 +26,10 @@ catalog from 1985-01-03 to 2021-03-12. Facts the code relies on:
   response is size-capped). Results are articles with per-page PDF links.
 * Ficha: GET ``contenedor.jsp?seccion=ficha_bome.jsp&dboidboletin=<id>``:
   header, whole-bulletin PDF, and a flat sequence of headings and articles.
-* robots.txt disallows ``ficha_bome.jsp`` and ``/mandar.php``. User decision
-  2026-09-24: allowed for on-demand requests only; nothing here crawls them.
+* robots.txt disallows ``ficha_bome.jsp`` and ``/mandar.php``. User decisions
+  2026-09-24: allowed for on-demand requests, and fichas (never PDFs) may be
+  bulk-indexed by the manually started, slow, capped and guarded sync of
+  :mod:`bome_navaja.sync_antiguo`; nothing in this module crawls.
 * Local index keys (:mod:`bome_navaja.index`, schema v4): a bulletin is keyed
   by its identifier, or ``<cve>~<dboid>`` when the identifier repeats in the
   catalog (:func:`clave_boletin_antiguo`, :meth:`CatalogoAntiguo.claves`);
@@ -1000,17 +1002,23 @@ class PortalAntiguo:
             raise ValueError(f"dboid must be a positive integer, got {dboid!r}")
         return dboid
 
-    def ficha(self, dboid: int | str) -> FichaAntigua:
+    def ficha(self, dboid: int | str, *, boletin: BoletinAntiguo | None = None) -> FichaAntigua:
         """The ficha of the bulletin with portal id ``dboid``.
 
-        When the catalog is already in memory or cached on disk its entry
-        supplies the numbering (suffix, extraordinary flag); the catalog is
-        never downloaded for this.
+        ``boletin`` is its catalog entry when the caller has it (the old-portal
+        sync does); otherwise, when the catalog is already in memory or cached
+        on disk, its entry supplies the numbering (suffix, extraordinary flag).
+        The catalog is never downloaded for this. An entry of another
+        ``dboid`` is a ``ValueError`` raised before any request.
         """
         number = self._valid_dboid(dboid)
+        if boletin is not None and boletin.dboid != number:
+            raise ValueError(f"the catalog entry has dboid {boletin.dboid}, not {number}")
         text = self._page("GET", (("seccion", "ficha_bome.jsp"), ("dboidboletin", str(number)), *_COMMON_PARAMS))
-        cached = self._cached_catalog()
-        hint = cached.por_dboid(number) if cached is not None else None
+        hint = boletin
+        if hint is None:
+            cached = self._cached_catalog()
+            hint = cached.por_dboid(number) if cached is not None else None
         return parse_ficha(text, number, boletin=hint)
 
     def ficha_por_cve(self, cve: str) -> FichaAntigua:

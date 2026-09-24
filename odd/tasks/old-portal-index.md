@@ -23,5 +23,8 @@ portal is a frozen legacy site that may disappear.
 - [x] 1. Index v4: origin and old-portal identity (dboid, keys for repeated pre-2014 ids,
       synthetic article keys), migration, search results carry `origen`. Across origins the
       better outcome wins (indexado > sin_sumarios > failure), bomemelilla.es on a tie.
-- [ ] 2. Old-portal sync: plan, pace, cap, own guard, shared lease, `roto`/`sin_sumarios`.
+- [x] 2. Old-portal sync: plan, pace, cap, own guard, shared lease, `roto`/`sin_sumarios`.
+      Verified: `790 passed, 18 skipped`. Shared run loop extracted to `SincronizadorBase`
+      (sync.py); `SincronizadorPortalAntiguo` in sync_antiguo.py; lease and last-sync summary
+      record the origin.
 - [ ] 3. Tools, README, manifest, version 0.0.4.

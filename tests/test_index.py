@@ -519,6 +519,33 @@ def test_last_sync_summary_roundtrip(idx: SumarioIndex) -> None:
     assert idx.estado().ultima_sincronizacion == {"estado": "completado", "hechos": 3}
 
 
+def test_the_last_sync_summary_is_kept_per_origin(idx: SumarioIndex) -> None:
+    assert idx.estado().ultimas_sincronizaciones == {"bomemelilla.es": None, "melilla.es": None}
+    old = {"estado": "completado", "origen": "melilla.es", "finalizado": "2026-09-24T10:00:00Z"}
+    idx.guardar_resumen_sincronizacion(old)
+    state = idx.estado()
+    assert state.ultima_sincronizacion is None  # the field keeps meaning bomemelilla.es
+    assert state.ultimas_sincronizaciones == {"bomemelilla.es": None, "melilla.es": old}
+    assert idx.buscar("cese").cobertura["ultima_sincronizacion"] is None
+    bome = {"estado": "bloqueado", "origen": "bomemelilla.es", "finalizado": "2026-09-24T11:00:00Z"}
+    idx.guardar_resumen_sincronizacion(bome)
+    state = idx.estado()
+    assert state.ultima_sincronizacion == bome
+    assert state.ultimas_sincronizaciones == {"bomemelilla.es": bome, "melilla.es": old}
+    with pytest.raises(BusquedaInvalidaError):
+        idx.guardar_resumen_sincronizacion({"estado": "completado", "origen": "boe.es"})
+
+
+def test_the_lease_names_the_origin_of_its_holder(idx: SumarioIndex) -> None:
+    assert idx.adquirir_lease("a", now=100.0, stale_after=60, origen="melilla.es") is None
+    held = idx.adquirir_lease("b", now=110.0, stale_after=60, origen="bomemelilla.es")
+    assert held is not None and (held["propietario"], held["origen"]) == ("a", "melilla.es")
+    assert idx.lease(now=120.0, stale_after=60)["origen"] == "melilla.es"
+    idx.liberar_lease("a")
+    assert idx.adquirir_lease("b", now=130.0, stale_after=60) is None  # no origin given
+    assert "origen" not in idx.lease(now=131.0, stale_after=60)
+
+
 # --------------------------------------------------------------------------- lease
 
 

@@ -487,6 +487,21 @@ def test_ficha_by_dboid(portal: Portal) -> None:
     }
 
 
+def test_ficha_takes_an_explicit_catalog_entry(portal: Portal) -> None:
+    portal.page("ficha_bome.jsp", "ficha_1999_3660.html")
+    hint = BoletinAntiguo(
+        cve="BOME-BX-1999-7", numero=7, extraordinario=True, sufijo="7 BIS", fecha=date(1999, 12, 30),
+        dboid=276000, url_ficha=url_ficha(276000), cve_oficial=False,
+    )
+    with portal.client() as client:
+        ficha = client.ficha(276000, boletin=hint)
+        assert (ficha.cve, ficha.sufijo, ficha.extraordinario) == ("BOME-BX-1999-7", "7 BIS", True)
+        assert len(ficha.articulos) == 73
+        with pytest.raises(ValueError):
+            client.ficha(1, boletin=hint)
+    assert len(portal.requests) == 1  # a mismatched entry is refused before any request
+
+
 @pytest.mark.parametrize("dboid", [0, -3, "12a", True])
 def test_ficha_rejects_invalid_dboids(portal: Portal, dboid: object) -> None:
     with portal.client() as client, pytest.raises(ValueError):

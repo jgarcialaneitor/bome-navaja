@@ -375,6 +375,9 @@ class EstadoIndice(JsonModel):
     """Per origin (:data:`ORIGENES`): ``boletines`` (counts per state and
     ``total``), ``articulos``, ``articulos_con_sumario``, ``fecha_min`` and
     ``fecha_max``. The top-level fields are the totals over every origin."""
+    ultimas_sincronizaciones: dict[str, Any] = field(default_factory=dict)
+    """Per origin (:data:`ORIGENES`), the summary of its last sync, or ``None``.
+    ``ultima_sincronizacion`` is the bomemelilla.es one, as before schema v4."""
 
 
 # --------------------------------------------------------------------------- query building
@@ -638,6 +641,15 @@ class _BulletinRow:
 def _check_estado(estado: str) -> None:
     if estado not in ESTADOS_GUARDABLES:
         raise ValueError(f"estado must be one of {ESTADOS_GUARDABLES}, got {estado!r}")
+
+
+_LEASE_ORIGIN_KEY = "sync_lease_origen"
+"""``meta`` row naming the owner and origin of the current sync lease."""
+
+
+def _last_sync_key(origen: str) -> str:
+    """``meta`` key of an origin's last sync summary (``last_sync`` stays bomemelilla.es)."""
+    return "last_sync" if origen == ORIGEN_BOME else f"last_sync:{origen}"
 
 
 _OUTCOME_RANK = {"indexado": 2, "sin_sumarios": 1}
@@ -1122,11 +1134,19 @@ class SumarioIndex:
             )
 
     def guardar_resumen_sincronizacion(self, resumen: Mapping[str, Any]) -> None:
-        """Persist the summary of the last sync (JSON) for :meth:`estado`."""
+        """Persist the summary of the last sync (JSON) of its origin for :meth:`estado`.
+
+        ``resumen["origen"]`` (default ``bomemelilla.es``) picks the slot: the
+        bomemelilla.es one is what :attr:`EstadoIndice.ultima_sincronizacion`
+        always reported; every origin's is in ``ultimas_sincronizaciones``.
+        """
+        origen = resumen.get("origen") or ORIGEN_BOME
+        if origen not in ORIGENES:
+            raise _invalid(f"'origen' must be one of {ORIGENES}, got {origen!r}")
         with self._tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync', ?)",
-                (json.dumps(dict(resumen), ensure_ascii=True),),
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (_last_sync_key(origen), json.dumps(dict(resumen), ensure_ascii=True)),
             )
 
     # ------------------------------------------------------------------ reads
@@ -1158,8 +1178,8 @@ class SumarioIndex:
             raise _invalid(f"'origen' must be one of {ORIGENES} or None, got {origen!r}")
         return {row[0]: row[1] for row in rows}
 
-    def _last_sync(self) -> dict[str, Any] | None:
-        raw = self._meta("last_sync")
+    def _last_sync(self, origen: str = ORIGEN_BOME) -> dict[str, Any] | None:
+        raw = self._meta(_last_sync_key(origen))
         return json.loads(raw) if raw else None
 
     def _coverage(self) -> dict[str, Any]:
@@ -1424,37 +1444,62 @@ class SumarioIndex:
             ultima_sincronizacion=self._last_sync(),
             sincronizacion_en_curso=self.lease(),
             por_origen=per_origin,
+            ultimas_sincronizaciones={origen: self._last_sync(origen) for origen in ORIGENES},
         )
 
     # ------------------------------------------------------------------ cross-process lease
 
     @staticmethod
-    def _lease_info(row: sqlite3.Row, now: float) -> dict[str, Any]:
-        return {
+    def _lease_info(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> dict[str, Any]:
+        info: dict[str, Any] = {
             "propietario": row["owner"],
             "latido": utc_iso(row["heartbeat"]),
             "iniciado": utc_iso(row["started"]),
             "segundos_desde_latido": round(now - row["heartbeat"], 1),
         }
+        stored = conn.execute("SELECT value FROM meta WHERE key = ?", (_LEASE_ORIGIN_KEY,)).fetchone()
+        if stored is not None:
+            try:
+                holder = json.loads(stored[0])
+            except ValueError:
+                holder = None
+            if isinstance(holder, dict) and holder.get("propietario") == row["owner"]:
+                info["origen"] = holder.get("origen")
+        return info
 
     def adquirir_lease(
-        self, owner: str, *, now: float | None = None, stale_after: float = LEASE_STALE_SECONDS
+        self,
+        owner: str,
+        *,
+        now: float | None = None,
+        stale_after: float = LEASE_STALE_SECONDS,
+        origen: str | None = None,
     ) -> dict[str, Any] | None:
         """Take the sync lease; ``None`` on success, else the live holder's info.
 
-        A lease whose heartbeat is older than ``stale_after`` seconds is taken
-        over (its process died without releasing it).
+        One lease per index, whatever the origin being synced: both syncs write
+        the same index, so only one runs at a time. ``origen`` is recorded next
+        to the lease and reported as the holder's ``origen``. A lease whose
+        heartbeat is older than ``stale_after`` seconds is taken over (its
+        process died without releasing it).
         """
         moment = time.time() if now is None else now
         with self._tx() as conn:
             row = conn.execute("SELECT owner, heartbeat, started FROM sync_lease WHERE id = 1").fetchone()
             if row is not None and row["owner"] != owner and moment - row["heartbeat"] <= stale_after:
-                return self._lease_info(row, moment)
+                return self._lease_info(conn, row, moment)
             started = row["started"] if row is not None and row["owner"] == owner else moment
             conn.execute(
                 "INSERT OR REPLACE INTO sync_lease (id, owner, heartbeat, started) VALUES (1, ?, ?, ?)",
                 (owner, moment, started),
             )
+            if origen is None:
+                conn.execute("DELETE FROM meta WHERE key = ?", (_LEASE_ORIGIN_KEY,))
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (_LEASE_ORIGIN_KEY, json.dumps({"propietario": owner, "origen": origen})),
+                )
         return None
 
     def renovar_lease(self, owner: str, *, now: float | None = None) -> bool:
@@ -1477,12 +1522,11 @@ class SumarioIndex:
     ) -> dict[str, Any] | None:
         """Info on the live lease, or ``None`` when free or stale."""
         moment = time.time() if now is None else now
-        row = self._conn().execute(
-            "SELECT owner, heartbeat, started FROM sync_lease WHERE id = 1"
-        ).fetchone()
+        conn = self._conn()
+        row = conn.execute("SELECT owner, heartbeat, started FROM sync_lease WHERE id = 1").fetchone()
         if row is None or moment - row["heartbeat"] > stale_after:
             return None
-        return self._lease_info(row, moment)
+        return self._lease_info(conn, row, moment)
 
 
 __all__ = [
