@@ -10,7 +10,8 @@ Kinds observed on bomemelilla.es (fixtures captured 2026-09-23):
   bulletin, both numbered per year (``BOME-A-2026-1051``, ``BOME-AX-2026-102``).
 * ``S`` / ``SX`` sumario PDF of a bulletin; the number is the bulletin number
   (``BOME-S-2026-6416`` is the sumario of ``BOME-B-2026-6416``).
-* ``P`` single page PDF, numbered per year (``BOME-P-2026-4784``).
+* ``P`` / ``PX`` single page PDF of an ordinary / extraordinary bulletin,
+  numbered per year (``BOME-P-2026-4784``, ``BOME-PX-2021-362``).
 
 The article number in the ``/bome/{CVE}/articulo/{n}`` URL is the article CVE
 number (``BOME-A-2026-1051`` → ``/bome/BOME-B-2026-6416/articulo/1051``).
@@ -44,6 +45,7 @@ class CveKind(StrEnum):
     SUMARIO = "S"
     EXTRA_SUMARIO = "SX"
     PAGE = "P"
+    EXTRA_PAGE = "PX"
 
     @property
     def is_extraordinary(self) -> bool:

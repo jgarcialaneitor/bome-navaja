@@ -394,7 +394,7 @@ def resolver_cve(cve: str) -> dict:
     """Devuelve la URL canónica de cualquier CVE (boletín, artículo, sumario o página).
 
     Útil para citar o para saber a qué boletín y artículo pertenece un CVE de artículo
-    (BOME-A-...) o de página (BOME-P-...). Comprueba que la página exista.
+    (BOME-A-...) o de página (BOME-P-... / BOME-PX-...). Comprueba que la página exista.
     """
     canonical = str(parse_cve(cve))
     client = _cliente()
@@ -488,7 +488,7 @@ def leer_pdf(
     max_caracteres: int = 20000,
 ) -> dict:
     """Texto del PDF de cualquier CVE: boletín, sumario (BOME-S), artículo (BOME-A) o página
-    (BOME-P).
+    (BOME-P / BOME-PX).
 
     Las páginas sin texto extraíble (escaneadas) salen con sin_texto=true y un aviso.
     Paginación: devuelve páginas enteras hasta max_caracteres (1000-100000, por defecto

@@ -67,7 +67,7 @@ Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `err
 | | `cancelar_sincronizacion` | Pide parar la sincronización en curso |
 | **Servidor** | `estado_servidor` | Versión, rutas de datos, SQLite disponible y configuración, sin tocar la red |
 
-Los CVE tienen la forma `BOME-L-AAAA-N`: `BOME-B-2026-6416` (boletín), `BOME-BX-2026-41` (extraordinario), `BOME-A-2026-1051` (artículo), `BOME-S-2026-6416` (sumario), `BOME-P-2026-4784` (página). Se aceptan en minúsculas y con espacios.
+Los CVE tienen la forma `BOME-L-AAAA-N`: `BOME-B-2026-6416` (boletín), `BOME-BX-2026-41` (extraordinario), `BOME-A-2026-1051` (artículo), `BOME-S-2026-6416` (sumario), `BOME-P-2026-4784` (página), `BOME-PX-2021-362` (página de un extraordinario). Se aceptan en minúsculas y con espacios.
 
 ---
 

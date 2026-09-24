@@ -130,6 +130,16 @@ def test_download_saves_under_canonical_name(site: Site, pdfs: Path) -> None:
     json.dumps(result.to_dict())
 
 
+def test_download_extraordinary_page_cve(site: Site, pdfs: Path) -> None:
+    site.pdf("BOME-PX-2021-362", PAGE_PDF)
+    with site.client() as client:
+        result = descargar_pdf(client, "bome-px-2021-362")
+    assert result.cve == "BOME-PX-2021-362"
+    assert result.ruta == str(pdfs / "BOME-PX-2021-362.pdf")
+    assert result.url == f"{BASE}/bome/descargar/BOME-PX-2021-362.pdf"
+    assert sorted(p.name for p in pdfs.iterdir()) == ["BOME-PX-2021-362.pdf"]
+
+
 def test_download_reuses_cache_unless_refresh(site: Site, pdfs: Path) -> None:
     site.pdf("BOME-A-2026-1050", ARTICLE_PDF)
     with site.client() as client:

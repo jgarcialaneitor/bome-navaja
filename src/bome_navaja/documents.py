@@ -335,7 +335,7 @@ def _atomic_write(target: Path, data: bytes) -> None:
 
 
 def descargar_pdf(client: BomeClient, cve: str | Cve, *, refrescar: bool = False) -> DescargaPdf:
-    """Download the PDF of any CVE (B, BX, A, AX, S, SX, P) into the local cache.
+    """Download the PDF of any CVE (B, BX, A, AX, S, SX, P, PX) into the local cache.
 
     The file is ``pdf_dir()/{canonical CVE}.pdf``: its name comes only from
     the parsed CVE, so no caller or server text reaches the path, and the
