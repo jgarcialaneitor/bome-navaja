@@ -79,8 +79,8 @@ HASTA_POR_DEFECTO: Final = date(2017, 12, 31)
 
 _CAPPED_MESSAGE = (
     "per-run limit of {cap} bulletins reached: {left} bulletins of the old portal remain to be "
-    "indexed. Start the old-portal sync again later to continue; spreading the runs out is "
-    "gentler on melilla.es."
+    "indexed. Call sincronizar_indice(origen=\"melilla.es\") again later to continue; spreading "
+    "the runs out is gentler on melilla.es."
 )
 
 

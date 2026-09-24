@@ -573,6 +573,7 @@ def test_import_creates_no_client_and_no_index(data_dir: Path) -> None:
         assert srv._client is None
         assert srv._index is None
         assert srv._portal is None and srv._portal_guard is None
+        assert srv._sync_antiguo is None
         assert not data_dir.exists()
     finally:
         importlib.reload(srv)
@@ -930,6 +931,7 @@ class OldPortal:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.guards: list[GuardiaSitio] = []
+        self.paces: list[dict[str, float]] = []
         self.lock = threading.Lock()
         self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {}
         for key, name in {
@@ -959,8 +961,10 @@ class OldPortal:
     def seccions(self) -> list[str]:
         return [r.url.params.get("seccion") or r.url.path for r in self.requests]
 
-    def factory(self, *, guard: GuardiaSitio) -> PortalAntiguo:
+    def factory(self, *, guard: GuardiaSitio, **pace: float) -> PortalAntiguo:
+        """Records the requested pace (empty for the interactive portal) but never waits."""
         self.guards.append(guard)
+        self.paces.append(pace)
         return PortalAntiguo(transport=httpx.MockTransport(self), guard=guard, polite_delay=0, jitter=0)
 
 
@@ -1303,3 +1307,259 @@ def test_old_portal_tools_are_documented_for_the_model() -> None:
     text = srv.server.instructions or ""
     for needle in ("buscar_bome_antiguo", "ver_bome_antiguo", "melilla.es", "bomemelilla.es", "2018"):
         assert needle in text, needle
+
+
+# --------------------------------------------------------------------------- old-portal index (old-portal-index task 3)
+
+
+def old_catalog_page(years: dict[int, list[tuple[int, str]]]) -> bytes:
+    """A catalog page shaped like the real one: one accordion set per year."""
+    sets = "".join(
+        f'<div class="set set{i}"><div class="title"><img src="resid/1/img/{year}.jpg"/></div>'
+        '<div class="content"><div class="cBome"><div class="c45">'
+        '<div class="listado1"><a href="">Mes</a></div><div class="listado2"><ul class="menu">'
+        + "".join(
+            '<li><a href="contenedor.jsp?seccion=ficha_bome.jsp&amp;dboidboletin='
+            f'{dboid}&amp;codResi=1&amp;language=es&amp;codAdirecto=15">{text}</a></li>'
+            for dboid, text in links
+        )
+        + "</ul></div></div></div></div></div>"
+        for i, (year, links) in enumerate(years.items(), start=1)
+    )
+    html = (
+        '<html><body><div class="bandaNo"><div id="accordion3" class="accordionWrapper">'
+        f"{sets}</div></div></body></html>"
+    )
+    return html.encode("latin-1")
+
+
+OLD_INDEX_CATALOG = old_catalog_page(
+    {
+        2018: [(300001, "nº 5520 / 02-01-2018")],
+        1999: [(276000, "nº 3660 / 30-12-1999")],
+        1991: [(278000, "nº 3175 / 26-12-1991")],
+        1986: [(279997, "nº 2899 / 25-12-1986")],
+    }
+)
+"""Four bulletins: 2018 and 1986 fall outside the old-portal sync's default range."""
+
+OLD_INDEX_FICHAS = {
+    300001: "ficha_5302.html",
+    276000: "ficha_1999_3660.html",
+    278000: "ficha_1991_3175.html",
+    279997: "ficha_1986_2899.html",
+}
+
+
+def _latin1(body: bytes) -> httpx.Response:
+    return httpx.Response(200, content=body, headers={"content-type": "text/html;charset=ISO-8859-1"})
+
+
+@pytest.fixture
+def old_index(old: OldPortal, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch) -> OldPortal:
+    """The old portal with a small catalog and one ficha per dboid; its sync never sleeps."""
+    from bome_navaja.sync_antiguo import SincronizadorPortalAntiguo
+
+    monkeypatch.setattr(
+        srv, "SincronizadorPortalAntiguo", functools.partial(SincronizadorPortalAntiguo, wait=fake_time.wait)
+    )
+    old.routes["bome.jsp"] = lambda request: _latin1(OLD_INDEX_CATALOG)
+    fichas = {dboid: (ANTIGUO / name).read_bytes() for dboid, name in OLD_INDEX_FICHAS.items()}
+
+    def ficha(request: httpx.Request) -> httpx.Response:
+        body = fichas.get(int(request.url.params["dboidboletin"]))
+        return _latin1(body) if body is not None else httpx.Response(404)
+
+    old.routes["ficha_bome.jsp"] = ficha
+    return old
+
+
+def fichas_pedidas(old: OldPortal) -> list[int]:
+    return [int(r.url.params["dboidboletin"]) for r in old.requests if r.url.params.get("seccion") == "ficha_bome.jsp"]
+
+
+def test_sincronizar_indice_syncs_the_old_portal_with_its_defaults(site: Site, old_index: OldPortal) -> None:
+    started = ok(srv.sincronizar_indice(origen="melilla.es"))
+    assert (started["estado"], started["origen"]) == ("en_curso", "melilla.es")
+    assert (started["desde"], started["hasta"]) == ("1991-01-01", "2017-12-31")
+    assert started["limite_boletines"] == 250
+    sync = srv._get_sync_antiguo()
+    assert sync is srv._get_sync_antiguo()  # one per process
+    assert sync.esperar(10)
+    assert fichas_pedidas(old_index) == [276000, 278000]  # newest first; 2018 and 1986 out of range
+    assert site.requests == []  # bomemelilla.es is not touched
+    assert srv._sync is None
+    guard = srv._get_portal_guard()
+    assert sync.guard is guard
+    assert old_index.guards == [guard]
+    assert old_index.paces == [{"polite_delay": 2.0, "jitter": 1.0}]  # the sync pace, not the interactive one
+    state = ok(srv.estado_indice())
+    job = state["sincronizacion"]
+    assert (job["estado"], job["origen"]) == ("completado", "melilla.es")
+    assert (job["total_planificado"], job["indexados"]) == (2, 2)
+    indice = state["indice"]
+    assert indice["por_origen"]["melilla.es"]["boletines"]["indexado"] == 2
+    assert indice["por_origen"]["bomemelilla.es"]["boletines"]["total"] == 0
+    assert indice["ultimas_sincronizaciones"]["melilla.es"]["origen"] == "melilla.es"
+    assert indice["ultimas_sincronizaciones"]["bomemelilla.es"] is None
+
+
+def test_the_old_portal_sync_takes_the_tool_arguments_and_the_env_overrides(
+    site: Site, old_index: OldPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "3")
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_MAX_BOLETINES", "1")
+    started = ok(srv.sincronizar_indice(origen="melilla.es", reindexar_recientes_dias=3))  # ignored
+    assert started["limite_boletines"] == 1
+    assert srv._get_sync_antiguo().esperar(10)
+    assert old_index.paces == [{"polite_delay": 3.0, "jitter": 1.0}]
+    state = ok(srv.estado_indice())["sincronizacion"]
+    assert (state["total_planificado"], state["pendientes_tras_limite"]) == (1, 1)
+    assert 'sincronizar_indice(origen="melilla.es")' in state["mensaje"]
+    assert fichas_pedidas(old_index) == [276000]
+    old_index.requests.clear()
+    ok(srv.sincronizar_indice(origen="melilla.es", desde="1986-01-01", hasta="1991-12-31", max_boletines=5))
+    assert srv._get_sync_antiguo().esperar(10)
+    assert fichas_pedidas(old_index) == [278000, 279997]
+
+
+@pytest.mark.parametrize("origen", ["boe.es", "", "MELILLA", None, 1])
+def test_sincronizar_indice_rejects_an_unknown_origen(site: Site, data_dir: Path, origen: object) -> None:
+    result = fail(srv.sincronizar_indice(origen=origen), "argumento_invalido")  # type: ignore[arg-type]
+    assert "bomemelilla.es" in result["error"] and "melilla.es" in result["error"]
+    assert site.requests == []
+    assert not (data_dir / "sumarios.sqlite3").exists()
+
+
+def test_the_old_portal_sync_validates_its_arguments(site: Site, old_index: OldPortal) -> None:
+    fail(srv.sincronizar_indice(origen="melilla.es", desde="ayer"), "argumento_invalido")
+    fail(srv.sincronizar_indice(origen="melilla.es", max_boletines=0), "busqueda_invalida")
+    fail(srv.sincronizar_indice(origen="melilla.es", desde="2000-01-01", hasta="1999-01-01"), "busqueda_invalida")
+    assert old_index.requests == []
+
+
+def test_a_running_bomemelilla_sync_keeps_the_old_portal_sync_out(site: Site, old_index: OldPortal) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    body = (FIXTURES / "b6416.html").read_bytes()
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        release.wait(10)
+        return httpx.Response(200, content=body)
+
+    site.routes["/bome/BOME-B-2026-6416"] = slow
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    try:
+        assert entered.wait(10)
+        refused = ok(srv.sincronizar_indice(origen="melilla.es"))
+        assert refused["estado"] == "en_curso_en_otro_proceso"
+        assert refused["origen"] == "melilla.es" and refused["lease"]["origen"] == "bomemelilla.es"
+        assert srv._get_sync_antiguo().owner != srv._get_sync().owner
+        running = ok(srv.estado_indice())["sincronizacion"]
+        assert (running["estado"], running["origen"]) == ("en_curso", "bomemelilla.es")
+        cancelled = ok(srv.cancelar_sincronizacion())
+        assert (cancelled["estado"], cancelled["origen"]) == ("en_curso", "bomemelilla.es")
+    finally:
+        release.set()
+    assert srv._get_sync().esperar(10)
+    assert old_index.requests == []
+    last = ok(srv.estado_indice())["sincronizacion"]
+    assert (last["estado"], last["origen"]) == ("cancelado", "bomemelilla.es")
+
+
+def test_a_running_old_portal_sync_keeps_the_bomemelilla_sync_out(site: Site, old_index: OldPortal) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    ficha = old_index.routes["ficha_bome.jsp"]
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        release.wait(10)
+        return ficha(request)
+
+    old_index.routes["ficha_bome.jsp"] = slow
+    ok(srv.sincronizar_indice(origen="melilla.es"))
+    try:
+        assert entered.wait(10)
+        again = ok(srv.sincronizar_indice(origen="melilla.es"))
+        assert (again["estado"], again["origen"]) == ("en_curso", "melilla.es")
+        refused = ok(srv.sincronizar_indice())
+        assert refused["estado"] == "en_curso_en_otro_proceso"
+        assert refused["origen"] == "bomemelilla.es" and refused["lease"]["origen"] == "melilla.es"
+        running = ok(srv.estado_indice())
+        assert (running["sincronizacion"]["estado"], running["sincronizacion"]["origen"]) == ("en_curso", "melilla.es")
+        assert running["indice"]["sincronizacion_en_curso"]["origen"] == "melilla.es"
+        assert "parcial" in ok(srv.buscar_en_indice("suscripciones"))["aviso"]
+        cancelled = ok(srv.cancelar_sincronizacion())
+        assert (cancelled["estado"], cancelled["origen"]) == ("en_curso", "melilla.es")
+    finally:
+        release.set()
+    assert srv._get_sync_antiguo().esperar(10)
+    assert site.requests == []
+    assert fichas_pedidas(old_index) == [276000]  # cancelled after the bulletin in flight
+    last = ok(srv.estado_indice())["sincronizacion"]
+    assert (last["estado"], last["origen"]) == ("cancelado", "melilla.es")
+    # Once the lease is free, the other origin may sync.
+    assert ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30"))["estado"] == "en_curso"
+    assert srv._get_sync().esperar(10)
+    assert ok(srv.estado_indice())["sincronizacion"]["origen"] == "bomemelilla.es"
+
+
+def test_cancelar_sincronizacion_without_any_sync(site: Site) -> None:
+    assert ok(srv.cancelar_sincronizacion())["estado"] == "inactivo"
+
+
+def test_buscar_en_indice_finds_old_portal_articles(site: Site, old_index: OldPortal) -> None:
+    ok(srv.sincronizar_indice(origen="melilla.es"))
+    assert srv._get_sync_antiguo().esperar(10)
+    found = ok(srv.buscar_en_indice("suscripciones"))
+    assert found["total"] == 1
+    (article,) = found["articulos"]
+    assert article["origen"] == "melilla.es"
+    assert article["bome_cve"] == "BOME-B-1999-3660" and article["bome_fecha"].startswith("1999-")
+    assert article["url"].startswith("https://www.melilla.es/melillaPortal/") and "276000" in article["url"]
+    assert article["pdf_url"].startswith("https://www.melilla.es/mandar.php/")
+    cobertura = found["cobertura"]
+    assert cobertura["por_origen"]["melilla.es"]["boletines_indexados"] == 2
+    assert cobertura["fecha_min"].startswith("1991-")
+    assert "vacío" not in (found.get("aviso") or "")
+
+
+def test_close_shared_state_forgets_the_old_portal_sync(site: Site, old_index: OldPortal) -> None:
+    ok(srv.sincronizar_indice(origen="melilla.es", max_boletines=1))
+    sync = srv._get_sync_antiguo()
+    srv.close_shared_state()
+    assert srv._sync_antiguo is None
+    assert sync.esperar(0)
+    assert srv._get_sync_antiguo() is not sync
+
+
+def test_estado_servidor_reports_the_old_portal_sync_pace(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result = ok(srv.estado_servidor())
+    assert result["cortesia_sincronizacion_portal_antiguo"] == {
+        "pausa_segundos": 2.0,
+        "variacion_segundos": 1.0,
+        "max_boletines_por_ejecucion": 250,
+    }
+    monkeypatch.setenv("BOME_NAVAJA_SYNC_DELAY", "4")
+    pace = ok(srv.estado_servidor())["cortesia_sincronizacion_portal_antiguo"]
+    assert pace["pausa_segundos"] == 4.0
+    assert not data_dir.exists()
+
+
+def test_the_old_portal_index_is_documented_for_the_model() -> None:
+    tools = tools_by_name()
+    sync = tools["sincronizar_indice"].description
+    for needle in ("origen", '"melilla.es"', "1991-01-01", "2017-12-31", "reindexar_recientes_dias", "una a la vez"):
+        assert needle in sync, needle
+    search = tools["buscar_en_indice"].description
+    for needle in ("melilla.es", "1991", "2017", "origen", "pdf_url", "ficha"):
+        assert needle in search, needle
+    state = tools["estado_indice"].description
+    for needle in ("por_origen", "ultimas_sincronizaciones", "origen"):
+        assert needle in state, needle
+    assert "cualquiera" in tools["cancelar_sincronizacion"].description
+    assert "cortesia_sincronizacion_portal_antiguo" in tools["estado_servidor"].description
+    text = srv.server.instructions or ""
+    assert 'sincronizar_indice(origen="melilla.es")' in text and "1991" in text

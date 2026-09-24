@@ -27,4 +27,5 @@ portal is a frozen legacy site that may disappear.
       Verified: `790 passed, 18 skipped`. Shared run loop extracted to `SincronizadorBase`
       (sync.py); `SincronizadorPortalAntiguo` in sync_antiguo.py; lease and last-sync summary
       record the origin.
-- [ ] 3. Tools, README, manifest, version 0.0.4.
+- [x] 3. Tools, README, manifest, version 0.0.4. Verified: `806 passed, 18 skipped`.
+      `sincronizar_indice(origen="melilla.es")`; 19 tools unchanged in number.

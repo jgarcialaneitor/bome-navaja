@@ -82,3 +82,25 @@ def test_the_old_portal_section_states_the_robots_policy_and_its_files() -> None
     ):
         assert needle in section, needle
     assert "MCP-19%20herramientas" in README and "17 herramientas" not in README
+
+
+def test_the_old_portal_index_is_documented() -> None:
+    index = README.split("## \U0001f4c7 \u00cdndice local de sumarios", 1)[1].split("\n## ", 1)[0]
+    assert "### Indexar el portal antiguo (melilla.es)" in index
+    for needle in (
+        'origen="melilla.es"',
+        "1991",
+        "2017",
+        "250 boletines",
+        "`origen`",
+        "`por_origen`",
+        "`ultimas_sincronizaciones`",
+        "en_curso_en_otro_proceso",
+        "gana bomemelilla.es",
+        "2014\u20132016",
+    ):
+        assert needle in index, needle
+    portal = README.split("## \U0001f3db\ufe0f Portal antiguo (melilla.es)", 1)[1].split("\n## ", 1)[0]
+    assert "0.0.4" in portal and "en masa" in portal and "Los PDF nunca se recorren en masa" in portal
+    limits = README.split("Limitaciones conocidas", 2)[2]
+    assert "no incluye el portal antiguo" not in limits
