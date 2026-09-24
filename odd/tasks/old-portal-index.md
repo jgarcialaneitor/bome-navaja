@@ -55,3 +55,15 @@ portal is a frozen legacy site that may disappear.
       lookup (2 not 3: a failed lookup must leave room in the guard's 3-per-10-min budget for the
       explicit call its error suggests). Verified: `839 passed, 18 skipped`; live AX-2019-103 still OK.
       Commit `f1b990a`; native review `review-81fa7c9c20838b4f` approved and acknowledged.
+
+## Delivery
+
+- 2026-09-24 (user decision): [PR #4](https://github.com/jgarcialaneitor/bome-navaja/pull/4), CI green
+  on all 4 jobs, merged into `main` with a merge commit (`9d44d37`). Suite on `main`:
+  `839 passed, 18 skipped`.
+- Bundle built from `main`: `bome-navaja-0.0.4.mcpb` (136,296 bytes, sha256 `80b2be8b…b822`);
+  independent verify PASS (20 files byte-identical to `9d44d37`, 19 tools, version 0.0.4,
+  `sincronizar_indice` exposes `origen`, both site guards idle, no network). Release
+  [v0.0.4](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.4) tagged on `9d44d37`;
+  downloaded asset sha256 verified identical.
+- Not verified: install inside Claude Desktop; the old-portal sync against the real site.
