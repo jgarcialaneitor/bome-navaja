@@ -1095,6 +1095,32 @@ def test_roto_cannot_be_stored_directly(idx: SumarioIndex) -> None:
         idx.guardar_boletin(BROKEN, [], "roto")  # type: ignore[arg-type]
 
 
+def test_pending_counts_only_the_default_sync_range(filled: SumarioIndex) -> None:
+    # An index synced from 2014 by an earlier version keeps those calendar rows.
+    new = ref("BOME-B-2018-5500", date(2018, 1, 2))
+    new_error = ref("BOME-B-2026-6400", date(2026, 8, 1))
+    old = ref("BOME-B-2016-5300", date(2016, 5, 3))
+    old_error = ref("BOME-B-2017-5450", date(2017, 12, 29))
+    filled.registrar_calendario([B1, B2, BX, OLD, new, new_error, old, old_error])
+    filled.guardar_boletin(new_error, [], "error", error="boom")
+    filled.guardar_boletin(old_error, [], "error", error="boom")
+    state = filled.estado()
+    assert index_module.SYNC_DEFAULT_START == date(2018, 1, 1)
+    assert state.pendientes == 2  # 2018-5500 (never processed) and the 2026 error
+    assert state.pendientes_anteriores_2018 == 2  # reported, not hidden
+    cobertura = filled.buscar("cese").cobertura
+    assert (cobertura["pendientes"], cobertura["pendientes_anteriores_2018"]) == (2, 2)
+    assert state.to_dict()["pendientes_anteriores_2018"] == 2
+
+
+def test_the_first_day_of_2018_is_pending_and_the_last_of_2017_is_not(idx: SumarioIndex) -> None:
+    idx.registrar_calendario(
+        [ref("BOME-B-2017-5499", date(2017, 12, 31)), ref("BOME-B-2018-5500", date(2018, 1, 1))]
+    )
+    state = idx.estado()
+    assert (state.pendientes, state.pendientes_anteriores_2018) == (1, 1)
+
+
 def test_rotos_are_counted_and_are_not_pending_work(filled: SumarioIndex) -> None:
     other = ref("BOME-B-2026-6400", date(2026, 8, 1))
     filled.registrar_calendario([B1, B2, BX, OLD, BROKEN, other])
@@ -1186,7 +1212,8 @@ def test_v2_index_is_migrated_to_v3_in_place(tmp_path: Path) -> None:
         state = index.estado()
         assert state.boletines == {"indexado": 2, "sin_sumarios": 1, "error": 4, "roto": 2, "total": 9}
         assert state.articulos == 3
-        assert state.pendientes == 4
+        assert state.pendientes == 0  # the 4 remaining errors are all from 2017
+        assert state.pendientes_anteriores_2018 == 4
         assert state.ultima_sincronizacion == {"estado": "completado"}
         assert [a.numero for a in index.buscar("cese").articulos] == [3, 1]
         assert index.buscar("cese").cobertura["rotos"] == 2

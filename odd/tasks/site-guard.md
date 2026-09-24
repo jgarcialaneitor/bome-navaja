@@ -31,6 +31,24 @@ every `error` bulletin, including the known-broken ones.
 Out of scope: push, PR, merge, release (user decisions); User-Agent and `.mcpb` settings (user
 decision 2026-09-24: leave as they are).
 
+## Scope extension (user decision 2026-09-24: "todos los cambios nuevos a la 0.0.3")
+
+Field + recon evidence (Engram `bome-navaja/old-portal-recon`): bomemelilla.es is an incomplete
+migration for 2014-2017 (141 bulletins missing; the HTTP 500s concentrate there). The old portal
+https://www.melilla.es/melillaPortal/contenedor.jsp?seccion=bome.jsp (city hosting 195.57.65.8,
+https only: port 80 closed, its `http://` links must be rewritten) has the frozen catalog
+1985-01-03..2021-03-12 (3,261 bulletins, numbering identical to bomemelilla CVEs), a text search
+returning article-level sumarios with per-page PDF links, a bulletin "ficha" with the full
+consejería tree and a whole-bulletin PDF, and PDFs served by `mandar.php`.
+
+5. The sync starts at 2018-01-01 by default (earlier only with an explicit `desde`).
+6. Old-portal client: catalog (cached locally, it is frozen), search, ficha, PDFs; own site guard.
+7. Tools for the old portal, README, manifest.
+
+robots.txt of melilla.es disallows `ficha_bome.jsp` and `/mandar.php`. User decision 2026-09-24:
+ignore it for **on-demand** requests the user makes (ficha, PDF). Agent line, accepted by
+proceeding: no bulk crawling of those paths (no index sync from the old portal) in this release.
+
 ## Tasks
 
 - [x] 1. `PX` CVE kind. Verified: `515 passed, 16 skipped`. Commit `1294afc`; native review
@@ -49,3 +67,7 @@ decision 2026-09-24: leave as they are).
       processes erring at the same instant can go 1-2 over the budget (still under 5).
 - [x] 4. Server tools, README, version 0.0.3. Verified: `593 passed, 16 skipped`. Commit
       `3a06686`; native review `review-f3ca6064c6b4d09e` approved and acknowledged.
+- [x] 5. Sync default start 2018-01-01. Verified: `599 passed, 16 skipped`. Pre-2018 gaps are
+      reported apart as `pendientes_anteriores_2018`.
+- [ ] 6. Old-portal client + parsers + catalog cache + own guard.
+- [ ] 7. Old-portal tools, README, manifest.

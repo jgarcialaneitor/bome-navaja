@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -344,6 +345,43 @@ def test_sync_through_the_tools(site: Site, data_dir: Path) -> None:
     word = ok(srv.buscar_en_indice("rden", coincidencia="palabra"))
     assert word["total"] == 0
     assert ok(srv.cancelar_sincronizacion())["estado"] == "completado"
+
+
+def test_the_default_sync_starts_in_2018_and_older_gaps_are_reported_apart(
+    site: Site, data_dir: Path
+) -> None:
+    from bome_navaja.index import SumarioIndex
+    from bome_navaja.models import BulletinRef
+
+    ok(srv.sincronizar_indice(reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    calendar = next(r for r in site.requests if r.url.path == "/api/bomes/calendar")
+    assert calendar.url.params["start"] == "2018-01-01"
+    before = ok(srv.estado_indice())["indice"]
+    assert before["pendientes_anteriores_2018"] == 0
+    # A calendar row recorded by an earlier sync from 2014 is not pending work.
+    old = SumarioIndex(data_dir / "sumarios.sqlite3")
+    try:
+        old.registrar_calendario(
+            [BulletinRef("BOME-B-2016-5300", 5300, date(2016, 5, 3), False, f"{BASE}/bome/BOME-B-2016-5300")]
+        )
+    finally:
+        old.close()
+    after = ok(srv.estado_indice())["indice"]
+    assert after["pendientes"] == before["pendientes"]
+    assert after["pendientes_anteriores_2018"] == 1
+    cobertura = ok(srv.buscar_en_indice("relacion provisional"))["cobertura"]
+    assert (cobertura["pendientes"], cobertura["pendientes_anteriores_2018"]) == (before["pendientes"], 1)
+
+
+def test_the_tool_docs_explain_the_2018_default() -> None:
+    tools = tools_by_name()
+    sync = tools["sincronizar_indice"].description
+    assert "2018-01-01" in sync and "portal antiguo" in sync and "2014-01-01" not in sync
+    for name in ("estado_indice", "buscar_en_indice"):
+        assert "pendientes_anteriores_2018" in tools[name].description, name
+    text = srv.server.instructions or ""
+    assert "2018-01-01" in text and "portal antiguo" in text
 
 
 def test_buscar_en_indice_warns_while_a_sync_runs(site: Site, data_dir: Path) -> None:

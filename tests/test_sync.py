@@ -141,8 +141,8 @@ def test_full_run(site: Site, index: SumarioIndex) -> None:
     json.dumps(state.to_dict())
 
     calendar = next(u for u in site.requests if "/api/bomes/calendar" in u)
-    assert "start=2014-01-01" in calendar and "end=2026-09-23" in calendar
-    # Newest first.
+    assert "start=2018-01-01" in calendar and "end=2026-09-23" in calendar
+    # Newest first (the fake calendar ignores the range and still lists 2014).
     paths = site.bulletin_paths()
     assert paths[0] == "/bome/BOME-B-2026-6416"
     assert paths[-1] == "/bome/BOME-B-2014-5092"
@@ -199,6 +199,24 @@ def test_date_range_is_forwarded(site: Site, index: SumarioIndex) -> None:
     run(sync, desde="2026-09-01", hasta=date(2026, 9, 30))
     calendar = next(u for u in site.requests if "/api/bomes/calendar" in u)
     assert "start=2026-09-01" in calendar and "end=2026-09-30" in calendar
+
+
+def calendar_range(site: Site) -> tuple[str, str]:
+    calendar = httpx.URL(next(u for u in site.requests if "/api/bomes/calendar" in u))
+    return calendar.params["start"], calendar.params["end"]
+
+
+def test_the_default_range_starts_in_2018(site: Site, index: SumarioIndex) -> None:
+    assert sync_module.SYNC_DEFAULT_START == date(2018, 1, 1)
+    state = run(make_sync(index, site))
+    assert (state.desde, state.hasta) == ("2018-01-01", TODAY.isoformat())
+    assert calendar_range(site) == ("2018-01-01", TODAY.isoformat())
+
+
+def test_an_explicit_earlier_desde_is_honoured(site: Site, index: SumarioIndex) -> None:
+    state = run(make_sync(index, site), desde="2015-03-01")
+    assert state.desde == "2015-03-01"
+    assert calendar_range(site) == ("2015-03-01", TODAY.isoformat())
 
 
 def test_cancel_mid_run_and_second_start(site: Site, index: SumarioIndex) -> None:

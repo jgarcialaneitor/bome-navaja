@@ -95,6 +95,14 @@ MIN_SQLITE_VERSION = (3, 34, 0)
 
 TRIGRAM_MIN_CHARS = 3
 
+SYNC_DEFAULT_START = date(2018, 1, 1)
+"""First day a sync covers when no ``desde`` is given (re-exported by
+:mod:`bome_navaja.sync`). bomemelilla.es is an incomplete migration before 2018
+(missing bulletins, pages answering HTTP 500 that the firewall counts, sumarios
+only from late 2016), so older bulletins are left to the old melilla.es portal.
+Only calendar bulletins from this day on count as ``pendientes``; older ones not
+indexed are reported apart as ``pendientes_anteriores_2018``."""
+
 LEASE_STALE_SECONDS = 180.0
 """A sync lease whose heartbeat is older than this belongs to a dead process."""
 
@@ -289,9 +297,10 @@ class ResultadoIndice(JsonModel):
     siguiente: int | None
     """Offset of the next page, or ``None`` when this is the last one."""
     cobertura: dict[str, Any]
-    """Indexed range and count, pending and broken (``rotos``) bulletins, last
-    sync time and whether a sync is running: results only cover what has been
-    indexed so far."""
+    """Indexed range and count, pending (from :data:`SYNC_DEFAULT_START`, older
+    ones apart as ``pendientes_anteriores_2018``) and broken (``rotos``)
+    bulletins, last sync time and whether a sync is running: results only cover
+    what has been indexed so far."""
     nota: str
 
 
@@ -310,8 +319,13 @@ class EstadoIndice(JsonModel):
     calendario_conocidos: int
     """Bulletins known from the site calendar (recorded by the last sync)."""
     pendientes: int
-    """Calendar bulletins not indexed yet, or whose last attempt failed. Rotos
-    (``boletines["roto"]``) are not pending: normal syncs skip them."""
+    """Calendar bulletins dated from :data:`SYNC_DEFAULT_START` on (or undated)
+    not indexed yet, or whose last attempt failed. Rotos (``boletines["roto"]``)
+    are not pending: normal syncs skip them."""
+    pendientes_anteriores_2018: int
+    """Same count for calendar bulletins dated before :data:`SYNC_DEFAULT_START`
+    (recorded by syncs of older versions or with an explicit earlier ``desde``):
+    outside the default sync range, so not pending work, but not hidden."""
     ultima_sincronizacion: dict[str, Any] | None
     sincronizacion_en_curso: dict[str, Any] | None
     """Live sync lease (owner, heartbeat), or ``None``."""
@@ -965,16 +979,29 @@ class SumarioIndex:
             "fecha_min": row[1],
             "fecha_max": row[2],
             "pendientes": pending,
+            "pendientes_anteriores_2018": self._pending_before_default_start(),
             "rotos": self._broken(),
             "ultima_sincronizacion": (last or {}).get("finalizado"),
             "sincronizacion_en_curso": self.lease() is not None,
         }
 
+    _UNFINISHED_CALENDAR = (
+        "SELECT count(*) FROM calendar c LEFT JOIN bulletins b ON b.cve = c.cve "
+        "WHERE (b.cve IS NULL OR b.estado = 'error') AND "
+    )
+
     def _pending(self) -> int:
-        """Calendar bulletins never processed or whose last attempt failed (not rotos)."""
+        """Calendar bulletins from :data:`SYNC_DEFAULT_START` on (or undated) never
+        processed or whose last attempt failed (not rotos)."""
         return self._conn().execute(
-            "SELECT count(*) FROM calendar c LEFT JOIN bulletins b ON b.cve = c.cve "
-            "WHERE b.cve IS NULL OR b.estado = 'error'"
+            self._UNFINISHED_CALENDAR + "(c.date IS NULL OR c.date >= ?)",
+            (SYNC_DEFAULT_START.isoformat(),),
+        ).fetchone()[0]
+
+    def _pending_before_default_start(self) -> int:
+        """Like :meth:`_pending` for calendar bulletins dated before :data:`SYNC_DEFAULT_START`."""
+        return self._conn().execute(
+            self._UNFINISHED_CALENDAR + "c.date < ?", (SYNC_DEFAULT_START.isoformat(),)
         ).fetchone()[0]
 
     def _broken(self) -> int:
@@ -1155,6 +1182,7 @@ class SumarioIndex:
             fecha_max=date.fromisoformat(high) if high else None,
             calendario_conocidos=known,
             pendientes=self._pending(),
+            pendientes_anteriores_2018=self._pending_before_default_start(),
             ultima_sincronizacion=self._last_sync(),
             sincronizacion_en_curso=self.lease(),
         )
@@ -1227,6 +1255,7 @@ __all__ = [
     "ESTADOS_GUARDABLES",
     "ROTO_TRAS_FALLOS_5XX",
     "SCHEMA_VERSION",
+    "SYNC_DEFAULT_START",
     "ArticuloIndexado",
     "EstadoIndice",
     "ResultadoIndice",

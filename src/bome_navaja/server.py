@@ -97,7 +97,10 @@ Qué herramienta usar:
 - Explorar: listar_bomes (calendario), ver_bome (árbol de artículos), resolver_cve.
 - Índice local: sincronizar_indice (solo cuando haga falta; cada ejecución indexa como mucho
   250 boletines por defecto en ~15-20 min; el histórico completo necesita varias ejecuciones
-  espaciadas). Los boletines "rotos" (su página da error interno del sitio) se saltan;
+  espaciadas). Por defecto cubre 2018-01-01..hoy: antes de 2018 bomemelilla.es está incompleto
+  e inestable (faltan boletines y hay páginas rotas), y los boletines anteriores se consultan
+  mejor en el portal antiguo de melilla.es. Un 'desde' anterior es posible pero no
+  recomendable. Los boletines "rotos" (su página da error interno del sitio) se saltan;
   reintentar_rotos solo para comprobar si el sitio los arregló.
 
 Cortafuegos del sitio: bomemelilla.es bloquea la IP tras unas 5 respuestas de error, y
@@ -716,6 +719,10 @@ def buscar_en_indice(
     Requiere haber llamado antes a sincronizar_indice; si el índice está vacío devuelve 0
     resultados y un aviso (usa buscar_articulos mientras tanto). Mira 'cobertura' (rango
     indexado, pendientes, sincronización en curso) antes de afirmar que algo no existe.
+    La sincronización por defecto cubre desde 2018-01-01: 'pendientes' cuenta solo boletines
+    desde esa fecha y pendientes_anteriores_2018 los anteriores del calendario sin indexar
+    (bomemelilla.es está incompleto antes de 2018; esos boletines se consultan mejor en el
+    portal antiguo de melilla.es).
     coincidencia: "fragmento" (subcadena, como el sitio: "cese" encuentra "ceses" y
     "procese") o "palabra" (cada frase debe empezar una palabra: "cese" → cese, ceses, no
     procese). terminos=[{texto, operador: "y"|"o", modo: "contiene"|"no_contiene"}]; Y dentro
@@ -730,6 +737,7 @@ def buscar_en_indice(
             "fecha_min": None,
             "fecha_max": None,
             "pendientes": None,
+            "pendientes_anteriores_2018": None,
             "rotos": None,
             "ultima_sincronizacion": None,
             "sincronizacion_en_curso": False,
@@ -771,7 +779,10 @@ def estado_indice() -> dict:
     Devuelve boletines indexados / sin sumarios / con error / rotos (páginas que el sitio
     respondió con error interno dos veces; no cuentan como pendientes), artículos, rango de
     fechas, pendientes frente al calendario, última sincronización y el progreso de la actual
-    (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
+    (hechos, total_planificado, eta_segundos). 'pendientes' cuenta solo boletines desde
+    2018-01-01 (el inicio por defecto de sincronizar_indice); los anteriores del calendario sin
+    indexar (de sincronizaciones antiguas o con un 'desde' anterior) salen aparte en
+    pendientes_anteriores_2018 y no son trabajo pendiente. Úsalo para seguir una sincronización lanzada con sincronizar_indice.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
     nos bloqueó: 403/429/503 o dos peticiones seguidas sin respuesta; lo indexado se conserva y
     bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min: no vuelvas a
@@ -805,12 +816,16 @@ def sincronizar_indice(
     """Arranca en segundo plano la sincronización del índice local de sumarios y vuelve al
     instante.
 
-    Recorre el calendario (por defecto 2014-01-01..hoy) del más reciente al más antiguo:
+    Recorre el calendario (por defecto 2018-01-01..hoy) del más reciente al más antiguo:
     indexa los boletines que falten, re-indexa los de los últimos reindexar_recientes_dias
-    días y, si reintentar_errores, los que fallaron. Para no saturar el sitio va despacio
+    días y, si reintentar_errores, los que fallaron. Empieza en 2018 porque antes
+    bomemelilla.es está incompleto e inestable (faltan boletines y sus páginas rotas responden
+    HTTP 500, que el cortafuegos castiga) y apenas tiene texto buscable; los boletines
+    anteriores se consultan mejor en el portal antiguo de melilla.es. Un 'desde' anterior es
+    posible pero no recomendable. Para no saturar el sitio va despacio
     (~2-3 s entre peticiones) y cada ejecución indexa como mucho max_boletines boletines
-    (por defecto 250, los más recientes; ~15-20 minutos). El histórico completo desde 2014
-    (~1900 boletines) necesita varias ejecuciones: si el estado final trae
+    (por defecto 250, los más recientes; ~15-20 minutos). El rango por defecto
+    (~1100 boletines) necesita varias ejecuciones: si el estado final trae
     pendientes_tras_limite > 0, vuelve a llamarla más tarde (espaciar las ejecuciones es más
     amable con el sitio). Es reanudable: si se corta, la siguiente llamada continúa donde
     quedó. Sigue el progreso con estado_indice; mientras tanto

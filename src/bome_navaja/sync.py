@@ -2,7 +2,11 @@
 
 :class:`SincronizadorIndice` crawls the site politely in a daemon thread:
 
-1. Read the calendar for the range (default 2014-01-01..today) and record it.
+1. Read the calendar for the range (default :data:`SYNC_DEFAULT_START`, i.e.
+   2018-01-01, ..today) and record it. bomemelilla.es is an incomplete
+   migration before 2018 (missing bulletins, broken pages answering HTTP 500,
+   which is where the firewall bans come from), so older bulletins are only
+   crawled with an explicit earlier ``desde``.
 2. Plan the bulletins not indexed yet, those published in the last
    ``reindexar_recientes_dias`` days (late corrections) and, if asked, those
    whose last attempt failed. Bulletins marked ``roto`` (their page answered
@@ -91,7 +95,7 @@ from typing import Any, Literal, cast
 
 from .client import BomeClient
 from .guard import VENTANA_ERRORES_SEGUNDOS, GuardiaSitio
-from .index import LEASE_STALE_SECONDS, SumarioIndex, utc_iso
+from .index import LEASE_STALE_SECONDS, SYNC_DEFAULT_START, SumarioIndex, utc_iso
 from .models import (
     Article,
     BomeBlockedError,
@@ -102,7 +106,6 @@ from .models import (
     JsonModel,
 )
 from .search import (
-    FIRST_DATE,
     BusquedaInvalidaError,
     articulos_del_boletin,
 )
@@ -405,14 +408,15 @@ class SincronizadorIndice:
         """Start a background sync and return its status at once.
 
         At most ``max_boletines`` bulletins (default: the constructor's) are
-        indexed, the newest of the plan. ``reintentar_errores`` replans failed
-        bulletins; ``roto`` ones are only replanned with ``reintentar_rotos``
+        indexed, the newest of the plan. Without ``desde`` the range starts at
+        :data:`SYNC_DEFAULT_START`; an earlier ``desde`` is honoured.
+        ``reintentar_errores`` replans failed bulletins; ``roto`` ones are only replanned with ``reintentar_rotos``
         (each costs an HTTP 500 that the site's firewall counts). While a sync of this object runs,
         returns that job. When another
         process holds a live lease, returns ``en_curso_en_otro_proceso`` with
         the lease and starts nothing.
         """
-        start = _date(desde, "desde") or FIRST_DATE
+        start = _date(desde, "desde") or SYNC_DEFAULT_START
         end = _date(hasta, "hasta") or self._today()
         if end < start:
             raise BusquedaInvalidaError(f"'hasta' ({end}) is before 'desde' ({start})")
@@ -773,6 +777,7 @@ __all__ = [
     "PAUSA_TRAS_ERROR_MAX_SEGUNDOS",
     "PAUSA_TRAS_ERROR_MIN_SEGUNDOS",
     "SYNC_JITTER",
+    "SYNC_DEFAULT_START",
     "SYNC_POLITE_DELAY",
     "EstadoSincronizacion",
     "SincronizadorIndice",
