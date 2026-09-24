@@ -35,3 +35,9 @@ portal is a frozen legacy site that may disappear.
 - [x] 3. Tools, README, manifest, version 0.0.4. Verified: `806 passed, 18 skipped`.
       `sincronizar_indice(origen="melilla.es")`; 19 tools unchanged in number. Commit `409be1f`;
       native review `review-89159e3cdf044087` approved (4 lenses) and acknowledged.
+- [ ] 4. Bug (user report 2026-09-24): `leer_articulo("BOME-AX-2019-103")` returned the ORDINARY
+      article 103 (a grant call instead of the decree). Root cause verified live: the site's resolver
+      `/buscar-cve` drops the X for AX and PX — `BOME-AX-2019-103` → `/bome/BOME-B-2019-5625/articulo/103`,
+      `BOME-PX-2021-362` → `/bome/BOME-B-2021-5839/articulo/170#pagina-362`; BX and SX resolve
+      correctly. Fix: never trust the resolver for extraordinary article/page CVEs, resolve AX
+      ourselves, and verify every fetched article's own CVE.
