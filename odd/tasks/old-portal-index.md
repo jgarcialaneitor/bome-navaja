@@ -43,4 +43,6 @@ portal is a frozen legacy site that may disappear.
       ourselves, and verify every fetched article's own CVE.
       Verified: `831 passed, 18 skipped`; live 2026-09-24: `leer_articulo("BOME-AX-2019-103")` →
       BOME-BX-2019-28 art. 103, Decreto nº 293 (personal eventual), ~4 s; `resolver_cve` AX → BX URL,
-      PX → PDF URL with a note.
+      PX → PDF URL with a note. Commit `87d1129`; native review `review-d8cd303051b078b4` approved
+      (4 lenses) and acknowledged. Follow-up (advisory, documents.py:748): an extraordinary bulletin
+      whose page lists no articles is skipped by the search, so an article hidden in it is not found.
