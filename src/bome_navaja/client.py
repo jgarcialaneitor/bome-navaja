@@ -16,10 +16,12 @@ Endpoint map (read-only reconnaissance, 2026-09-23):
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
@@ -38,6 +40,7 @@ from .cve import (
 )
 from .models import (
     Article,
+    BomeBlockedError,
     BomeDocumentTooLargeError,
     BomeError,
     BomeHTTPError,
@@ -60,6 +63,7 @@ from .parsers import (
 )
 
 __all__ = [
+    "BomeBlockedError",
     "BomeClient",
     "BomeError",
     "BomeHTTPError",
@@ -88,11 +92,60 @@ def _today() -> date:
     return date.today()
 
 
+def _now() -> datetime:
+    """Current UTC time; a seam so tests can pin ``Retry-After`` dates."""
+    return datetime.now(UTC)
+
+
+# Answers meaning "the site is refusing us" (rate limit, WAF, overload), not
+# "this document is broken": bulk callers must stop on them.
+_BLOCKING_STATUSES = frozenset({403, 429, 503})
+
+
+def _retry_after(value: str | None) -> float | None:
+    """Seconds from a ``Retry-After`` header (delta-seconds or HTTP-date).
+
+    Absent or unparsable values give ``None``; negative values and dates in
+    the past give ``0.0``.
+    """
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        pass
+    else:
+        return max(seconds, 0.0) if math.isfinite(seconds) else None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - _now()).total_seconds(), 0.0)
+
+
 def _raise_for_status(response: httpx.Response) -> None:
-    """Map 404 to :class:`BomeNotFoundError` and other 4xx/5xx to :class:`BomeHTTPError`."""
+    """Map HTTP failures to ``BomeError``.
+
+    404 is :class:`BomeNotFoundError`; 403, 429 and 503 are
+    :class:`BomeBlockedError` (with ``Retry-After`` parsed); any other 4xx/5xx
+    is :class:`BomeHTTPError`.
+    """
     final_url = str(response.url)
     if response.status_code == 404:
         raise BomeNotFoundError(f"not found: {final_url}", status=404, url=final_url)
+    if response.status_code in _BLOCKING_STATUSES:
+        retry_after = _retry_after(response.headers.get("retry-after"))
+        hint = f"; Retry-After {retry_after:g} s" if retry_after is not None else ""
+        raise BomeBlockedError(
+            f"HTTP {response.status_code} for {final_url}: the site is refusing requests "
+            f"(rate limit or firewall){hint}",
+            status=response.status_code,
+            url=final_url,
+            retry_after=retry_after,
+        )
     if response.status_code >= 400:
         raise BomeHTTPError(
             f"HTTP {response.status_code} for {final_url}",

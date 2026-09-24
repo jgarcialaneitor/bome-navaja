@@ -385,6 +385,24 @@ def test_500_is_error_http(site: Site) -> None:
     site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(500)
     result = fail(srv.ver_bome("BOME-B-2026-6416"), "error_http")
     assert result["estado_http"] == 500
+    assert "reintentar_tras_segundos" not in result
+
+
+def test_blocking_answer_is_sitio_bloqueando(site: Site) -> None:
+    site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(
+        429, headers={"retry-after": "120"}
+    )
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
+    assert result["estado_http"] == 429
+    assert result["reintentar_tras_segundos"] == 120.0
+    assert "espera" in result["error"].lower()
+
+
+def test_blocked_drill_down_is_sitio_bloqueando(site: Site) -> None:
+    site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(403)
+    result = fail(srv.buscar_articulos(texto="relacion provisional"), "sitio_bloqueando")
+    assert result["estado_http"] == 403
+    assert result["reintentar_tras_segundos"] is None
 
 
 @pytest.mark.parametrize(

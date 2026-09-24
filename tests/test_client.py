@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import httpx
@@ -13,6 +13,7 @@ from bome_navaja import client as client_module
 from bome_navaja.client import BomeClient
 from bome_navaja.cve import InvalidCveError
 from bome_navaja.models import (
+    BomeBlockedError,
     BomeError,
     BomeHTTPError,
     BomeNotFoundError,
@@ -314,8 +315,66 @@ def test_500_raises_http_error(recorder: Recorder) -> None:
     with recorder.client() as bome, pytest.raises(BomeHTTPError) as info:
         bome.bulletin("BOME-B-2026-6416")
     assert not isinstance(info.value, BomeNotFoundError)
+    assert not isinstance(info.value, BomeBlockedError)
     assert info.value.status == 500
     assert isinstance(info.value, BomeError)
+
+
+@pytest.mark.parametrize("status", [403, 429, 503])
+def test_blocking_statuses_raise_blocked_error(recorder: Recorder, status: int) -> None:
+    recorder.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(status)
+    with recorder.client() as bome, pytest.raises(BomeBlockedError) as info:
+        bome.bulletin("BOME-B-2026-6416")
+    assert isinstance(info.value, BomeHTTPError)
+    assert not isinstance(info.value, BomeNotFoundError)
+    assert info.value.status == status
+    assert info.value.url == f"{BASE}/bome/BOME-B-2026-6416"
+    assert info.value.retry_after is None
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("120", 120.0),
+        (" 7 ", 7.0),
+        ("-5", 0.0),
+        ("Thu, 24 Sep 2026 10:01:30 GMT", 90.0),
+        ("Thu, 24 Sep 2026 09:00:00 GMT", 0.0),  # already in the past
+        ("soon", None),
+        ("", None),
+        ("nan", None),
+    ],
+)
+def test_blocked_error_parses_retry_after(
+    recorder: Recorder, monkeypatch: pytest.MonkeyPatch, header: str, expected: float | None
+) -> None:
+    monkeypatch.setattr(client_module, "_now", lambda: datetime(2026, 9, 24, 10, 0, 0, tzinfo=UTC))
+    recorder.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(
+        429, headers={"retry-after": header}
+    )
+    with recorder.client() as bome, pytest.raises(BomeBlockedError) as info:
+        bome.bulletin("BOME-B-2026-6416")
+    if expected is None:
+        assert info.value.retry_after is None
+    else:
+        assert info.value.retry_after == pytest.approx(expected)
+
+
+def test_download_blocked_raises_blocked_error(recorder: Recorder) -> None:
+    recorder.routes["/bome/descargar/BOME-P-2026-4784.pdf"] = lambda request: httpx.Response(
+        503, headers={"retry-after": "30"}, content=b"<html>busy</html>"
+    )
+    with recorder.client() as bome, pytest.raises(BomeBlockedError) as info:
+        bome.download("BOME-P-2026-4784")
+    assert info.value.status == 503
+    assert info.value.retry_after == 30.0
+    assert info.value.url == f"{BASE}/bome/descargar/BOME-P-2026-4784.pdf"
+
+
+def test_download_404_stays_not_found(recorder: Recorder) -> None:
+    with recorder.client() as bome, pytest.raises(BomeNotFoundError) as info:
+        bome.download("BOME-P-2026-4784")
+    assert not isinstance(info.value, BomeBlockedError)
 
 
 def test_empty_page_raises_not_found(recorder: Recorder) -> None:

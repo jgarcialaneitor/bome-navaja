@@ -47,6 +47,7 @@ from .documents import leer_boletin as _leer_boletin
 from .documents import leer_pdf as _leer_pdf
 from .index import SumarioIndex
 from .models import (
+    BomeBlockedError,
     BomeDocumentTooLargeError,
     BomeError,
     BomeHTTPError,
@@ -230,6 +231,13 @@ _ERRORS: tuple[tuple[type[BaseException], str, str], ...] = (
     (BomeIndexUnavailableError, "indice_no_disponible", "El índice local no está disponible"),
     (BomeDocumentTooLargeError, "documento_demasiado_grande", "El documento supera el límite de tamaño"),
     (BomeStorageError, "error_almacenamiento", "Error de almacenamiento local"),
+    (
+        BomeBlockedError,
+        "sitio_bloqueando",
+        "bomemelilla.es está rechazando nuestras peticiones (límite de peticiones o "
+        "cortafuegos); espera varios minutos antes de reintentar y no repitas la llamada "
+        "en bucle",
+    ),
     (BomeNotFoundError, "no_encontrado", "No existe en bomemelilla.es"),
     (BomeHTTPError, "error_http", "bomemelilla.es no respondió correctamente"),
     (BomeParseError, "error_formato", "La respuesta del sitio no tiene el formato esperado"),
@@ -245,6 +253,8 @@ def error_result(exc: BaseException) -> dict[str, Any]:
             if isinstance(exc, BomeHTTPError):
                 result["estado_http"] = exc.status
                 result["url"] = exc.url
+            if isinstance(exc, BomeBlockedError):
+                result["reintentar_tras_segundos"] = exc.retry_after
             return result
     raise TypeError(f"not a BomeError: {exc!r}")
 

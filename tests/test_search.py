@@ -511,6 +511,48 @@ def test_failing_hidden_article_is_recorded(site: Site, fixtures_dir: Path) -> N
     assert error.error_code == "no_encontrado"
 
 
+def test_blocked_bulletin_stops_drill_down(site: Site) -> None:
+    from bome_navaja.models import BomeBlockedError
+
+    site.paged([[B6416, BX41], [B5092]])
+    site.bulletins["BOME-BX-2026-41"] = lambda: httpx.Response(429, headers={"retry-after": "60"})
+    with site.client() as client, pytest.raises(BomeBlockedError) as info:
+        buscar_articulos(client, texto="relacion provisional")
+    assert info.value.retry_after == 60.0
+    # Nothing is requested after the site starts refusing.
+    assert site.bulletin_paths() == ["/bome/BOME-B-2026-6416", "/bome/BOME-BX-2026-41"]
+    assert len(site.search_requests()) == 1
+
+
+def test_blocked_hidden_article_stops_drill_down(site: Site, fixtures_dir: Path) -> None:
+    from bome_navaja.models import BomeBlockedError
+
+    html = _without_article((fixtures_dir / "b6416.html").read_text("utf-8"), "BOME-A-2026-1056")
+    site.bulletins["BOME-B-2026-6416"] = lambda: httpx.Response(200, text=html)
+    site.bulletins["BOME-B-2026-6416/articulo/1056"] = lambda: httpx.Response(403)
+    site.paged([[B6416, BX41]])
+    with site.client() as client, pytest.raises(BomeBlockedError) as info:
+        buscar_articulos(client, texto="relacion provisional")
+    assert info.value.status == 403
+    assert "/bome/BOME-BX-2026-41" not in site.bulletin_paths()
+
+
+def test_blocked_later_search_page_propagates(site: Site) -> None:
+    from bome_navaja.models import BomeBlockedError
+
+    site.paged([[B6416, BX41], [B5092]])
+
+    def search(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        if page == 2:
+            return httpx.Response(503)
+        return httpx.Response(200, text=site.search_pages[page])
+
+    site.search_handler = search
+    with site.client() as client, pytest.raises(BomeBlockedError):
+        buscar_articulos(client, texto="relacion provisional")
+
+
 def test_first_search_page_failure_propagates(site: Site) -> None:
     site.search_handler = lambda request: httpx.Response(500)
     from bome_navaja.models import BomeHTTPError
@@ -552,3 +594,18 @@ def test_articulos_del_boletin_fetches_hidden_articles(site: Site, fixtures_dir:
     assert hidden.listado_en_bome is False
     (error,) = errors
     assert (error.etapa, error.cve, error.error_code) == ("articulo", "BOME-A-2026-1056", "no_encontrado")
+
+
+def test_articulos_del_boletin_propagates_blocking(site: Site, fixtures_dir: Path) -> None:
+    from bome_navaja.models import BomeBlockedError
+    from bome_navaja.parsers import parse_bulletin_page
+    from bome_navaja.search import articulos_del_boletin
+
+    html = _without_article((fixtures_dir / "b6416.html").read_text("utf-8"), "BOME-A-2026-1051")
+    html = _without_article(html, "BOME-A-2026-1056")
+    bulletin = parse_bulletin_page(html, "BOME-B-2026-6416")
+    site.bulletins["BOME-B-2026-6416/articulo/1051"] = lambda: httpx.Response(429)
+    with site.client() as client, pytest.raises(BomeBlockedError):
+        articulos_del_boletin(client, bulletin)
+    # The second hidden article is never requested once the site refuses.
+    assert site.bulletin_paths() == ["/bome/BOME-B-2026-6416/articulo/1051"]

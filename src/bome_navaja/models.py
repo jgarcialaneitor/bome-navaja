@@ -41,6 +41,21 @@ class BomeNotFoundError(BomeHTTPError):
     """The requested document does not exist (404 or an empty page)."""
 
 
+class BomeBlockedError(BomeHTTPError):
+    """The site is refusing our requests: rate-limited or firewalled (403/429/503).
+
+    Callers doing bulk work must stop instead of recording it as one more
+    per-document failure, and wait before asking again.
+    """
+
+    def __init__(
+        self, message: str, *, status: int | None, url: str, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message, status=status, url=url)
+        self.retry_after = retry_after
+        """Seconds the site asked us to wait (``Retry-After``), or ``None`` if not sent."""
+
+
 class BomeParseError(BomeError):
     """A page or payload did not have the expected shape."""
 
