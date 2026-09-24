@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import queue
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -17,10 +19,15 @@ import pytest
 
 from bome_navaja import __version__
 from bome_navaja import server as srv
+from bome_navaja.antiguo import FICHERO_CATALOGO, PortalAntiguo
 from bome_navaja.client import BomeClient
+from bome_navaja.guard import ENFRIAMIENTO_SEGUNDOS, FICHERO_ESTADO, FICHERO_ESTADO_MELILLA, GuardiaSitio
+from bome_navaja.sync import SincronizadorIndice
 
 FIXTURES = Path(__file__).parent / "fixtures"
+ANTIGUO = FIXTURES / "antiguo"
 BASE = "https://bomemelilla.es"
+OLD_PDF = "https://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf"
 
 EXPECTED_TOOLS = {
     "listar_bomes",
@@ -40,6 +47,8 @@ EXPECTED_TOOLS = {
     "sincronizar_indice",
     "cancelar_sincronizacion",
     "estado_servidor",
+    "buscar_bome_antiguo",
+    "ver_bome_antiguo",
 }
 
 
@@ -57,6 +66,7 @@ class Site:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.paces: list[dict[str, float]] = []
+        self.guards: list[GuardiaSitio | None] = []
         self.lock = threading.Lock()
         self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {}
         for path, name in {
@@ -98,10 +108,25 @@ class Site:
         handler = self.routes.get(request.url.path)
         return handler(request) if handler else httpx.Response(404, text="Not found")
 
-    def factory(self, **pace: float) -> BomeClient:
+    def factory(self, *, guard: GuardiaSitio | None = None, **pace: float) -> BomeClient:
         """Records the requested pace (empty for interactive clients) but never waits."""
         self.paces.append(pace)
-        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0)
+        self.guards.append(guard)
+        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0, guard=guard)
+
+
+class FakeTime:
+    """Wall clock of the server's guard; the sync's waits move it instead of sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 1_790_000_000.0
+
+    def clock(self) -> float:
+        return self.now
+
+    def wait(self, seconds: float) -> bool:
+        self.now += seconds
+        return False
 
 
 @pytest.fixture
@@ -117,7 +142,16 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 
 @pytest.fixture
-def site(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
+def fake_time(monkeypatch: pytest.MonkeyPatch) -> FakeTime:
+    """The server's guard and sync run on a fake clock: no test ever really waits."""
+    fake = FakeTime()
+    monkeypatch.setattr(srv, "GuardiaSitio", functools.partial(GuardiaSitio, clock=fake.clock))
+    monkeypatch.setattr(srv, "SincronizadorIndice", functools.partial(SincronizadorIndice, wait=fake.wait))
+    return fake
+
+
+@pytest.fixture
+def site(data_dir: Path, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch) -> Site:
     fake = Site()
     monkeypatch.setattr(srv, "_client_factory", fake.factory)
     return fake
@@ -318,6 +352,43 @@ def test_sync_through_the_tools(site: Site, data_dir: Path) -> None:
     assert ok(srv.cancelar_sincronizacion())["estado"] == "completado"
 
 
+def test_the_default_sync_starts_in_2018_and_older_gaps_are_reported_apart(
+    site: Site, data_dir: Path
+) -> None:
+    from bome_navaja.index import SumarioIndex
+    from bome_navaja.models import BulletinRef
+
+    ok(srv.sincronizar_indice(reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    calendar = next(r for r in site.requests if r.url.path == "/api/bomes/calendar")
+    assert calendar.url.params["start"] == "2018-01-01"
+    before = ok(srv.estado_indice())["indice"]
+    assert before["pendientes_anteriores_2018"] == 0
+    # A calendar row recorded by an earlier sync from 2014 is not pending work.
+    old = SumarioIndex(data_dir / "sumarios.sqlite3")
+    try:
+        old.registrar_calendario(
+            [BulletinRef("BOME-B-2016-5300", 5300, date(2016, 5, 3), False, f"{BASE}/bome/BOME-B-2016-5300")]
+        )
+    finally:
+        old.close()
+    after = ok(srv.estado_indice())["indice"]
+    assert after["pendientes"] == before["pendientes"]
+    assert after["pendientes_anteriores_2018"] == 1
+    cobertura = ok(srv.buscar_en_indice("relacion provisional"))["cobertura"]
+    assert (cobertura["pendientes"], cobertura["pendientes_anteriores_2018"]) == (before["pendientes"], 1)
+
+
+def test_the_tool_docs_explain_the_2018_default() -> None:
+    tools = tools_by_name()
+    sync = tools["sincronizar_indice"].description
+    assert "2018-01-01" in sync and "portal antiguo" in sync and "2014-01-01" not in sync
+    for name in ("estado_indice", "buscar_en_indice"):
+        assert "pendientes_anteriores_2018" in tools[name].description, name
+    text = srv.server.instructions or ""
+    assert "2018-01-01" in text and "portal antiguo" in text
+
+
 def test_buscar_en_indice_warns_while_a_sync_runs(site: Site, data_dir: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -350,7 +421,7 @@ def test_buscar_en_indice_warns_while_a_sync_runs(site: Site, data_dir: Path) ->
 def test_estado_servidor_touches_neither_network_nor_index(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def no_network() -> BomeClient:
+    def no_network(**kwargs: object) -> BomeClient:
         raise AssertionError("estado_servidor must not create a client")
 
     monkeypatch.setattr(srv, "_client_factory", no_network)
@@ -371,6 +442,15 @@ def test_estado_servidor_touches_neither_network_nor_index(
         "max_boletines_por_ejecucion": 250,
     }
     assert result["url_base"] == BASE
+    assert result["guardia_sitio"] == {
+        "enfriamiento_hasta": None,
+        "segundos_restantes": 0,
+        "motivo": None,
+        "errores_en_ventana": 0,
+        "max_errores": 3,
+        "ventana_segundos": 600,
+        "fichero": str(data_dir / FICHERO_ESTADO),
+    }
     assert not data_dir.exists()
 
 
@@ -450,6 +530,41 @@ def test_sincronizar_indice_passes_max_boletines(site: Site) -> None:
     assert [r.url.path for r in site.requests if r.url.path.startswith("/bome/")] == ["/bome/BOME-B-2026-6416"]
 
 
+def test_broken_pages_become_rotos_and_are_skipped_unless_asked(site: Site) -> None:
+    site.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(500)
+
+    def sync(**kwargs: object) -> None:
+        ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0, **kwargs))
+        assert srv._get_sync().esperar(10)
+
+    def broken_requests() -> list[str]:
+        return [r.url.path for r in site.requests if r.url.path == "/bome/BOME-B-2026-6416"]
+
+    sync()
+    sync()
+    state = ok(srv.estado_indice())
+    assert state["indice"]["boletines"]["roto"] == 1
+    assert state["sincronizacion"]["rotos"] == 1
+    found = ok(srv.buscar_en_indice("orden"))
+    assert found["cobertura"]["rotos"] == 1
+    assert "reintentar_rotos" in found["aviso"]
+    site.requests.clear()
+    sync()
+    assert broken_requests() == []
+    sync(reintentar_rotos=True)
+    assert broken_requests() == ["/bome/BOME-B-2026-6416"]
+    assert ok(srv.estado_indice())["sincronizacion"]["rotos"] == 1
+
+
+def test_sincronizar_indice_documents_reintentar_rotos() -> None:
+    description = tools_by_name()["sincronizar_indice"].description
+    assert "reintentar_rotos" in description and "500" in description
+
+
+def test_empty_index_cobertura_has_rotos(site: Site) -> None:
+    assert ok(srv.buscar_en_indice("cese"))["cobertura"]["rotos"] is None
+
+
 def test_import_creates_no_client_and_no_index(data_dir: Path) -> None:
     import importlib
 
@@ -457,6 +572,7 @@ def test_import_creates_no_client_and_no_index(data_dir: Path) -> None:
     try:
         assert srv._client is None
         assert srv._index is None
+        assert srv._portal is None and srv._portal_guard is None
         assert not data_dir.exists()
     finally:
         importlib.reload(srv)
@@ -482,7 +598,8 @@ def test_blocking_answer_is_sitio_bloqueando(site: Site) -> None:
     )
     result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
     assert result["estado_http"] == 429
-    assert result["reintentar_tras_segundos"] == 120.0
+    # Retry-After was 120 s, but the guard keeps the site closed for its whole cooldown.
+    assert result["reintentar_tras_segundos"] == ENFRIAMIENTO_SEGUNDOS
     assert "espera" in result["error"].lower()
 
 
@@ -490,7 +607,7 @@ def test_blocked_drill_down_is_sitio_bloqueando(site: Site) -> None:
     site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(403)
     result = fail(srv.buscar_articulos(texto="relacion provisional"), "sitio_bloqueando")
     assert result["estado_http"] == 403
-    assert result["reintentar_tras_segundos"] is None
+    assert result["reintentar_tras_segundos"] == ENFRIAMIENTO_SEGUNDOS
 
 
 @pytest.mark.parametrize(
@@ -522,7 +639,7 @@ def test_index_query_errors(site: Site) -> None:
 def test_unexpected_exception_is_error_interno(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def broken() -> BomeClient:
+    def broken(**kwargs: object) -> BomeClient:
         raise RuntimeError("secret internal detail")
 
     monkeypatch.setattr(srv, "_client_factory", broken)
@@ -548,8 +665,8 @@ def test_nothing_is_printed_to_stdout(site: Site, capsys: pytest.CaptureFixture[
 def test_shared_client_is_created_once(site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
     created: list[BomeClient] = []
 
-    def counting() -> BomeClient:
-        client = site.factory()
+    def counting(**kwargs: object) -> BomeClient:
+        client = site.factory(**kwargs)
         created.append(client)
         return client
 
@@ -702,3 +819,487 @@ def test_tool_descriptions_are_accurate() -> None:
     assert "sincronizacion_indice" not in names["estado_indice"]
     for tool in ("leer_articulo", "leer_boletin", "leer_pdf"):
         assert "cortada" in names[tool], tool
+
+
+# --------------------------------------------------------------------------- site guard (site-guard task 3)
+
+
+def test_one_persisted_guard_is_shared_by_the_tools_and_the_sync(site: Site, data_dir: Path) -> None:
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    guard = srv._get_guard()
+    assert guard is srv._get_guard()
+    assert guard.estado()["fichero"] == str(data_dir / FICHERO_ESTADO)
+    stored = json.loads((data_dir / FICHERO_ESTADO).read_text("utf-8"))
+    assert len(stored["errores"]) == 1  # the 404 was counted in the data folder
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    assert srv._get_sync().guard is guard
+    assert site.guards == [guard, guard]  # interactive client, then the sync client
+
+
+def test_tools_refuse_without_the_network_during_a_cooldown(site: Site, fake_time: FakeTime) -> None:
+    srv._get_guard().registrar(None)
+    srv._get_guard().registrar(None)  # two requests in a row lost: the site is closed
+    fake_time.now += 500
+    for call in (
+        lambda: srv.ver_bome("BOME-B-2026-6416"),
+        lambda: srv.leer_articulo("BOME-B-2026-6416", 1051),
+        lambda: srv.descargar_pdf("BOME-P-2026-4784"),
+        lambda: srv.listar_consejerias(1),
+    ):
+        result = fail(call(), "sitio_bloqueando")
+        assert result["reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 500)
+        assert result["estado_http"] is None
+        assert "bloque" in result["error"] and "UTC" in result["error"]
+    assert site.requests == []
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30"))
+    assert srv._get_sync().esperar(10)
+    state = ok(srv.estado_indice())["sincronizacion"]
+    assert state["estado"] == "bloqueado"
+    assert state["reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 500)
+    assert site.requests == []
+
+
+def test_a_full_error_budget_is_pausa_preventiva(site: Site, fake_time: FakeTime) -> None:
+    for number in (9997, 9998, 9999):
+        fail(srv.ver_bome(f"BOME-B-2026-{number}"), "no_encontrado")
+    fake_time.now += 100
+    site.requests.clear()
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "pausa_preventiva")
+    assert result["reintentar_tras_segundos"] == pytest.approx(500)
+    assert result["estado_http"] is None
+    text = result["error"].lower()
+    assert "pausa preventiva" in text and "cortafuegos" in text and "500 s" in text
+    assert site.requests == []
+    fake_time.now += 500
+    ok(srv.ver_bome("BOME-B-2026-6416"))
+
+
+def test_a_cooldown_left_by_another_process_is_honoured(
+    site: Site, data_dir: Path, fake_time: FakeTime
+) -> None:
+    data_dir.mkdir(parents=True)
+    (data_dir / FICHERO_ESTADO).write_text(
+        json.dumps({"errores": [], "enfriamiento_hasta": fake_time.now + 3000, "motivo": "HTTP 429"}), "utf-8"
+    )
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
+    assert result["reintentar_tras_segundos"] == pytest.approx(3000)
+    assert site.requests == []
+    state = ok(srv.estado_servidor())["guardia_sitio"]
+    assert state["segundos_restantes"] == 3000
+    assert state["motivo"] == "HTTP 429"
+    assert state["enfriamiento_hasta"].endswith("+00:00")
+
+
+def test_estado_servidor_reports_the_guard(site: Site, data_dir: Path) -> None:
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    state = ok(srv.estado_servidor())["guardia_sitio"]
+    assert (state["errores_en_ventana"], state["max_errores"], state["ventana_segundos"]) == (1, 3, 600)
+    assert state["enfriamiento_hasta"] is None
+    assert state["fichero"] == str(data_dir / FICHERO_ESTADO)
+
+
+def test_without_a_data_folder_the_guard_lives_in_memory(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bome_navaja.models import BomeError
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise BomeError("no data folder")
+
+    monkeypatch.setattr(srv, "data_dir", unavailable)
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    guard = srv._get_guard()
+    assert guard.estado()["fichero"] is None
+    assert guard.errores_en_ventana() == 1
+
+
+def test_close_shared_state_forgets_the_guard(site: Site) -> None:
+    guard = srv._get_guard()
+    srv.close_shared_state()
+    assert srv._get_guard() is not guard
+
+
+
+# --------------------------------------------------------------------------- old portal (site-guard task 7)
+
+
+class OldPortal:
+    """MockTransport router for the old portal on melilla.es (by ``seccion`` or path)."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.guards: list[GuardiaSitio] = []
+        self.lock = threading.Lock()
+        self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {}
+        for key, name in {
+            "bome.jsp": "listado.html",
+            "busqueda_bome.jsp": "busqueda_personal_eventual.html",
+            "ficha_bome.jsp": "ficha_5302.html",
+        }.items():
+            body = (ANTIGUO / name).read_bytes()
+            self.routes[key] = functools.partial(
+                lambda content, request: httpx.Response(
+                    200, content=content, headers={"content-type": "text/html;charset=ISO-8859-1"}
+                ),
+                body,
+            )
+        pdf = (ANTIGUO / "5302_73.pdf").read_bytes()
+        self.routes["/mandar.php/n/9/4914/5302_73.pdf"] = lambda request: httpx.Response(
+            200, content=pdf, headers={"content-type": "application/pdf"}
+        )
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        with self.lock:
+            self.requests.append(request)
+        key = request.url.params.get("seccion") or request.url.path
+        handler = self.routes.get(key)
+        return handler(request) if handler else httpx.Response(404, text="no route")
+
+    def seccions(self) -> list[str]:
+        return [r.url.params.get("seccion") or r.url.path for r in self.requests]
+
+    def factory(self, *, guard: GuardiaSitio) -> PortalAntiguo:
+        self.guards.append(guard)
+        return PortalAntiguo(transport=httpx.MockTransport(self), guard=guard, polite_delay=0, jitter=0)
+
+
+@pytest.fixture
+def old(data_dir: Path, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch) -> OldPortal:
+    fake = OldPortal()
+    monkeypatch.setattr(srv, "_portal_factory", fake.factory)
+    return fake
+
+
+def calendar_json(*rows: tuple[str, str]) -> Callable[[httpx.Request], httpx.Response]:
+    body = [
+        {"title": f"Nº {cve.rsplit('-', 1)[1]}", "start": day, "url": f"/bome/{cve}"} for cve, day in rows
+    ]
+    return lambda request: httpx.Response(200, json=body)
+
+
+def test_listar_bomes_after_the_old_portal_ends_never_asks_it(site: Site, old: OldPortal) -> None:
+    result = ok(srv.listar_bomes("2026-09-01", "2026-09-30"))
+    assert result["total"] == 8
+    assert {b["origen"] for b in result["bomes"]} == {"bomemelilla.es"}
+    assert "aviso" not in result
+    assert old.requests == []
+
+
+def test_listar_bomes_merges_the_old_catalog_before_2021_03_13(site: Site, old: OldPortal) -> None:
+    site.routes["/api/bomes/calendar"] = calendar_json(
+        ("BOME-B-2016-5302", "2016-01-08"), ("BOME-B-2016-5300", "2016-01-01")
+    )
+    result = ok(srv.listar_bomes("2016-01-01", "2016-01-08"))
+    assert [b["cve"] for b in result["bomes"]] == ["BOME-B-2016-5302", "BOME-B-2016-5301", "BOME-B-2016-5300"]
+    assert [b["origen"] for b in result["bomes"]] == ["bomemelilla.es", "melilla.es", "bomemelilla.es"]
+    assert result["total"] == 3 and result["truncado"] is False
+    assert result["solo_portal_antiguo"] == 1
+    kept, only_old, _ = result["bomes"]
+    assert "dboid" not in kept  # bomemelilla.es wins: its own entry, untouched
+    assert only_old["dboid"] == 216769
+    assert only_old["date"] == "2016-01-05" and only_old["number"] == 5301
+    assert only_old["extraordinary"] is False
+    assert "ver_bome_antiguo" in only_old["ver_con"] and "216769" in only_old["ver_con"]
+    assert only_old["url"].startswith("https://www.melilla.es/melillaPortal/")
+    assert old.seccions() == ["bome.jsp"]
+    # The catalog is cached in the data folder and reused: no second GET.
+    ok(srv.listar_bomes("2016-01-01", "2016-01-08"))
+    assert old.seccions() == ["bome.jsp"]
+
+
+def test_listar_bomes_before_2014_uses_only_the_old_catalog(site: Site, old: OldPortal) -> None:
+    result = ok(srv.listar_bomes("1985-01-01", "1986-12-31"))
+    assert result["total"] == 55
+    assert {b["origen"] for b in result["bomes"]} == {"melilla.es"}
+    assert all(b["cve_oficial"] is False for b in result["bomes"])
+    assert site.requests == []  # bomemelilla.es starts in 2014: not asked
+    extras = [b for b in result["bomes"] if b["cve"] == "BOME-BX-1986-1"]
+    assert sorted(b["dboid"] for b in extras) == [280058, 280087]  # repeated identifiers both listed
+    dates = [b["date"] for b in result["bomes"]]
+    assert dates == sorted(dates, reverse=True)
+
+
+def test_listar_bomes_across_2014_asks_bomemelilla_only_from_2014(site: Site, old: OldPortal) -> None:
+    site.routes["/api/bomes/calendar"] = calendar_json()
+    result = ok(srv.listar_bomes("2011-12-01", "2014-01-31"))
+    calendar = next(r for r in site.requests if r.url.path == "/api/bomes/calendar")
+    assert calendar.url.params["start"] == "2014-01-01"
+    assert result["total"] > 0 and {b["origen"] for b in result["bomes"]} == {"melilla.es"}
+
+
+def test_listar_bomes_keeps_max_listado_over_the_merge(
+    site: Site, old: OldPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(srv, "MAX_LISTADO", 10)
+    result = ok(srv.listar_bomes("2010-01-01", "2011-12-31"))
+    assert result["total"] == 255
+    assert len(result["bomes"]) == 10 and result["truncado"] is True
+    assert result["bomes"][0]["date"].startswith("2011-12")
+
+
+def test_listar_bomes_without_the_old_portal_still_lists_bomemelilla(site: Site, old: OldPortal) -> None:
+    site.routes["/api/bomes/calendar"] = calendar_json(("BOME-B-2016-5302", "2016-01-08"))
+    old.routes["bome.jsp"] = lambda request: httpx.Response(500)
+    result = ok(srv.listar_bomes("2016-01-01", "2016-01-08"))
+    assert [b["cve"] for b in result["bomes"]] == ["BOME-B-2016-5302"]
+    assert "melilla.es" in result["aviso"] and "portal antiguo" in result["aviso"]
+    assert result["portal_antiguo_error_code"] == "error_http"
+    # The old portal's error counts in its own guard, never in bomemelilla.es's.
+    assert srv._get_portal_guard().errores_en_ventana() == 1
+    assert srv._get_guard().errores_en_ventana() == 0
+
+
+def test_listar_bomes_with_the_old_portal_blocked_gives_an_aviso(site: Site, old: OldPortal) -> None:
+    site.routes["/api/bomes/calendar"] = calendar_json(("BOME-B-2016-5302", "2016-01-08"))
+    srv._get_portal_guard().registrar(403)
+    result = ok(srv.listar_bomes("2016-01-01", "2016-01-08"))
+    assert result["total"] == 1
+    assert result["portal_antiguo_error_code"] == "sitio_bloqueando"
+    assert result["portal_antiguo_reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+    assert old.requests == []
+
+
+def test_listar_bomes_only_before_2014_fails_when_the_old_portal_does(site: Site, old: OldPortal) -> None:
+    old.routes["bome.jsp"] = lambda request: httpx.Response(500)
+    result = fail(srv.listar_bomes("1990-01-01", "1990-12-31"), "error_http")
+    assert "melilla.es" in result["error"] and "bomemelilla.es" not in result["error"]
+
+
+def test_buscar_bome_antiguo(site: Site, old: OldPortal) -> None:
+    result = ok(srv.buscar_bome_antiguo("personal eventual"))
+    assert result["total"] == 76 and result["truncado"] is False
+    assert len(result["articulos"]) == 76
+    first = result["articulos"][0]
+    assert first["cve_boletin"] == "BOME-B-2020-5722" and first["fecha"] == "2020-01-17"
+    assert first["sumario"].startswith("Decreto nº 20")
+    assert first["ruta"][0] == "CIUDAD AUTÓNOMA DE MELILLA"
+    assert first["paginas"][0]["url_pdf"] == "https://www.melilla.es/mandar.php/n/12/3334/5722_47.pdf"
+    assert first["dboid_boletin"] == 257569 and first["origen"] == "melilla.es"
+    (request,) = old.requests
+    assert request.method == "POST" and request.content == b"textobome=personal+eventual"
+    assert site.requests == []
+
+
+def test_buscar_bome_antiguo_filters_by_date_and_limits(site: Site, old: OldPortal) -> None:
+    result = ok(srv.buscar_bome_antiguo("personal eventual", desde="2019-01-01", hasta="31/12/2019", limite=2))
+    assert (result["desde"], result["hasta"]) == ("2019-01-01", "2019-12-31")
+    assert result["total"] > 2 and result["truncado"] is True
+    assert len(result["articulos"]) == 2
+    assert result["total_sin_filtrar"] == 76
+    assert all(a["fecha"].startswith("2019") for a in result["articulos"])
+    empty = ok(srv.buscar_bome_antiguo("personal eventual", desde="2021-01-01"))
+    assert empty["total"] == 0 and empty["articulos"] == [] and empty["aviso"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: srv.buscar_bome_antiguo("ab"),
+        lambda: srv.buscar_bome_antiguo("personal eventual", limite=0),
+        lambda: srv.buscar_bome_antiguo("personal eventual", limite=501),
+        lambda: srv.buscar_bome_antiguo("personal eventual", desde="ayer"),
+        lambda: srv.buscar_bome_antiguo("personal eventual", desde="2020-01-01", hasta="2019-01-01"),
+        lambda: srv.buscar_bome_antiguo("euro €"),
+    ],
+)
+def test_buscar_bome_antiguo_rejects_bad_arguments_without_a_request(
+    old: OldPortal, call: Callable[[], dict]
+) -> None:
+    fail(call(), "busqueda_invalida")
+    assert old.requests == []
+
+
+def test_ver_bome_antiguo_by_cve_and_by_dboid(site: Site, old: OldPortal) -> None:
+    by_cve = ok(srv.ver_bome_antiguo(cve="bome-b-2016-5302"))
+    assert by_cve["cve"] == "BOME-B-2016-5302" and by_cve["dboid"] == 216808
+    assert by_cve["url_pdf"] == "https://www.melilla.es/mandar.php/n/9/4913/5302.pdf"
+    assert by_cve["total_articulos"] == 4
+    article = by_cve["articulos"][0]
+    assert article["numero"] == 27 and article["tipo"] == "Notificación"
+    assert article["ruta"][-1] == "Personal Funcionario"
+    assert article["paginas"] == [{"numero": 73, "url_pdf": OLD_PDF}]
+    assert by_cve["origen"] == "melilla.es"
+    assert old.seccions() == ["bome.jsp", "ficha_bome.jsp"]
+    by_dboid = ok(srv.ver_bome_antiguo(dboid=216808))
+    assert by_dboid["cve"] == "BOME-B-2016-5302"
+    assert old.seccions() == ["bome.jsp", "ficha_bome.jsp", "ficha_bome.jsp"]
+    assert site.requests == []
+
+
+def test_ver_bome_antiguo_pre_2014_identifiers_are_flagged(site: Site, old: OldPortal) -> None:
+    result = ok(srv.ver_bome_antiguo(dboid=280058))  # the ficha fixture answers any dboid
+    assert "aviso" not in result or "bomemelilla.es" in result["aviso"]
+    ambiguous = fail(srv.ver_bome_antiguo(cve="BOME-BX-1986-1"), "boletin_ambiguo")
+    assert "280058" in ambiguous["error"] and "280087" in ambiguous["error"]
+    assert "1986-05-20" in ambiguous["error"] and "1986-02-08" in ambiguous["error"]
+    candidates = {(c["dboid"], c["fecha"]) for c in ambiguous["candidatos"]}
+    assert candidates == {(280058, "1986-05-20"), (280087, "1986-02-08")}
+    assert all("sufijo" in c for c in ambiguous["candidatos"])
+
+
+def test_ver_bome_antiguo_errors(site: Site, old: OldPortal) -> None:
+    missing = fail(srv.ver_bome_antiguo(cve="BOME-B-2099-1"), "no_encontrado")
+    assert "melilla.es" in missing["error"] and "bomemelilla.es" not in missing["error"]
+    fail(srv.ver_bome_antiguo(), "argumento_invalido")
+    fail(srv.ver_bome_antiguo(cve="BOME-B-2016-5302", dboid=216808), "argumento_invalido")
+    fail(srv.ver_bome_antiguo(dboid=0), "argumento_invalido")
+    fail(srv.ver_bome_antiguo(cve="BOME-A-2016-1"), "cve_invalido")
+
+
+def test_descargar_and_leer_pdf_of_an_old_portal_url(site: Site, old: OldPortal, data_dir: Path) -> None:
+    download = ok(srv.descargar_pdf(url="http://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf"))
+    assert download["ruta"] == str(data_dir / "pdfs" / "melilla-9-4914-5302_73.pdf")
+    assert (data_dir / "pdfs" / "melilla-9-4914-5302_73.pdf").read_bytes() == (ANTIGUO / "5302_73.pdf").read_bytes()
+    assert download["url"] == OLD_PDF
+    assert download["cve"] is None and download["origen"] == "melilla.es"
+    assert download["total_paginas"] == 1 and download["cache_hit"] is False
+    reading = ok(srv.leer_pdf(url=OLD_PDF))
+    assert reading["fuente"] == "pdf" and reading["origen"] == "melilla.es"
+    assert reading["metadatos"]["cache_hit"] is True
+    assert "4328" in reading["paginas"][0]["texto"]
+    assert [str(r.url) for r in old.requests] == [OLD_PDF]
+    assert site.requests == []
+    again = ok(srv.descargar_pdf(url=OLD_PDF, refrescar=True))
+    assert again["cache_hit"] is False and len(old.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/mandar.php/n/9/4914/5302_73.pdf",
+        "https://www.melilla.es/mandar.php/n/9/../4914/5302_73.pdf",
+        "https://bomemelilla.es/bome/descargar/BOME-B-2016-5302.pdf",
+        "file:///etc/passwd",
+    ],
+)
+def test_old_pdf_tools_reject_foreign_urls(old: OldPortal, data_dir: Path, url: str) -> None:
+    fail(srv.descargar_pdf(url=url), "url_pdf_invalida")
+    fail(srv.leer_pdf(url=url), "url_pdf_invalida")
+    assert old.requests == []
+    assert not (data_dir / "pdfs").exists()
+
+
+def test_pdf_tools_need_exactly_one_of_cve_and_url(site: Site, old: OldPortal) -> None:
+    fail(srv.descargar_pdf(), "lectura_invalida")
+    fail(srv.leer_pdf(), "lectura_invalida")
+    fail(srv.descargar_pdf("BOME-P-2026-4784", url=OLD_PDF), "lectura_invalida")
+    fail(srv.leer_pdf("BOME-P-2026-4784", url=OLD_PDF), "lectura_invalida")
+    assert site.requests == [] and old.requests == []
+
+
+def test_ver_bome_404_suggests_the_old_portal(site: Site) -> None:
+    result = fail(srv.ver_bome("BOME-B-2016-5301"), "no_encontrado")
+    assert "ver_bome_antiguo" in result["error"]
+    recent = fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    assert "ver_bome_antiguo" not in recent["error"]
+
+
+def test_old_portal_guard_refusals_name_melilla_es(site: Site, old: OldPortal, fake_time: FakeTime) -> None:
+    guard = srv._get_portal_guard()
+    guard.registrar(None)
+    guard.registrar(None)  # two requests in a row lost: the old portal is closed
+    fake_time.now += 100
+    for call in (
+        lambda: srv.buscar_bome_antiguo("personal eventual"),
+        lambda: srv.ver_bome_antiguo(dboid=216808),
+        lambda: srv.leer_pdf(url=OLD_PDF),
+    ):
+        result = fail(call(), "sitio_bloqueando")
+        assert result["reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 100)
+        assert "melilla.es" in result["error"] and "bomemelilla.es" not in result["error"]
+    assert old.requests == []
+    ok(srv.ver_bome("BOME-B-2026-6416"))  # bomemelilla.es is a different site: still open
+
+
+def test_old_portal_error_budget_is_pausa_preventiva_for_melilla_es(
+    site: Site, old: OldPortal, fake_time: FakeTime
+) -> None:
+    old.routes["ficha_bome.jsp"] = lambda request: httpx.Response(500)
+    for _ in range(3):
+        fail(srv.ver_bome_antiguo(dboid=216808), "error_http")
+    result = fail(srv.ver_bome_antiguo(dboid=216808), "pausa_preventiva")
+    assert "melilla.es" in result["error"] and "bomemelilla.es" not in result["error"]
+    assert len(old.requests) == 3
+    assert srv._get_guard().errores_en_ventana() == 0
+
+
+def test_one_persisted_old_portal_guard_and_portal_per_process(
+    site: Site, old: OldPortal, data_dir: Path
+) -> None:
+    ok(srv.buscar_bome_antiguo("personal eventual"))
+    ok(srv.ver_bome_antiguo(dboid=216808))
+    guard = srv._get_portal_guard()
+    assert old.guards == [guard]  # one portal, built once with the process's old-portal guard
+    assert guard is not srv._get_guard()
+    assert guard.sitio == "melilla.es"
+    assert guard.estado()["fichero"] == str(data_dir / FICHERO_ESTADO_MELILLA)
+    portal = srv._portal
+    assert portal is not None
+    srv.close_shared_state()
+    assert portal.closed and srv._portal is None
+    assert srv._get_portal_guard() is not guard
+
+
+def test_old_portal_guard_lives_in_memory_without_a_data_folder(
+    old: OldPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bome_navaja.models import BomeError
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise BomeError("no data folder")
+
+    monkeypatch.setattr(srv, "data_dir", unavailable)
+    assert srv._get_portal_guard().estado()["fichero"] is None
+    assert srv._get_portal_guard().sitio == "melilla.es"
+
+
+def test_estado_servidor_reports_the_old_portal_without_network(
+    data_dir: Path, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_portal(**kwargs: object) -> PortalAntiguo:
+        raise AssertionError("estado_servidor must not create the old-portal client")
+
+    monkeypatch.setattr(srv, "_portal_factory", no_portal)
+    result = ok(srv.estado_servidor())
+    assert result["guardia_portal_antiguo"] == {
+        "enfriamiento_hasta": None,
+        "segundos_restantes": 0,
+        "motivo": None,
+        "errores_en_ventana": 0,
+        "max_errores": 3,
+        "ventana_segundos": 600,
+        "fichero": str(data_dir / FICHERO_ESTADO_MELILLA),
+    }
+    assert result["catalogo_portal_antiguo"] == {
+        "ruta": str(data_dir / FICHERO_CATALOGO),
+        "existe": False,
+        "fetched_at": None,
+        "boletines": None,
+    }
+    assert result["url_portal_antiguo"] == "https://www.melilla.es/melillaPortal"
+    assert not data_dir.exists()
+
+
+def test_estado_servidor_reports_the_cached_catalog(site: Site, old: OldPortal, data_dir: Path) -> None:
+    ok(srv.listar_bomes("1985-01-01", "1985-12-31"))
+    catalog = ok(srv.estado_servidor())["catalogo_portal_antiguo"]
+    assert catalog["existe"] is True and catalog["boletines"] == 476
+    assert catalog["fetched_at"] and catalog["ruta"] == str(data_dir / FICHERO_CATALOGO)
+    (data_dir / FICHERO_CATALOGO).write_text("{broken", "utf-8")
+    broken = ok(srv.estado_servidor())["catalogo_portal_antiguo"]
+    assert broken["existe"] is True and broken["boletines"] is None and broken["error"]
+
+
+def test_old_portal_tools_are_documented_for_the_model() -> None:
+    tools = tools_by_name()
+    search = tools["buscar_bome_antiguo"].description
+    for needle in ("1985", "2021", "1991", "literal", "2018", "limite", "truncado"):
+        assert needle in search, needle
+    ficha = tools["ver_bome_antiguo"].description
+    assert "dboid" in ficha and "cve" in ficha
+    assert "url" in tools["leer_pdf"].description and "url" in tools["descargar_pdf"].description
+    assert "origen" in tools["listar_bomes"].description
+    text = srv.server.instructions or ""
+    for needle in ("buscar_bome_antiguo", "ver_bome_antiguo", "melilla.es", "bomemelilla.es", "2018"):
+        assert needle in text, needle

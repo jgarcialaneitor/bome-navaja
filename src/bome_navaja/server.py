@@ -17,6 +17,23 @@ sync owns a separate client created by the same factory, but asked for the
 slower sync pace (:func:`bome_navaja.sync.sync_settings_from_env`: its
 environment overrides are read when the sync is first used).
 
+Site guard: one :class:`~bome_navaja.guard.GuardiaSitio` per process,
+created lazily and persisted in the data folder (``estado_sitio.json``, so
+restarts and other server processes share its error budget and cooldown; a
+memory-only guard when the data folder is unavailable), is wired into both
+the shared client and the sync client. While it refuses, tools answer
+``sitio_bloqueando`` or ``pausa_preventiva`` with ``reintentar_tras_segundos``
+without touching the network.
+
+Old portal (melilla.es, bulletins 1985-2021-03-12): one lazy
+:class:`~bome_navaja.antiguo.PortalAntiguo` per process, used under its own
+``_portal_use_lock`` (the two sites are independent), with its own guard
+persisted as ``estado_sitio_melilla.json`` (memory-only without a data
+folder). Its errors never count against bomemelilla.es's budget, and the
+model-facing messages name the site that failed. robots.txt of melilla.es
+disallows the ficha and ``mandar.php``: they are requested only on demand,
+one tool call at a time, never in bulk (user decision 2026-09-24).
+
 Nothing touches the network or the index file at import time; the index is
 opened only by the index tools, and a sync starts only through
 ``sincronizar_indice`` (user decision 2026-09-23).
@@ -40,13 +57,27 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
+from .antiguo import (
+    FICHERO_CATALOGO,
+    PORTAL_URL,
+    BoletinAmbiguoError,
+    BoletinAntiguo,
+    PortalAntiguo,
+    UrlPdfInvalidaError,
+    estado_catalogo,
+    texto_busqueda_valido,
+)
+from .antiguo import SITIO as SITIO_ANTIGUO
 from .client import BomeClient
 from .cve import BASE_URL, InvalidCveError, parse_cve
 from .documents import LecturaInvalidaError
 from .documents import descargar_pdf as _descargar_pdf
+from .documents import descargar_pdf_antiguo as _descargar_pdf_antiguo
 from .documents import leer_articulo as _leer_articulo
 from .documents import leer_boletin as _leer_boletin
 from .documents import leer_pdf as _leer_pdf
+from .documents import leer_pdf_antiguo as _leer_pdf_antiguo
+from .guard import FICHERO_ESTADO, FICHERO_ESTADO_MELILLA, SITIO_POR_DEFECTO, GuardiaSitio
 from .index import SumarioIndex
 from .models import (
     BomeBlockedError,
@@ -57,6 +88,7 @@ from .models import (
     BomeIndexVersionError,
     BomeNotFoundError,
     BomeParseError,
+    BomePausaPreventivaError,
     BomeStorageError,
 )
 from .paths import data_dir, index_path, pdf_dir
@@ -71,11 +103,30 @@ MAX_LISTADO = 500
 DEFAULT_LISTADO_DIAS = 30
 SYNC_SHUTDOWN_WAIT = 10.0
 
+INICIO_BOMEMELILLA = date(2014, 1, 1)
+"""bomemelilla.es has nothing before this date: earlier ranges come from the old portal."""
+
+FIN_PORTAL_ANTIGUO = date(2021, 3, 12)
+"""Last bulletin of the old portal's frozen catalog."""
+
+MAX_LIMITE_ANTIGUO = 500
+"""Most articles ``buscar_bome_antiguo`` returns in one call."""
+
 INSTRUCTIONS = """\
-Servidor del Boletín Oficial de la Ciudad Autónoma de Melilla (BOME, bomemelilla.es).
-Cobertura: boletines desde 2014 (ordinarios BOME-B y extraordinarios BOME-BX). Los sumarios
-de artículos existen solo desde finales de 2016; los boletines de 2014-2016 no tienen texto
-de artículos ni PDF descargable.
+Servidor del Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Dos orígenes:
+- bomemelilla.es (el sitio actual): boletines desde 2014 (ordinarios BOME-B y extraordinarios
+  BOME-BX). Los sumarios de artículos existen solo desde finales de 2016; los boletines de
+  2014-2016 no tienen texto de artículos ni PDF descargable, y antes de 2018 le faltan
+  boletines.
+- melilla.es (el portal antiguo, congelado): boletines de 1985 al 12-03-2021, con sumarios de
+  artículos desde ~1991 y PDF por página. Herramientas: buscar_bome_antiguo (búsqueda de
+  artículos), ver_bome_antiguo (un boletín con sus artículos) y leer_pdf / descargar_pdf con
+  'url' (los PDF que dan esas dos). Cada resultado lleva 'origen'.
+
+Qué portal usar: para boletines anteriores a 2018, o cuando bomemelilla.es no tiene un
+boletín (ver_bome responde no_encontrado), usa las herramientas del portal antiguo;
+listar_bomes ya junta los dos catálogos antes de 2021-03-13. Los identificadores anteriores a
+2014 tienen forma de CVE pero no son CVE de bomemelilla.es y algunos se repiten: usa el dboid.
 
 Qué herramienta usar:
 - Buscar por sumario de artículo (lo habitual): buscar_en_indice si el índice local está
@@ -87,7 +138,19 @@ Qué herramienta usar:
 - Explorar: listar_bomes (calendario), ver_bome (árbol de artículos), resolver_cve.
 - Índice local: sincronizar_indice (solo cuando haga falta; cada ejecución indexa como mucho
   250 boletines por defecto en ~15-20 min; el histórico completo necesita varias ejecuciones
-  espaciadas).
+  espaciadas). Por defecto cubre 2018-01-01..hoy: antes de 2018 bomemelilla.es está incompleto
+  e inestable (faltan boletines y hay páginas rotas), y los boletines anteriores se consultan
+  mejor en el portal antiguo de melilla.es. Un 'desde' anterior es posible pero no
+  recomendable. Los boletines "rotos" (su página da error interno del sitio) se saltan;
+  reintentar_rotos solo para comprobar si el sitio los arregló.
+
+Cortafuegos del sitio: bomemelilla.es bloquea la IP tras unas 5 respuestas de error, y
+bome-navaja se protege sola (como mucho 3 errores cada 10 minutos entre todas las
+herramientas y la sincronización). Si una herramienta responde pausa_preventiva (pausa propia,
+no un bloqueo) o sitio_bloqueando (el sitio nos bloqueó: no se le pide nada durante ~75 min),
+espera reintentar_tras_segundos antes de reintentar; no repitas la llamada en bucle ni cambies
+de herramienta para esquivarlo. estado_servidor muestra la guardia en guardia_sitio. El
+portal antiguo (melilla.es) tiene su propia guardia, igual pero aparte (guardia_portal_antiguo).
 
 Semántica de búsqueda del sitio: coincidencia literal por subcadena, sin distinguir tildes ni
 mayúsculas, sin sinónimos (busca "cese", no "destitución"; "nombra" encuentra
@@ -108,28 +171,121 @@ class ArgumentoInvalidoError(BomeError, ValueError):
 
 
 def _default_client_factory(
-    *, polite_delay: float = RECOMMENDED_POLITE_DELAY, jitter: float = 0.0
+    *,
+    polite_delay: float = RECOMMENDED_POLITE_DELAY,
+    jitter: float = 0.0,
+    guard: GuardiaSitio | None = None,
 ) -> BomeClient:
-    return BomeClient(polite_delay=polite_delay, jitter=jitter)
+    return BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
 
 
 _client_factory: Callable[..., BomeClient] = _default_client_factory
-"""Builds every client. The shared (interactive) client is built with no
-arguments, the sync client with the sync pace as ``polite_delay``/``jitter``
-keywords. Tests replace it with a MockTransport one."""
+"""Builds every client, always with the process's site guard as ``guard=``.
+The shared (interactive) client gets no other argument, the sync client the
+sync pace as ``polite_delay``/``jitter`` keywords. Tests replace it with a
+MockTransport one."""
 
 _state_lock = threading.Lock()
 _client_use_lock = threading.Lock()
 _client: BomeClient | None = None
 _index: SumarioIndex | None = None
 _sync: SincronizadorIndice | None = None
+_guard: GuardiaSitio | None = None
+
+
+def _default_portal_factory(*, guard: GuardiaSitio) -> PortalAntiguo:
+    return PortalAntiguo(guard=guard)
+
+
+_portal_factory: Callable[..., PortalAntiguo] = _default_portal_factory
+"""Builds the old-portal client with the process's old-portal guard as ``guard=``.
+Tests replace it with a MockTransport one."""
+
+_portal_use_lock = threading.Lock()
+_portal: PortalAntiguo | None = None
+_portal_guard: GuardiaSitio | None = None
+
+
+def _get_guard() -> GuardiaSitio:
+    """The process's site guard, persisted in the data folder when there is one."""
+    global _guard
+    with _state_lock:
+        if _guard is None:
+            try:
+                path = data_dir()[0] / FICHERO_ESTADO
+            except BomeError as exc:
+                print(
+                    f"bome-navaja: no data folder for the site guard ({exc}); "
+                    "its state is kept in memory for this process",
+                    file=sys.stderr,
+                )
+                path = None
+            _guard = GuardiaSitio(path)
+        return _guard
+
+
+def _get_portal_guard() -> GuardiaSitio:
+    """The old portal's guard (melilla.es), persisted apart from bomemelilla.es's."""
+    global _portal_guard
+    with _state_lock:
+        if _portal_guard is None:
+            try:
+                path = data_dir()[0] / FICHERO_ESTADO_MELILLA
+            except BomeError as exc:
+                print(
+                    f"bome-navaja: no data folder for the old portal's site guard ({exc}); "
+                    "its state is kept in memory for this process",
+                    file=sys.stderr,
+                )
+                path = None
+            _portal_guard = GuardiaSitio(path, sitio=SITIO_ANTIGUO)
+        return _portal_guard
+
+
+def _get_portal() -> PortalAntiguo:
+    global _portal
+    guard = _get_portal_guard()
+    with _state_lock:
+        if _portal is None:
+            _portal = _portal_factory(guard=guard)
+        return _portal
+
+
+class _LockedPortal:
+    """Proxy over the shared old-portal client: one request at a time, errors tagged.
+
+    Every :class:`BomeError` it lets through carries ``sitio = "melilla.es"``
+    so :func:`error_result` names the right site.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(_get_portal(), name)
+        if not callable(attribute):
+            return attribute
+
+        @functools.wraps(attribute)
+        def locked(*args: Any, **kwargs: Any) -> Any:
+            try:
+                with _portal_use_lock:
+                    return getattr(_get_portal(), name)(*args, **kwargs)
+            except BomeError as exc:
+                exc.sitio = SITIO_ANTIGUO  # type: ignore[attr-defined]
+                raise
+
+        return locked
+
+
+def _portal_antiguo() -> PortalAntiguo:
+    """The shared old-portal client behind its per-call lock."""
+    return _LockedPortal()  # type: ignore[return-value]
 
 
 def _get_client() -> BomeClient:
     global _client
+    guard = _get_guard()
     with _state_lock:
         if _client is None:
-            _client = _client_factory()
+            _client = _client_factory(guard=guard)
         return _client
 
 
@@ -188,33 +344,44 @@ def _sync_settings() -> SyncSettings:
 def _get_sync() -> SincronizadorIndice:
     global _sync
     index = _get_index()
+    guard = _get_guard()
     with _state_lock:
         if _sync is None:
             settings = _sync_settings()
             for warning in settings.warnings:
                 print(f"bome-navaja: {warning}", file=sys.stderr)
+
+            def sync_client(*, guard: GuardiaSitio | None = None) -> BomeClient:
+                return _client_factory(
+                    polite_delay=settings.polite_delay, jitter=settings.jitter, guard=guard
+                )
+
             _sync = SincronizadorIndice(
                 index,
-                lambda: _client_factory(polite_delay=settings.polite_delay, jitter=settings.jitter),
+                sync_client,
                 polite_delay=settings.polite_delay,
                 jitter=settings.jitter,
                 max_boletines=settings.max_boletines,
+                guard=guard,
             )
         return _sync
 
 
 def close_shared_state() -> None:
     """Stop the sync, close the shared client and the index (shutdown and tests)."""
-    global _client, _index, _sync
+    global _client, _index, _sync, _guard, _portal, _portal_guard
     with _state_lock:
-        sync, index, client = _sync, _index, _client
-        _sync = _index = _client = None
+        sync, index, client, portal = _sync, _index, _client, _portal
+        _sync = _index = _client = _portal = None
+        _guard = _portal_guard = None
     if sync is not None:
         sync.cancelar()
         if not sync.esperar(SYNC_SHUTDOWN_WAIT):
             print("bome-navaja: the index sync did not stop in time", file=sys.stderr)
     if client is not None:
         client.close()
+    if portal is not None:
+        portal.close()
     if index is not None:
         index.close()
 
@@ -248,36 +415,63 @@ _ERRORS: tuple[tuple[type[BaseException], str, str], ...] = (
     (BusquedaInvalidaError, "busqueda_invalida", "Criterios de búsqueda no válidos"),
     (LecturaInvalidaError, "lectura_invalida", "Parámetros de lectura no válidos"),
     (ArgumentoInvalidoError, "argumento_invalido", "Argumento no válido"),
+    (UrlPdfInvalidaError, "url_pdf_invalida", "URL de PDF no válida"),
+    (BoletinAmbiguoError, "boletin_ambiguo", "Identificador ambiguo en el portal antiguo (melilla.es)"),
     (BomeIndexVersionError, "indice_version_incompatible", "El índice local tiene una versión incompatible"),
     (BomeIndexUnavailableError, "indice_no_disponible", "El índice local no está disponible"),
     (BomeDocumentTooLargeError, "documento_demasiado_grande", "El documento supera el límite de tamaño"),
     (BomeStorageError, "error_almacenamiento", "Error de almacenamiento local"),
     (
+        BomePausaPreventivaError,
+        "pausa_preventiva",
+        "Pausa de seguridad propia de bome-navaja para no activar el cortafuegos de "
+        "{sitio} (no es un bloqueo del sitio); espera los segundos de "
+        "reintentar_tras_segundos antes de reintentar y no repitas la llamada en bucle",
+    ),
+    (
         BomeBlockedError,
         "sitio_bloqueando",
-        "bomemelilla.es está rechazando nuestras peticiones (límite de peticiones o "
-        "cortafuegos); espera varios minutos antes de reintentar y no repitas la llamada "
-        "en bucle",
+        "{sitio} está rechazando nuestras peticiones (límite de peticiones o "
+        "cortafuegos) y bome-navaja no le pedirá nada durante reintentar_tras_segundos; "
+        "espera ese tiempo antes de reintentar y no repitas la llamada en bucle",
     ),
-    (BomeNotFoundError, "no_encontrado", "No existe en bomemelilla.es"),
-    (BomeHTTPError, "error_http", "bomemelilla.es no respondió correctamente"),
+    (BomeNotFoundError, "no_encontrado", "No existe en {sitio}"),
+    (BomeHTTPError, "error_http", "{sitio} no respondió correctamente"),
     (BomeParseError, "error_formato", "La respuesta del sitio no tiene el formato esperado"),
     (BomeError, "error", "Error del cliente BOME"),
 )
 
 
 def error_result(exc: BaseException) -> dict[str, Any]:
-    """The ``ok: false`` payload for a :class:`BomeError`."""
+    """The ``ok: false`` payload for a :class:`BomeError`.
+
+    The prefix names the site that failed: ``exc.sitio`` when the old-portal
+    proxy tagged it, else bomemelilla.es.
+    """
+    sitio = getattr(exc, "sitio", SITIO_POR_DEFECTO)
     for kind, code, prefix in _ERRORS:
         if isinstance(exc, kind):
-            result: dict[str, Any] = {"ok": False, "error": f"{prefix}: {exc}", "error_code": code}
+            text = prefix.format(sitio=sitio)
+            result: dict[str, Any] = {"ok": False, "error": f"{text}: {exc}", "error_code": code}
             if isinstance(exc, BomeHTTPError):
                 result["estado_http"] = exc.status
                 result["url"] = exc.url
             if isinstance(exc, BomeBlockedError):
                 result["reintentar_tras_segundos"] = exc.retry_after
+            if isinstance(exc, BoletinAmbiguoError):
+                result["candidatos"] = [_candidato(b) for b in exc.candidatos]
             return result
     raise TypeError(f"not a BomeError: {exc!r}")
+
+
+def _candidato(boletin: BoletinAntiguo) -> dict[str, Any]:
+    return {
+        "cve": boletin.cve,
+        "dboid": boletin.dboid,
+        "fecha": boletin.fecha.isoformat(),
+        "sufijo": boletin.sufijo,
+        "extraordinario": boletin.extraordinario,
+    }
 
 
 def _herramienta(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
@@ -321,30 +515,99 @@ def _fecha(value: str | None, name: str, error: type[BomeError] = BusquedaInvali
 # --------------------------------------------------------------------------- navigation tools
 
 
+def _entrada_antigua(boletin: BoletinAntiguo) -> dict[str, Any]:
+    """A ``listar_bomes`` entry for a bulletin only the old portal lists."""
+    etiqueta = boletin.sufijo or str(boletin.numero)
+    return {
+        "cve": boletin.cve,
+        "number": boletin.numero,
+        "date": boletin.fecha.isoformat(),
+        "extraordinary": boletin.extraordinario,
+        "url": boletin.url_ficha,
+        "title": f"Nº {'Extra ' if boletin.extraordinario else ''}{etiqueta}",
+        "origen": SITIO_ANTIGUO,
+        "dboid": boletin.dboid,
+        "cve_oficial": boletin.cve_oficial,
+        "sufijo": boletin.sufijo,
+        "ver_con": f"ver_bome_antiguo(dboid={boletin.dboid})",
+    }
+
+
 @server.tool()
 @_herramienta
 def listar_bomes(desde: str | None = None, hasta: str | None = None) -> dict:
-    """Lista los boletines publicados entre dos fechas (calendario del sitio).
+    """Lista los boletines publicados entre dos fechas (calendario de bomemelilla.es y, antes
+    de 2021-03-13, también el catálogo del portal antiguo de melilla.es).
 
     Fechas en AAAA-MM-DD o DD/MM/AAAA, ambas incluidas. Por defecto, los últimos 30 días
     hasta hoy. Devuelve como máximo 500 boletines, del más reciente al más antiguo; si hay
     más, 'truncado' es true y 'total' dice cuántos hay: acota el rango. Cada boletín trae
-    cve, number, date, extraordinary (BOME-BX), title y url. Para ver sus artículos usa ver_bome.
+    cve, number, date, extraordinary (BOME-BX), title, url y origen ("bomemelilla.es" o
+    "melilla.es"). Si el rango llega antes del 2021-03-13 se añaden los boletines que solo
+    tiene el portal antiguo (a bomemelilla.es le faltan muchos antes de 2018 y no tiene nada
+    antes de 2014); traen dboid y ver_con (ábrelos con ver_bome_antiguo) y
+    'solo_portal_antiguo' los cuenta. Si un boletín está en los dos, gana bomemelilla.es
+    (ábrelo con ver_bome). Si el portal antiguo no responde, devuelve lo de bomemelilla.es y
+    un 'aviso'. Antes de 2014 los identificadores no son CVE de bomemelilla.es
+    (cve_oficial=false) y pueden repetirse: usa el dboid.
     """
     end = _fecha(hasta, "hasta", ArgumentoInvalidoError) or date.today()
     start = _fecha(desde, "desde", ArgumentoInvalidoError) or end - timedelta(days=DEFAULT_LISTADO_DIAS)
     if end < start:
         raise ArgumentoInvalidoError(f"'hasta' ({end}) es anterior a 'desde' ({start})")
-    client = _cliente()
-    refs = client.calendar(start, end)
-    refs.sort(key=lambda r: (r.date or date.min, r.number), reverse=True)
+    entries: list[dict[str, Any]] = []
+    if end >= INICIO_BOMEMELILLA:
+        refs = _cliente().calendar(max(start, INICIO_BOMEMELILLA), end)
+        entries = [{**ref.to_dict(), "origen": SITIO_POR_DEFECTO} for ref in refs]
+    extra: dict[str, Any] = {}
+    if start <= FIN_PORTAL_ANTIGUO:
+        try:
+            catalogo = _portal_antiguo().catalogo()
+        except BomeError as exc:
+            if end < INICIO_BOMEMELILLA:
+                raise  # the old portal is the only source for this range
+            failure = error_result(exc)
+            extra["aviso"] = (
+                "No se pudo consultar el catálogo del portal antiguo (melilla.es): "
+                f"{failure['error']} La lista solo trae los boletines de bomemelilla.es, al que le "
+                "faltan boletines antes de 2018; reinténtalo más tarde (respeta "
+                "portal_antiguo_reintentar_tras_segundos si viene) o busca con buscar_bome_antiguo."
+            )
+            extra["portal_antiguo_error_code"] = failure["error_code"]
+            if "reintentar_tras_segundos" in failure:
+                extra["portal_antiguo_reintentar_tras_segundos"] = failure["reintentar_tras_segundos"]
+        else:
+            known = {entry["cve"] for entry in entries}
+            old_only = [
+                _entrada_antigua(b)
+                for b in catalogo.entre(start, min(end, FIN_PORTAL_ANTIGUO))
+                if b.cve not in known
+            ]
+            entries.extend(old_only)
+            extra["solo_portal_antiguo"] = len(old_only)
+    entries.sort(key=lambda e: (e["date"] or "", e["number"]), reverse=True)
     return {
         "desde": start.isoformat(),
         "hasta": end.isoformat(),
-        "total": len(refs),
-        "truncado": len(refs) > MAX_LISTADO,
-        "bomes": [ref.to_dict() for ref in refs[:MAX_LISTADO]],
+        "total": len(entries),
+        "truncado": len(entries) > MAX_LISTADO,
+        "bomes": entries[:MAX_LISTADO],
+        **extra,
     }
+
+
+def _pista_portal_antiguo(cve: str) -> str | None:
+    """A hint towards ver_bome_antiguo for a bulletin CVE the old portal may have."""
+    try:
+        parsed = parse_cve(cve)
+    except InvalidCveError:
+        return None
+    if not parsed.kind.is_bulletin or parsed.year > FIN_PORTAL_ANTIGUO.year:
+        return None
+    return (
+        f"bomemelilla.es no tiene todos los boletines anteriores a 2018: prueba "
+        f'ver_bome_antiguo(cve="{parsed}") (portal antiguo de melilla.es, 1985-2021).'
+    )
 
 
 @server.tool()
@@ -359,7 +622,13 @@ def ver_bome(cve: str, recuperar_ocultos: bool = False) -> dict:
     devuelven en 'articulos_ocultos'. Para el texto de un artículo usa leer_articulo.
     """
     client = _cliente()
-    bulletin = client.bulletin(cve)
+    try:
+        bulletin = client.bulletin(cve)
+    except BomeNotFoundError as exc:
+        hint = _pista_portal_antiguo(cve)
+        if hint is None:
+            raise
+        raise BomeNotFoundError(f"{exc}. {hint}", status=exc.status, url=exc.url) from exc
     data: dict[str, Any] = {**bulletin.to_dict(), "total_articulos": len(bulletin.articles)}
     if recuperar_ocultos:
         articles, errors = articulos_del_boletin(client, bulletin)
@@ -394,7 +663,7 @@ def resolver_cve(cve: str) -> dict:
     """Devuelve la URL canónica de cualquier CVE (boletín, artículo, sumario o página).
 
     Útil para citar o para saber a qué boletín y artículo pertenece un CVE de artículo
-    (BOME-A-...) o de página (BOME-P-...). Comprueba que la página exista.
+    (BOME-A-...) o de página (BOME-P-... / BOME-PX-...). Comprueba que la página exista.
     """
     canonical = str(parse_cve(cve))
     client = _cliente()
@@ -479,42 +748,157 @@ def leer_boletin(
     ).to_dict()
 
 
+def _cve_o_url(cve: str | None, url: str | None) -> None:
+    if (cve is None) == (url is None):
+        raise LecturaInvalidaError(
+            "da exactamente uno de 'cve' (PDF de bomemelilla.es) o 'url' (PDF del portal antiguo "
+            "de melilla.es, tal como lo dan buscar_bome_antiguo y ver_bome_antiguo)"
+        )
+
+
 @server.tool()
 @_herramienta
 def leer_pdf(
-    cve: str,
+    cve: str | None = None,
     desde_pagina: int = 1,
     desde_caracter: int = 0,
     max_caracteres: int = 20000,
+    url: str | None = None,
 ) -> dict:
     """Texto del PDF de cualquier CVE: boletín, sumario (BOME-S), artículo (BOME-A) o página
-    (BOME-P).
+    (BOME-P / BOME-PX); o, con url en vez de cve, de un PDF del portal antiguo de melilla.es.
 
-    Las páginas sin texto extraíble (escaneadas) salen con sin_texto=true y un aviso.
+    Da exactamente uno: cve, o url (solo las URL https://www.melilla.es/mandar.php/... que
+    devuelven buscar_bome_antiguo y ver_bome_antiguo, por página o del boletín entero; se
+    rechaza cualquier otra). Las páginas sin texto extraíble (escaneadas, frecuentes en los
+    boletines antiguos) salen con sin_texto=true y un aviso.
     Paginación: devuelve páginas enteras hasta max_caracteres (1000-100000, por defecto
     20000), siempre al menos una; una página más larga que max_caracteres se corta ahí
     (cortada=true). Si 'siguiente' no es null, vuelve a llamar con desde_pagina y
     desde_caracter de 'siguiente'; null significa que no queda más.
     """
+    _cve_o_url(cve, url)
+    if url is not None:
+        return _leer_pdf_antiguo(
+            _portal_antiguo(), url, desde_pagina=desde_pagina, desde_caracter=desde_caracter,
+            max_caracteres=max_caracteres,
+        ).to_dict()
     client = _cliente()
     return _leer_pdf(
-        client, cve, desde_pagina=desde_pagina, desde_caracter=desde_caracter,
+        client, cve, desde_pagina=desde_pagina, desde_caracter=desde_caracter,  # type: ignore[arg-type]
         max_caracteres=max_caracteres,
     ).to_dict()
 
 
 @server.tool()
 @_herramienta
-def descargar_pdf(cve: str, refrescar: bool = False) -> dict:
-    """Descarga el PDF de cualquier CVE a la caché local y devuelve su ruta, tamaño, sha256 y
-    número de páginas.
+def descargar_pdf(cve: str | None = None, refrescar: bool = False, url: str | None = None) -> dict:
+    """Descarga el PDF de cualquier CVE (o, con url, uno del portal antiguo de melilla.es) a la
+    caché local y devuelve su ruta, tamaño, sha256 y número de páginas.
 
-    El nombre del fichero es siempre el CVE canónico; el directorio lo fija
+    Da exactamente uno: cve, o url (solo las URL https://www.melilla.es/mandar.php/... que
+    devuelven buscar_bome_antiguo y ver_bome_antiguo). El nombre del fichero sale solo del CVE
+    canónico o de la ruta de esa URL (melilla-9-4914-5302_73.pdf); el directorio lo fija
     BOME_NAVAJA_PDF_DIR (ver estado_servidor). Reutiliza la copia en caché salvo
-    refrescar=true. Límite: 100 MB. Los PDF de 2014-2016 no existen en el sitio (404).
+    refrescar=true. Límite: 100 MB. Los PDF de 2014-2016 no existen en bomemelilla.es (404):
+    búscalos en el portal antiguo.
     """
+    _cve_o_url(cve, url)
+    if url is not None:
+        return _descargar_pdf_antiguo(_portal_antiguo(), url, refrescar=refrescar).to_dict()
     client = _cliente()
-    return _descargar_pdf(client, cve, refrescar=refrescar).to_dict()
+    return _descargar_pdf(client, cve, refrescar=refrescar).to_dict()  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- old portal tools
+
+
+@server.tool()
+@_herramienta
+def buscar_bome_antiguo(
+    texto: str,
+    desde: str | None = None,
+    hasta: str | None = None,
+    limite: int = 100,
+) -> dict:
+    """Busca artículos en el portal antiguo del BOME (melilla.es): boletines de 1985 al
+    12-03-2021, con sumarios de artículos desde ~1991.
+
+    Úsalo para cualquier cosa anterior a 2018 (bomemelilla.es está incompleto ahí y no tiene
+    nada antes de 2014). Búsqueda literal de texto en los artículos (3-200 caracteres,
+    sin distinguir mayúsculas; no busca por número de boletín: para eso usa ver_bome_antiguo
+    o listar_bomes). El portal devuelve TODO en una sola página, así que usa términos
+    concretos. Cada artículo trae cve_boletin, fecha, numero, tipo, sumario, ruta (consejería,
+    dirección, sección), paginas (número y url_pdf de cada página: léelas con
+    leer_pdf(url=...)), dboid_boletin y url_ficha. desde/hasta (AAAA-MM-DD o DD/MM/AAAA)
+    filtran por la fecha del boletín después de buscar. Devuelve como mucho limite
+    artículos (por defecto 100, máx. 500) en el orden del portal; 'total' cuenta los que
+    pasan el filtro y 'truncado' dice si hay más: acota el texto o las fechas.
+    """
+    if isinstance(limite, bool) or not isinstance(limite, int) or not 1 <= limite <= MAX_LIMITE_ANTIGUO:
+        raise BusquedaInvalidaError(f"'limite' debe estar entre 1 y {MAX_LIMITE_ANTIGUO}, no {limite!r}")
+    start, end = _fecha(desde, "desde"), _fecha(hasta, "hasta")
+    if start is not None and end is not None and end < start:
+        raise BusquedaInvalidaError(f"'hasta' ({end}) es anterior a 'desde' ({start})")
+    texto_busqueda_valido(texto)  # before touching the portal
+    articulos = _portal_antiguo().buscar(texto)
+    matching = [
+        a
+        for a in articulos
+        if (start is None and end is None)
+        or (a.fecha is not None and (start is None or a.fecha >= start) and (end is None or a.fecha <= end))
+    ]
+    data: dict[str, Any] = {
+        "texto": " ".join(texto.split()),
+        "desde": start.isoformat() if start else None,
+        "hasta": end.isoformat() if end else None,
+        "total": len(matching),
+        "total_sin_filtrar": len(articulos),
+        "limite": limite,
+        "truncado": len(matching) > limite,
+        "articulos": [a.to_dict() for a in matching[:limite]],
+    }
+    if not matching:
+        data["aviso"] = (
+            "Sin resultados en el portal antiguo. Su búsqueda es literal (sin sinónimos): prueba "
+            "otra palabra o una forma más corta, o quita el filtro de fechas. Los sumarios existen "
+            "desde ~1991."
+        )
+    return data
+
+
+@server.tool()
+@_herramienta
+def ver_bome_antiguo(cve: str | None = None, dboid: int | None = None) -> dict:
+    """Ficha de un boletín del portal antiguo (melilla.es, 1985 al 12-03-2021): PDF del
+    boletín entero y sus artículos.
+
+    Da exactamente uno: cve (BOME-B-AAAA-N o BOME-BX-AAAA-N; se busca en el catálogo del
+    portal) o dboid (el id del portal, como lo dan listar_bomes, buscar_bome_antiguo y los
+    errores de ambigüedad). Antes de 2014 los identificadores tienen forma de CVE pero no son
+    CVE de bomemelilla.es y algunos se repiten: entonces responde boletin_ambiguo con los
+    candidatos (dboid, fecha, sufijo) y hay que repetir con su dboid. Devuelve url_pdf (el
+    boletín entero), y articulos con numero, tipo, sumario, ruta (consejería, dirección,
+    sección) y paginas (url_pdf de cada página). Lee cualquiera de esos PDF con
+    leer_pdf(url=...).
+    """
+    if (cve is None) == (dboid is None):
+        raise ArgumentoInvalidoError("da exactamente uno de 'cve' o 'dboid'")
+    portal = _portal_antiguo()
+    if dboid is not None:
+        if isinstance(dboid, bool) or not isinstance(dboid, int) or dboid <= 0:
+            raise ArgumentoInvalidoError(f"'dboid' debe ser un entero positivo, no {dboid!r}")
+        ficha = portal.ficha(dboid)
+    else:
+        ficha = portal.ficha_por_cve(cve)  # type: ignore[arg-type]
+    data: dict[str, Any] = {**ficha.to_dict(), "total_articulos": len(ficha.articulos)}
+    if not ficha.cve_oficial:
+        data["aviso"] = (
+            f"{ficha.cve} es el número del portal antiguo con forma de CVE, pero no es un CVE de "
+            "bomemelilla.es (que empieza en 2014) y puede repetirse: cita también la fecha y el "
+            "dboid."
+        )
+    return data
 
 
 # --------------------------------------------------------------------------- live search tools
@@ -626,6 +1010,12 @@ def _index_aviso(cobertura: dict[str, Any], sync_state: str | None) -> str | Non
             f"{cobertura['pendientes']} boletines del calendario están pendientes o con error; "
             "sincronizar_indice los reintenta."
         )
+    if cobertura.get("rotos"):
+        notes.append(
+            f"{cobertura['rotos']} boletines están rotos (su página respondió con error interno "
+            "del sitio dos veces): no se indexan ni se reintentan salvo con "
+            "sincronizar_indice(reintentar_rotos=True)."
+        )
     return " ".join(notes) or None
 
 
@@ -652,6 +1042,10 @@ def buscar_en_indice(
     Requiere haber llamado antes a sincronizar_indice; si el índice está vacío devuelve 0
     resultados y un aviso (usa buscar_articulos mientras tanto). Mira 'cobertura' (rango
     indexado, pendientes, sincronización en curso) antes de afirmar que algo no existe.
+    La sincronización por defecto cubre desde 2018-01-01: 'pendientes' cuenta solo boletines
+    desde esa fecha y pendientes_anteriores_2018 los anteriores del calendario sin indexar
+    (bomemelilla.es está incompleto antes de 2018; esos boletines se consultan mejor en el
+    portal antiguo de melilla.es).
     coincidencia: "fragmento" (subcadena, como el sitio: "cese" encuentra "ceses" y
     "procese") o "palabra" (cada frase debe empezar una palabra: "cese" → cese, ceses, no
     procese). terminos=[{texto, operador: "y"|"o", modo: "contiene"|"no_contiene"}]; Y dentro
@@ -666,6 +1060,8 @@ def buscar_en_indice(
             "fecha_min": None,
             "fecha_max": None,
             "pendientes": None,
+            "pendientes_anteriores_2018": None,
+            "rotos": None,
             "ultima_sincronizacion": None,
             "sincronizacion_en_curso": False,
         }
@@ -703,12 +1099,19 @@ def buscar_en_indice(
 def estado_indice() -> dict:
     """Estado del índice local de sumarios y de su sincronización (no toca el sitio).
 
-    Devuelve boletines indexados / sin sumarios / con error, artículos, rango de fechas,
-    pendientes frente al calendario, última sincronización y el progreso de la actual
-    (hechos, total_planificado, eta_segundos). Úsalo para seguir una sincronización lanzada con sincronizar_indice.
+    Devuelve boletines indexados / sin sumarios / con error / rotos (páginas que el sitio
+    respondió con error interno dos veces; no cuentan como pendientes), artículos, rango de
+    fechas, pendientes frente al calendario, última sincronización y el progreso de la actual
+    (hechos, total_planificado, eta_segundos). 'pendientes' cuenta solo boletines desde
+    2018-01-01 (el inicio por defecto de sincronizar_indice); los anteriores del calendario sin
+    indexar (de sincronizaciones antiguas o con un 'desde' anterior) salen aparte en
+    pendientes_anteriores_2018 y no son trabajo pendiente. Úsalo para seguir una sincronización lanzada con sincronizar_indice.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
-    rechaza las peticiones por límite de ritmo o cortafuegos: lo indexado se conserva; espera,
-    horas si es un bloqueo del cortafuegos, antes de volver a sincronizar; ver 'mensaje').
+    nos bloqueó: 403/429/503 o dos peticiones seguidas sin respuesta; lo indexado se conserva y
+    bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min: no vuelvas a
+    sincronizar antes; ver 'mensaje'). En 'mensaje' también aparecen las pausas preventivas
+    (como mucho 3 respuestas de error del sitio cada 10 minutos) y la sincronización cuenta
+    los boletines que quedaron rotos en 'rotos'.
     """
     path, exists = _index_file()
     index = _open_index_if_present()
@@ -731,23 +1134,35 @@ def sincronizar_indice(
     reindexar_recientes_dias: int = 7,
     reintentar_errores: bool = True,
     max_boletines: int | None = None,
+    reintentar_rotos: bool = False,
 ) -> dict:
     """Arranca en segundo plano la sincronización del índice local de sumarios y vuelve al
     instante.
 
-    Recorre el calendario (por defecto 2014-01-01..hoy) del más reciente al más antiguo:
+    Recorre el calendario (por defecto 2018-01-01..hoy) del más reciente al más antiguo:
     indexa los boletines que falten, re-indexa los de los últimos reindexar_recientes_dias
-    días y, si reintentar_errores, los que fallaron. Para no saturar el sitio va despacio
+    días y, si reintentar_errores, los que fallaron. Empieza en 2018 porque antes
+    bomemelilla.es está incompleto e inestable (faltan boletines y sus páginas rotas responden
+    HTTP 500, que el cortafuegos castiga) y apenas tiene texto buscable; los boletines
+    anteriores se consultan mejor en el portal antiguo de melilla.es. Un 'desde' anterior es
+    posible pero no recomendable. Para no saturar el sitio va despacio
     (~2-3 s entre peticiones) y cada ejecución indexa como mucho max_boletines boletines
-    (por defecto 250, los más recientes; ~15-20 minutos). El histórico completo desde 2014
-    (~1900 boletines) necesita varias ejecuciones: si el estado final trae
+    (por defecto 250, los más recientes; ~15-20 minutos). El rango por defecto
+    (~1100 boletines) necesita varias ejecuciones: si el estado final trae
     pendientes_tras_limite > 0, vuelve a llamarla más tarde (espaciar las ejecuciones es más
     amable con el sitio). Es reanudable: si se corta, la siguiente llamada continúa donde
     quedó. Sigue el progreso con estado_indice; mientras tanto
     buscar_en_indice da resultados parciales. Si ya hay una en curso (en este u otro proceso)
-    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. Si el sitio rechaza
-    las peticiones (403/429/503 o conexiones cortadas) espera y reintenta; si sigue rechazándolas
-    termina en estado "bloqueado": no la relances enseguida, espera (horas si es el cortafuegos).
+    devuelve su estado sin arrancar otra. Solo sincroniza cuando se le pide. El cortafuegos del
+    sitio bloquea la IP tras unas 5 respuestas de error, así que la sincronización admite como
+    mucho 3 cada 10 minutos (si llega al límite hace una pausa preventiva y va más lenta) y
+    espera 30-60 s tras una página rota. Si el sitio la bloquea (403/429/503 o dos peticiones
+    seguidas sin respuesta) termina en estado "bloqueado" y bome-navaja no le pide nada durante
+    reintentar_tras_segundos (~75 min): no la relances antes (terminaría "bloqueado" al
+    instante).
+    Los boletines "rotos" (su página respondió con error interno, HTTP 500, dos veces) se
+    saltan; reintentar_rotos=True los vuelve a pedir: úsalo solo para comprobar si el sitio
+    los arregló, porque cada uno cuesta un HTTP 500 que el cortafuegos del sitio cuenta.
     """
     sync = _get_sync()
     return sync.iniciar(
@@ -756,6 +1171,7 @@ def sincronizar_indice(
         reindexar_recientes_dias=reindexar_recientes_dias,
         reintentar_errores=reintentar_errores,
         max_boletines=max_boletines,
+        reintentar_rotos=reintentar_rotos,
     ).to_dict()
 
 
@@ -763,7 +1179,7 @@ def sincronizar_indice(
 @_herramienta
 def cancelar_sincronizacion() -> dict:
     """Pide parar la sincronización en curso; termina tras el boletín que esté procesando (o al
-    instante si está esperando porque el sitio la había bloqueado).
+    instante si está en una pausa: preventiva o tras una página rota del sitio).
 
     Lo ya indexado se conserva y una nueva sincronizar_indice continúa desde ahí.
     """
@@ -811,7 +1227,15 @@ def estado_servidor() -> dict:
     el directorio de trabajo), si existe el fichero del índice y su estado si ya está
     abierto, versión de SQLite con FTS5/trigram, pausa de cortesía de las herramientas y de
     la sincronización (pausa, variación aleatoria y máximo de boletines por ejecución, con
-    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas) y URL base.
+    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas), URL base y la
+    guardia del sitio (guardia_sitio: enfriamiento_hasta, segundos_restantes y motivo si el
+    sitio nos bloqueó, durante el cual las herramientas responden sitio_bloqueando; errores
+    HTTP en la ventana de 10 minutos frente al máximo permitido, 3: con el cupo lleno
+    las herramientas responden pausa_preventiva; y su fichero estado_sitio.json,
+    compartido por todos los procesos de bome-navaja). Del portal antiguo (melilla.es):
+    url_portal_antiguo, su propia guardia (guardia_portal_antiguo, con su fichero
+    estado_sitio_melilla.json) y la caché de su catálogo (catalogo_portal_antiguo: ruta,
+    existe, fetched_at y número de boletines).
     """
     try:
         exists = index_path()[0].exists()
@@ -837,7 +1261,19 @@ def estado_servidor() -> dict:
         "cortesia_segundos": RECOMMENDED_POLITE_DELAY,
         "cortesia_sincronizacion": sync_pace,
         "url_base": BASE_URL,
+        "guardia_sitio": _get_guard().estado(),
+        "url_portal_antiguo": PORTAL_URL,
+        "guardia_portal_antiguo": _get_portal_guard().estado(),
+        "catalogo_portal_antiguo": _estado_catalogo(),
     }
+
+
+def _estado_catalogo() -> dict[str, Any]:
+    try:
+        path = data_dir()[0] / FICHERO_CATALOGO
+    except BomeError as exc:
+        return {**estado_catalogo(None), "error": str(exc)}
+    return estado_catalogo(path)
 
 
 def main(argv: list[str] | None = None) -> None:

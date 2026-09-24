@@ -13,7 +13,10 @@ import pytest
 from bome_navaja import index as index_module
 from bome_navaja.index import SCHEMA_VERSION, SumarioIndex
 from bome_navaja.models import (
+    BomeBlockedError,
+    BomeHTTPError,
     BomeIndexUnavailableError,
+    BomeNotFoundError,
     BomeIndexVersionError,
     BulletinRef,
 )
@@ -497,7 +500,7 @@ def test_estado(filled: SumarioIndex) -> None:
     filled.registrar_calendario([B1, B2, BX, OLD, ref("BOME-B-2026-6416", date(2026, 9, 22))])
     filled.guardar_boletin(ref("BOME-B-2026-6400", date(2026, 8, 1)), [], "error", error="boom")
     state = filled.estado()
-    assert state.boletines == {"indexado": 3, "sin_sumarios": 1, "error": 1, "total": 5}
+    assert state.boletines == {"indexado": 3, "sin_sumarios": 1, "error": 1, "roto": 0, "total": 5}
     assert state.articulos == 9
     assert state.articulos_con_sumario == 7
     assert (state.fecha_min, state.fecha_max) == (date(2014, 1, 3), date(2026, 9, 18))
@@ -760,7 +763,7 @@ def test_v1_index_is_migrated_in_place(tmp_path: Path) -> None:
     build_v1(path, ["Cese del director.", "Ceses varios.", "Procese el expediente.", None, "  "])
     index = SumarioIndex(path)
     try:
-        assert index.version_esquema() == SCHEMA_VERSION == 2
+        assert index.version_esquema() == SCHEMA_VERSION == 3
         state = index.estado()
         assert state.articulos == 5
         assert state.boletines["indexado"] == 1
@@ -997,3 +1000,276 @@ def test_migration_normalizes_each_sumario_once(tmp_path: Path, monkeypatch: pyt
 def test_busy_timeout_covers_a_long_migration(idx: SumarioIndex) -> None:
     timeout_ms = idx._conn().execute("PRAGMA busy_timeout").fetchone()[0]
     assert timeout_ms >= 15_000
+
+
+# --------------------------------------------------------------------------- site-guard task 2: schema v3
+
+
+def http_error(status: int | None, cve: str = "BOME-B-2018-5522") -> BomeHTTPError:
+    url = f"{BASE}/bome/{cve}"
+    if status is None:
+        return BomeHTTPError(f"request to {url!r} failed: timed out", status=None, url=url)
+    return BomeHTTPError(f"HTTP {status} for {url}", status=status, url=url)
+
+
+def failure(index: SumarioIndex, cve: str) -> tuple[str, int | None, int]:
+    """``(estado, http_status, fallos_5xx)`` of a stored bulletin."""
+    row = index._conn().execute(
+        "SELECT estado, http_status, fallos_5xx FROM bulletins WHERE cve = ?", (cve,)
+    ).fetchone()
+    return (row[0], row[1], row[2])
+
+
+BROKEN = ref("BOME-B-2018-5522", date(2018, 3, 2))
+
+
+def test_a_new_5xx_bulletin_is_an_error_with_its_status(idx: SumarioIndex) -> None:
+    assert idx.guardar_boletin(BROKEN, [], "error", error=http_error(500)) == "error"
+    assert failure(idx, BROKEN.cve) == ("error", 500, 1)
+
+
+def test_a_second_5xx_makes_the_bulletin_roto(idx: SumarioIndex) -> None:
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    assert idx.guardar_boletin(BROKEN, [], "error", error=http_error(502)) == "roto"
+    assert failure(idx, BROKEN.cve) == ("roto", 502, 2)
+    assert idx.estado_boletin(BROKEN.cve) == "roto"
+    assert idx.estados_boletines()[BROKEN.cve] == "roto"
+    # A further failure without an HTTP answer does not un-break it.
+    assert idx.guardar_boletin(BROKEN, [], "error", error=http_error(None)) == "roto"
+    assert failure(idx, BROKEN.cve) == ("roto", None, 2)
+
+
+def test_non_5xx_failures_never_make_a_bulletin_roto(idx: SumarioIndex) -> None:
+    not_found = BomeNotFoundError(f"not found: {BASE}/bome/X", status=404, url=f"{BASE}/bome/X")
+    for error in (not_found, not_found, http_error(None), http_error(None), "parse failure", RuntimeError("x")):
+        assert idx.guardar_boletin(BROKEN, [], "error", error=error) == "error"
+    assert failure(idx, BROKEN.cve) == ("error", None, 0)
+    idx.guardar_boletin(BROKEN, [], "error", error=not_found)
+    assert failure(idx, BROKEN.cve) == ("error", 404, 0)
+
+
+def test_a_timeout_between_two_5xx_does_not_reset_the_count(idx: SumarioIndex) -> None:
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(None))
+    assert failure(idx, BROKEN.cve) == ("error", None, 1)
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    assert failure(idx, BROKEN.cve) == ("roto", 500, 2)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: BomeBlockedError("HTTP 503 for x", status=503, url="x"), id="blocked-503"),
+        pytest.param(lambda: BomeHTTPError("HTTP 503 for x", status=503, url="x"), id="plain-503"),
+    ],
+)
+def test_a_503_is_the_site_refusing_not_a_broken_page(idx: SumarioIndex, make) -> None:
+    for _ in range(3):
+        assert idx.guardar_boletin(BROKEN, [], "error", error=make()) == "error"
+    assert failure(idx, BROKEN.cve) == ("error", 503, 0)
+
+
+def test_success_resets_the_failure_info(idx: SumarioIndex) -> None:
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    assert idx.guardar_boletin(BROKEN, [art(BROKEN, 1, "Cese del director.")], "indexado") == "indexado"
+    assert failure(idx, BROKEN.cve) == ("indexado", None, 0)
+    assert idx.buscar("cese").total == 1
+    # Counting starts again from zero.
+    idx.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    assert failure(idx, BROKEN.cve) == ("indexado", 500, 1)
+
+
+def test_an_indexed_bulletin_is_never_downgraded_to_roto(filled: SumarioIndex) -> None:
+    for _ in range(3):
+        assert filled.guardar_boletin(B2, [], "error", error=http_error(500, B2.cve)) == "indexado"
+    assert failure(filled, B2.cve) == ("indexado", 500, 3)
+    assert filled.buscar("hacienda").total == 1  # articles kept
+    for _ in range(2):
+        assert filled.guardar_boletin(OLD, [], "error", error=http_error(500, OLD.cve)) == "sin_sumarios"
+    assert failure(filled, OLD.cve) == ("sin_sumarios", 500, 2)
+
+
+def test_roto_cannot_be_stored_directly(idx: SumarioIndex) -> None:
+    with pytest.raises(ValueError):
+        idx.guardar_boletin(BROKEN, [], "roto")  # type: ignore[arg-type]
+
+
+def test_pending_counts_only_the_default_sync_range(filled: SumarioIndex) -> None:
+    # An index synced from 2014 by an earlier version keeps those calendar rows.
+    new = ref("BOME-B-2018-5500", date(2018, 1, 2))
+    new_error = ref("BOME-B-2026-6400", date(2026, 8, 1))
+    old = ref("BOME-B-2016-5300", date(2016, 5, 3))
+    old_error = ref("BOME-B-2017-5450", date(2017, 12, 29))
+    filled.registrar_calendario([B1, B2, BX, OLD, new, new_error, old, old_error])
+    filled.guardar_boletin(new_error, [], "error", error="boom")
+    filled.guardar_boletin(old_error, [], "error", error="boom")
+    state = filled.estado()
+    assert index_module.SYNC_DEFAULT_START == date(2018, 1, 1)
+    assert state.pendientes == 2  # 2018-5500 (never processed) and the 2026 error
+    assert state.pendientes_anteriores_2018 == 2  # reported, not hidden
+    cobertura = filled.buscar("cese").cobertura
+    assert (cobertura["pendientes"], cobertura["pendientes_anteriores_2018"]) == (2, 2)
+    assert state.to_dict()["pendientes_anteriores_2018"] == 2
+
+
+def test_the_first_day_of_2018_is_pending_and_the_last_of_2017_is_not(idx: SumarioIndex) -> None:
+    idx.registrar_calendario(
+        [ref("BOME-B-2017-5499", date(2017, 12, 31)), ref("BOME-B-2018-5500", date(2018, 1, 1))]
+    )
+    state = idx.estado()
+    assert (state.pendientes, state.pendientes_anteriores_2018) == (1, 1)
+
+
+def test_rotos_are_counted_and_are_not_pending_work(filled: SumarioIndex) -> None:
+    other = ref("BOME-B-2026-6400", date(2026, 8, 1))
+    filled.registrar_calendario([B1, B2, BX, OLD, BROKEN, other])
+    filled.guardar_boletin(other, [], "error", error=http_error(500, other.cve))
+    filled.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    filled.guardar_boletin(BROKEN, [], "error", error=http_error(500))
+    state = filled.estado()
+    assert state.boletines == {"indexado": 3, "sin_sumarios": 1, "error": 1, "roto": 1, "total": 6}
+    assert state.pendientes == 1  # the error only: the roto is skipped work, not pending
+    cobertura = filled.buscar("cese").cobertura
+    assert (cobertura["pendientes"], cobertura["rotos"]) == (1, 1)
+    assert cobertura["boletines_indexados"] == 4
+
+
+V2_DDL = V1_DDL.replace("'unicode61 remove_diacritics 2'", "'trigram case_sensitive 1'")
+
+
+def build_v2(path: Path) -> None:
+    """A schema-v2 index file as v0.0.2 wrote it, with every kind of stored failure."""
+    url = BASE + "/bome/{}"
+    rows = [
+        # cve, number, date, estado, error_code, error_message, n_articulos
+        ("BOME-B-2026-6375", 6375, "2026-05-01", "indexado", None, None, 2),
+        ("BOME-B-2026-6376", 6376, "2026-05-02", "indexado", "BomeHTTPError",
+         "HTTP 500 for " + url.format("BOME-B-2026-6376"), 1),
+        ("BOME-B-2014-5092", 5092, "2014-01-03", "sin_sumarios", None, None, 0),
+        ("BOME-B-2018-5522", 5522, "2018-03-02", "error", "BomeHTTPError",
+         "HTTP 500 for " + url.format("BOME-B-2018-5522"), 0),
+        ("BOME-B-2017-5400", 5400, "2017-01-10", "error", "BomeHTTPError",
+         "HTTP 502 for " + url.format("BOME-B-2017-5400"), 0),
+        ("BOME-B-2017-5401", 5401, "2017-01-11", "error", "BomeNotFoundError",
+         "not found: " + url.format("BOME-B-2017-5401"), 0),
+        ("BOME-B-2017-5402", 5402, "2017-01-12", "error", "BomeHTTPError",
+         "HTTP 404 for " + url.format("BOME-B-2017-5402"), 0),
+        ("BOME-B-2017-5403", 5403, "2017-01-13", "error", "BomeHTTPError",
+         f"request to '{url.format('BOME-B-2017-5403')}' failed: timed out", 0),
+        ("BOME-B-2017-5404", 5404, "2017-01-14", "error", "BomeParseError", "no bulletin header", 0),
+    ]
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V2_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+        conn.execute("INSERT INTO meta VALUES ('last_sync', '{\"estado\": \"completado\"}')")
+        for cve, number, day, estado, code, message, count in rows:
+            conn.execute(
+                "INSERT INTO bulletins VALUES (?, ?, ?, 0, ?, ?, ?, ?, '2026-09-23T10:00:00Z')",
+                (cve, number, day, estado, code, message, count),
+            )
+            conn.execute("INSERT INTO calendar VALUES (?, ?, ?, 0)", (cve, number, day))
+        articles = [
+            ("BOME-B-2026-6375", 1, "Cese del director."),
+            ("BOME-B-2026-6375", 2, "Nombramiento de personal eventual."),
+            ("BOME-B-2026-6376", 3, "Ceses varios."),
+        ]
+        for bulletin, number, sumario in articles:
+            cursor = conn.execute(
+                "INSERT INTO articles (cve, bulletin_cve, number, sumario, departamento, consejeria, "
+                "organismo, consejeria_norm, url, pdf_url, listado_en_bome) "
+                "VALUES (?, ?, ?, ?, 'CAM', 'HACIENDA', 'HACIENDA', 'hacienda', ?, NULL, 1)",
+                (f"BOME-A-2026-{number}", bulletin, number, sumario, f"{url.format(bulletin)}/articulo/{number}"),
+            )
+            conn.execute(
+                "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)", (cursor.lastrowid, normalize(sumario))
+            )
+
+
+def test_v2_index_is_migrated_to_v3_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "v2.sqlite3"
+    build_v2(path)
+    index = SumarioIndex(path)
+    try:
+        assert index.version_esquema() == SCHEMA_VERSION == 3
+        assert failure(index, "BOME-B-2018-5522") == ("roto", 500, 1)
+        assert failure(index, "BOME-B-2017-5400") == ("roto", 502, 1)
+        assert failure(index, "BOME-B-2017-5401") == ("error", 404, 0)
+        assert failure(index, "BOME-B-2017-5402") == ("error", 404, 0)
+        assert failure(index, "BOME-B-2017-5403") == ("error", None, 0)
+        assert failure(index, "BOME-B-2017-5404") == ("error", None, 0)
+        # Stored successes are untouched, even one that recorded a later error.
+        assert failure(index, "BOME-B-2026-6375") == ("indexado", None, 0)
+        assert failure(index, "BOME-B-2026-6376") == ("indexado", None, 0)
+        assert failure(index, "BOME-B-2014-5092") == ("sin_sumarios", None, 0)
+        message = index._conn().execute(
+            "SELECT error_code, error_message, n_articulos, indexed_at FROM bulletins WHERE cve = ?",
+            ("BOME-B-2018-5522",),
+        ).fetchone()
+        assert tuple(message) == (
+            "BomeHTTPError", f"HTTP 500 for {BASE}/bome/BOME-B-2018-5522", 0, "2026-09-23T10:00:00Z"
+        )
+        state = index.estado()
+        assert state.boletines == {"indexado": 2, "sin_sumarios": 1, "error": 4, "roto": 2, "total": 9}
+        assert state.articulos == 3
+        assert state.pendientes == 0  # the 4 remaining errors are all from 2017
+        assert state.pendientes_anteriores_2018 == 4
+        assert state.ultima_sincronizacion == {"estado": "completado"}
+        assert [a.numero for a in index.buscar("cese").articulos] == [3, 1]
+        assert index.buscar("cese").cobertura["rotos"] == 2
+        # The rebuilt table keeps its date index and its CHECK.
+        conn = index._conn()
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(bulletins)")}
+        assert "bulletins_date" in indexes
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE bulletins SET estado = 'banana' WHERE cve = 'BOME-B-2017-5404'")
+        assert conn.execute("SELECT count(*) FROM sqlite_master WHERE name LIKE '%bulletins%old%'").fetchone()[0] == 0
+        # Writes keep working on migrated rows: the migrated 500 already counts once.
+        index.guardar_boletin(ref("BOME-B-2017-5403", date(2017, 1, 13)), [], "error", error=http_error(500))
+        assert failure(index, "BOME-B-2017-5403") == ("error", 500, 1)
+    finally:
+        index.close()
+    again = SumarioIndex(path)
+    try:
+        assert again.version_esquema() == 3
+        assert failure(again, "BOME-B-2018-5522") == ("roto", 500, 1)
+        assert again.buscar("cese").total == 2
+    finally:
+        again.close()
+
+
+def test_v1_index_with_errors_is_migrated_to_v3(tmp_path: Path) -> None:
+    path = tmp_path / "v1.sqlite3"
+    build_v1(path, ["Cese del director."])
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO bulletins VALUES ('BOME-B-2018-5522', 5522, '2018-03-02', 0, 'error', "
+            "'BomeHTTPError', ?, 0, '2026-09-23T10:00:00Z')",
+            (f"HTTP 500 for {BASE}/bome/BOME-B-2018-5522",),
+        )
+    index = SumarioIndex(path)
+    try:
+        assert index.version_esquema() == 3
+        assert failure(index, "BOME-B-2018-5522") == ("roto", 500, 1)
+        assert failure(index, "BOME-B-2026-6375") == ("indexado", None, 0)
+        assert index.buscar("cese").total == 1
+        tokenizer = index._conn().execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'articles_fts'"
+        ).fetchone()[0]
+        assert "trigram" in tokenizer
+    finally:
+        index.close()
+
+
+def test_v3_migration_failure_rolls_back_to_v2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "v2.sqlite3"
+    build_v2(path)
+    monkeypatch.setattr(index_module, "_BULLETINS_DDL", "CREATE TABLE bulletins (broken")
+    with pytest.raises(BomeIndexUnavailableError) as info:
+        SumarioIndex(path)
+    assert info.value.error_code == "indice_no_disponible"
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2"
+        assert raw.execute("SELECT count(*) FROM bulletins").fetchone()[0] == 9
+        columns = {row[1] for row in raw.execute("PRAGMA table_info(bulletins)")}
+        assert "http_status" not in columns

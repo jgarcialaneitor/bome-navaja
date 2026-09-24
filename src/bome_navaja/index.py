@@ -45,11 +45,20 @@ Design choices:
   normalized→original character map.
 * **Errors vs data**: saving a bulletin as ``error`` never discards articles
   indexed earlier for it; it only records the error.
+* **Broken pages** (schema v3): every failure stores the HTTP status of the
+  answer (``http_status``, ``NULL`` when there was no answer at all) and 5xx
+  answers of the bulletin page are counted (``fallos_5xx``). The site answers
+  some bulletin pages with a deterministic HTTP 500 and bans the client after
+  a few of them, so a never-indexed bulletin whose page answered 5xx twice
+  becomes ``roto`` and normal syncs skip it. 503 is a block signal of the
+  site (rate limit or firewall), never evidence of a broken page. A success
+  resets both columns; an indexed bulletin is never downgraded to ``roto``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -63,7 +72,9 @@ from pathlib import Path
 from typing import Any, Literal, ParamSpec, TypeVar
 
 from .models import (
+    BomeBlockedError,
     BomeError,
+    BomeHTTPError,
     BomeIndexUnavailableError,
     BomeIndexVersionError,
     BomeStorageError,
@@ -74,13 +85,23 @@ from .paths import index_path
 from .search import ArticuloEncontrado, BusquedaInvalidaError
 from .text import Term, and_groups, ignorable, normalize, phrase_starts, term_from_dict
 
-SCHEMA_VERSION = 2
-"""v1 (task 5) used a word tokenizer; v2 uses trigram and is migrated in place."""
+SCHEMA_VERSION = 3
+"""v1 (task 5) used a word tokenizer; v2 uses trigram; v3 remembers HTTP failures
+per bulletin (``http_status``, ``fallos_5xx``, state ``roto``). Older files are
+migrated in place."""
 
 MIN_SQLITE_VERSION = (3, 34, 0)
 """First SQLite with the FTS5 ``trigram`` tokenizer."""
 
 TRIGRAM_MIN_CHARS = 3
+
+SYNC_DEFAULT_START = date(2018, 1, 1)
+"""First day a sync covers when no ``desde`` is given (re-exported by
+:mod:`bome_navaja.sync`). bomemelilla.es is an incomplete migration before 2018
+(missing bulletins, pages answering HTTP 500 that the firewall counts, sumarios
+only from late 2016), so older bulletins are left to the old melilla.es portal.
+Only calendar bulletins from this day on count as ``pendientes``; older ones not
+indexed are reported apart as ``pendientes_anteriores_2018``."""
 
 LEASE_STALE_SECONDS = 180.0
 """A sync lease whose heartbeat is older than this belongs to a dead process."""
@@ -96,7 +117,13 @@ MAX_DESPLAZAMIENTO = 1_000_000
 SNIPPET_CHARS = 220
 
 EstadoBoletin = Literal["indexado", "sin_sumarios", "error"]
-ESTADOS: tuple[str, ...] = ("indexado", "sin_sumarios", "error")
+"""States a caller can store; ``roto`` is derived by the index from the failures."""
+ESTADOS_GUARDABLES: tuple[str, ...] = ("indexado", "sin_sumarios", "error")
+ESTADOS: tuple[str, ...] = ("indexado", "sin_sumarios", "error", "roto")
+"""Every stored state, as counted by :meth:`SumarioIndex.estado`."""
+
+ROTO_TRAS_FALLOS_5XX = 2
+"""5xx answers of a bulletin page after which a never-indexed bulletin is ``roto``."""
 Orden = Literal["fecha", "relevancia"]
 Coincidencia = Literal["fragmento", "palabra"]
 COINCIDENCIAS: tuple[str, ...] = ("fragmento", "palabra")
@@ -119,23 +146,31 @@ _FTS_DDL = (
     "USING fts5 (texto, tokenize = 'trigram case_sensitive 1')"
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS bulletins (
+_BULLETINS_DDL = """CREATE TABLE IF NOT EXISTS bulletins (
     cve TEXT PRIMARY KEY,
     number INTEGER NOT NULL,
     date TEXT,
     extraordinary INTEGER NOT NULL,
-    estado TEXT NOT NULL CHECK (estado IN ('indexado', 'sin_sumarios', 'error')),
+    estado TEXT NOT NULL CHECK (estado IN ('indexado', 'sin_sumarios', 'error', 'roto')),
     error_code TEXT,
     error_message TEXT,
     n_articulos INTEGER NOT NULL DEFAULT 0,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    http_status INTEGER,
+    fallos_5xx INTEGER NOT NULL DEFAULT 0
+)"""
+_BULLETINS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS bulletins_date ON bulletins (date)"
+_V2_BULLETIN_COLUMNS = (
+    "cve, number, date, extraordinary, estado, error_code, error_message, n_articulos, indexed_at"
+)
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS bulletins_date ON bulletins (date);
+{_BULLETINS_DDL};
+{_BULLETINS_INDEX_DDL};
 CREATE TABLE IF NOT EXISTS articles (
     id INTEGER PRIMARY KEY,
     cve TEXT NOT NULL UNIQUE,
@@ -262,8 +297,10 @@ class ResultadoIndice(JsonModel):
     siguiente: int | None
     """Offset of the next page, or ``None`` when this is the last one."""
     cobertura: dict[str, Any]
-    """Indexed range and count, last sync time and whether a sync is running:
-    results only cover what has been indexed so far."""
+    """Indexed range and count, pending (from :data:`SYNC_DEFAULT_START`, older
+    ones apart as ``pendientes_anteriores_2018``) and broken (``rotos``)
+    bulletins, last sync time and whether a sync is running: results only cover
+    what has been indexed so far."""
     nota: str
 
 
@@ -282,7 +319,13 @@ class EstadoIndice(JsonModel):
     calendario_conocidos: int
     """Bulletins known from the site calendar (recorded by the last sync)."""
     pendientes: int
-    """Calendar bulletins not indexed yet, or whose last attempt failed."""
+    """Calendar bulletins dated from :data:`SYNC_DEFAULT_START` on (or undated)
+    not indexed yet, or whose last attempt failed. Rotos (``boletines["roto"]``)
+    are not pending: normal syncs skip them."""
+    pendientes_anteriores_2018: int
+    """Same count for calendar bulletins dated before :data:`SYNC_DEFAULT_START`
+    (recorded by syncs of older versions or with an explicit earlier ``desde``):
+    outside the default sync range, so not pending work, but not hidden."""
     ultima_sincronizacion: dict[str, Any] | None
     sincronizacion_en_curso: dict[str, Any] | None
     """Live sync lease (owner, heartbeat), or ``None``."""
@@ -491,6 +534,40 @@ def _storable(article: ArticuloEncontrado) -> ArticuloEncontrado:
     return replace(article, **changes)
 
 
+_BLOCK_STATUS = 503
+"""The site's block signal among the 5xx answers (see :mod:`bome_navaja.client`)."""
+
+
+def _broken_page_answer(status: int | None) -> bool:
+    """True for a 5xx answer that says the page itself is broken (503 is a block)."""
+    return status is not None and 500 <= status <= 599 and status != _BLOCK_STATUS
+
+
+def _http_status(error: BaseException | str | None) -> int | None:
+    """HTTP status carried by ``error`` (``None`` without an HTTP answer)."""
+    return error.status if isinstance(error, BomeHTTPError) else None
+
+
+_STORED_HTTP_STATUS = re.compile(r"HTTP (\d{3}) ")
+
+
+def _stored_http_status(code: str | None, message: str | None) -> int | None:
+    """Status of a failure stored by schema v2, recovered from its message.
+
+    The client words HTTP failures ``HTTP 500 for <url>`` and 404s ``not
+    found: <url>`` (``BomeNotFoundError``); transport failures (``request to
+    '<url>' failed: ...``) and parse errors have no status.
+    """
+    if not message:
+        return None
+    match = _STORED_HTTP_STATUS.match(message)
+    if match:
+        return int(match.group(1))
+    if code == "BomeNotFoundError" and message.startswith("not found: "):
+        return 404
+    return None
+
+
 def _error_info(error: BaseException | str | None) -> tuple[str | None, str | None]:
     if error is None:
         return None, None
@@ -656,8 +733,8 @@ class SumarioIndex:
         inside the same write transaction.
         """
         if self._schema_exists(conn):
-            if self._stored_version(conn) == "1":
-                self._upgrade_from_v1()
+            if self._stored_version(conn) in ("1", "2"):
+                self._upgrade()
             self._check_version(conn)
             return
         with self._tx() as tx:
@@ -673,30 +750,78 @@ class SumarioIndex:
             )
             self._check_version(tx)
 
-    def _upgrade_from_v1(self) -> None:
-        """v1 → v2: rebuild the FTS table with trigrams from ``articles``, locally.
+    def _upgrade(self) -> None:
+        """Migrate a v1 or v2 file to the current schema, locally, in ONE transaction.
 
-        One transaction; bulletin and article rows are kept, nothing is
-        crawled. The version is re-read under the write lock, so a concurrent
-        opener that already migrated makes this a no-op. Each sumario is
-        normalized exactly once, in Python (a SQL function in both the SELECT
-        list and the WHERE clause ran twice per row). Failures roll back and
-        surface from ``__init__`` as :class:`BomeIndexUnavailableError`.
+        Bulletin and article rows are kept, nothing is crawled. The version is
+        re-read under the write lock, so a concurrent opener that already
+        migrated makes this a no-op. Failures roll the whole upgrade back (the
+        file keeps its old version) and surface from ``__init__`` as
+        :class:`BomeIndexUnavailableError`.
         """
         with self._tx() as tx:
-            if self._stored_version(tx) != "1":
-                return
-            tx.execute("DROP TABLE IF EXISTS articles_fts")
-            tx.execute(_FTS_DDL)
-            rows = tx.execute("SELECT id, sumario FROM articles").fetchall()
-            folded = ((row[0], normalize(row[1])) for row in rows)
-            tx.executemany(
-                "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)",
-                ((article_id, text) for article_id, text in folded if text),
-            )
-            tx.execute(
-                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
-            )
+            version = self._stored_version(tx)
+            if version == "1":
+                self._upgrade_v1_to_v2(tx)
+                version = "2"
+            if version == "2":
+                self._upgrade_v2_to_v3(tx)
+                version = "3"
+            if version != self._stored_version(tx):
+                tx.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+
+    @staticmethod
+    def _upgrade_v1_to_v2(tx: sqlite3.Connection) -> None:
+        """v1 → v2: rebuild the FTS table with trigrams from ``articles``.
+
+        Each sumario is normalized exactly once, in Python (a SQL function in
+        both the SELECT list and the WHERE clause ran twice per row).
+        """
+        tx.execute("DROP TABLE IF EXISTS articles_fts")
+        tx.execute(_FTS_DDL)
+        rows = tx.execute("SELECT id, sumario FROM articles").fetchall()
+        folded = ((row[0], normalize(row[1])) for row in rows)
+        tx.executemany(
+            "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)",
+            ((article_id, text) for article_id, text in folded if text),
+        )
+
+    @staticmethod
+    def _upgrade_v2_to_v3(tx: sqlite3.Connection) -> None:
+        """v2 → v3: rebuild ``bulletins`` with the failure columns and state ``roto``.
+
+        SQLite cannot alter a CHECK constraint, so the table is recreated
+        (create, copy, drop, rename, re-index). ``articles`` refers to
+        bulletins only by ``bulletin_cve`` text (no foreign key) and the FTS
+        table by article id, so neither is touched. Failed rows get the status
+        parsed from their stored message; a 5xx (other than 503) becomes
+        ``roto`` at once with ``fallos_5xx = 1``: the site's broken pages
+        answer 500 deterministically, and confirming each one again would fire
+        a burst of 500s that the site's firewall bans. Stored successes keep
+        ``NULL``/0 even if they recorded a later error.
+        """
+        tx.execute(_BULLETINS_DDL.replace("bulletins", "bulletins_v3", 1))
+        tx.execute(
+            f"INSERT INTO bulletins_v3 ({_V2_BULLETIN_COLUMNS}) "
+            f"SELECT {_V2_BULLETIN_COLUMNS} FROM bulletins"
+        )
+        failed = tx.execute(
+            "SELECT cve, error_code, error_message FROM bulletins_v3 WHERE estado = 'error'"
+        ).fetchall()
+        updates = []
+        for cve, code, message in failed:
+            status = _stored_http_status(code, message)
+            if status is None:
+                continue
+            broken = _broken_page_answer(status)
+            updates.append(("roto" if broken else "error", status, int(broken), cve))
+        tx.executemany(
+            "UPDATE bulletins_v3 SET estado = ?, http_status = ?, fallos_5xx = ? WHERE cve = ?",
+            updates,
+        )
+        tx.execute("DROP TABLE bulletins")
+        tx.execute("ALTER TABLE bulletins_v3 RENAME TO bulletins")
+        tx.execute(_BULLETINS_INDEX_DDL)
 
     @_reading
     def version_esquema(self) -> int:
@@ -716,18 +841,25 @@ class SumarioIndex:
         articles: Sequence[ArticuloEncontrado],
         estado: EstadoBoletin,
         error: BaseException | str | None = None,
-    ) -> None:
+    ) -> str:
         """Store one bulletin and its articles in a single transaction.
 
-        Idempotent: the bulletin's previous articles are replaced; duplicate
-        article CVEs are collapsed, the last one wins. Any SQLite failure rolls
-        the transaction back and raises :class:`BomeStorageError`. With
-        ``estado="error"`` nothing indexed earlier is discarded: an already
-        indexed bulletin keeps its articles and state, and only the error is
-        recorded.
+        Returns the state the bulletin ends with. Idempotent: the bulletin's
+        previous articles are replaced; duplicate article CVEs are collapsed,
+        the last one wins. Any SQLite failure rolls the transaction back and
+        raises :class:`BomeStorageError`.
+
+        With ``estado="error"`` nothing indexed earlier is discarded: an already
+        indexed bulletin keeps its articles and state, and only the failure is
+        recorded. The failure's HTTP status (``error.status`` of a
+        :class:`BomeHTTPError`, else ``NULL``) goes to ``http_status``; a 5xx
+        answer other than 503 increments ``fallos_5xx``, and a bulletin that is
+        not indexed becomes ``roto`` once it reaches
+        :data:`ROTO_TRAS_FALLOS_5XX` (a failure without HTTP answer never
+        changes the count). Storing a success resets both columns.
         """
-        if estado not in ESTADOS:
-            raise ValueError(f"estado must be one of {ESTADOS}, got {estado!r}")
+        if estado not in ESTADOS_GUARDABLES:
+            raise ValueError(f"estado must be one of {ESTADOS_GUARDABLES}, got {estado!r}")
         # One row per article CVE: a page listing an article twice keeps the
         # last occurrence (at the position of the first one).
         # Lone surrogates (not UTF-8 encodable) are replaced by "?" before storing.
@@ -738,17 +870,26 @@ class SumarioIndex:
         code, message = _error_info(error)
         now = utc_iso()
         day = ref.date.isoformat() if ref.date else None
+        status: int | None = None
+        failures = 0
+        stored = estado
         with self._tx() as conn:
             if estado == "error":
+                status = _http_status(error)
+                broken = _broken_page_answer(status) and not isinstance(error, BomeBlockedError)
                 previous = conn.execute(
-                    "SELECT estado FROM bulletins WHERE cve = ?", (ref.cve,)
+                    "SELECT estado, fallos_5xx FROM bulletins WHERE cve = ?", (ref.cve,)
                 ).fetchone()
-                if previous is not None and previous[0] != "error":
+                failures = (previous[1] if previous is not None else 0) + int(broken)
+                if previous is not None and previous[0] not in ("error", "roto"):
                     conn.execute(
-                        "UPDATE bulletins SET error_code = ?, error_message = ? WHERE cve = ?",
-                        (code, message, ref.cve),
+                        "UPDATE bulletins SET error_code = ?, error_message = ?, http_status = ?, "
+                        "fallos_5xx = ? WHERE cve = ?",
+                        (code, message, status, failures, ref.cve),
                     )
-                    return
+                    return str(previous[0])
+                if failures >= ROTO_TRAS_FALLOS_5XX:
+                    stored = "roto"
             stale = [
                 row[0]
                 for row in conn.execute("SELECT id FROM articles WHERE bulletin_cve = ?", (ref.cve,))
@@ -762,13 +903,13 @@ class SumarioIndex:
                 conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
             conn.execute(
                 "INSERT OR REPLACE INTO bulletins (cve, number, date, extraordinary, estado, "
-                "error_code, error_message, n_articulos, indexed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ref.cve, ref.number, day, int(ref.extraordinary), estado, code, message,
-                 0 if estado == "error" else len(articles), now),
+                "error_code, error_message, n_articulos, indexed_at, http_status, fallos_5xx) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ref.cve, ref.number, day, int(ref.extraordinary), stored, code, message,
+                 0 if estado == "error" else len(articles), now, status, failures),
             )
             if estado == "error":
-                return
+                return stored
             for article in articles:
                 cursor = conn.execute(
                     "INSERT INTO articles (cve, bulletin_cve, number, sumario, departamento, "
@@ -784,6 +925,7 @@ class SumarioIndex:
                         "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)",
                         (cursor.lastrowid, folded),
                     )
+        return stored
 
     def registrar_calendario(self, refs: Sequence[BulletinRef]) -> None:
         """Remember the bulletins the site calendar lists (for ``pendientes``)."""
@@ -837,14 +979,35 @@ class SumarioIndex:
             "fecha_min": row[1],
             "fecha_max": row[2],
             "pendientes": pending,
+            "pendientes_anteriores_2018": self._pending_before_default_start(),
+            "rotos": self._broken(),
             "ultima_sincronizacion": (last or {}).get("finalizado"),
             "sincronizacion_en_curso": self.lease() is not None,
         }
 
+    _UNFINISHED_CALENDAR = (
+        "SELECT count(*) FROM calendar c LEFT JOIN bulletins b ON b.cve = c.cve "
+        "WHERE (b.cve IS NULL OR b.estado = 'error') AND "
+    )
+
     def _pending(self) -> int:
+        """Calendar bulletins from :data:`SYNC_DEFAULT_START` on (or undated) never
+        processed or whose last attempt failed (not rotos)."""
         return self._conn().execute(
-            "SELECT count(*) FROM calendar c LEFT JOIN bulletins b ON b.cve = c.cve "
-            "WHERE b.cve IS NULL OR b.estado = 'error'"
+            self._UNFINISHED_CALENDAR + "(c.date IS NULL OR c.date >= ?)",
+            (SYNC_DEFAULT_START.isoformat(),),
+        ).fetchone()[0]
+
+    def _pending_before_default_start(self) -> int:
+        """Like :meth:`_pending` for calendar bulletins dated before :data:`SYNC_DEFAULT_START`."""
+        return self._conn().execute(
+            self._UNFINISHED_CALENDAR + "c.date < ?", (SYNC_DEFAULT_START.isoformat(),)
+        ).fetchone()[0]
+
+    def _broken(self) -> int:
+        """Bulletins marked ``roto``: skipped by normal syncs, so not pending."""
+        return self._conn().execute(
+            "SELECT count(*) FROM bulletins WHERE estado = 'roto'"
         ).fetchone()[0]
 
     @_reading
@@ -1019,6 +1182,7 @@ class SumarioIndex:
             fecha_max=date.fromisoformat(high) if high else None,
             calendario_conocidos=known,
             pendientes=self._pending(),
+            pendientes_anteriores_2018=self._pending_before_default_start(),
             ultima_sincronizacion=self._last_sync(),
             sincronizacion_en_curso=self.lease(),
         )
@@ -1087,7 +1251,11 @@ __all__ = [
     "MAX_DESPLAZAMIENTO",
     "utc_iso",
     "MAX_LIMITE",
+    "ESTADOS",
+    "ESTADOS_GUARDABLES",
+    "ROTO_TRAS_FALLOS_5XX",
     "SCHEMA_VERSION",
+    "SYNC_DEFAULT_START",
     "ArticuloIndexado",
     "EstadoIndice",
     "ResultadoIndice",

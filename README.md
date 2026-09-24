@@ -5,10 +5,10 @@
 **Servidor MCP para el [Boletín Oficial de la Ciudad Autónoma de Melilla (BOME)](https://bomemelilla.es)**
 
 [![Python](https://img.shields.io/badge/python-3.12+-blue)](#-desarrollo)
-[![MCP](https://img.shields.io/badge/MCP-17%20herramientas-8A2BE2)](#-herramientas)
+[![MCP](https://img.shields.io/badge/MCP-19%20herramientas-8A2BE2)](#-herramientas)
 [![Licencia](https://img.shields.io/badge/licencia-MIT-green)](#-licencia)
 
-*Pregunta por el BOME en lenguaje natural: lista boletines, lee artículos y PDF completos, busca en vivo con la misma lógica que el sitio y consulta al instante un índice local de sumarios.*
+*Pregunta por el BOME en lenguaje natural: lista boletines, lee artículos y PDF completos, busca en vivo con la misma lógica que el sitio, consulta al instante un índice local de sumarios y llega hasta 1985 con el portal antiguo de melilla.es.*
 
 </div>
 
@@ -18,12 +18,13 @@
 
 | | |
 | --- | --- |
-| [🧭 Qué es](#-qué-es) | [💾 PDF descargados](#-pdf-descargados) |
-| [🧰 Herramientas](#-herramientas) | [📂 Dónde guarda los datos](#-dónde-guarda-los-datos) |
-| [🔍 Cómo busca el sitio](#-cómo-busca-el-sitio-y-por-qué-importa) | [🚀 Instalación](#-instalación) |
-| [📇 Índice local de sumarios](#-índice-local-de-sumarios) | [🔒 Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio) |
-| [📖 Leer documentos largos](#-leer-documentos-largos) | [🧪 Desarrollo](#-desarrollo) |
-| [🚧 Limitaciones conocidas](#-limitaciones-conocidas) | [📜 Licencia](#-licencia) |
+| [🧭 Qué es](#-qué-es) | [📂 Dónde guarda los datos](#-dónde-guarda-los-datos) |
+| [🧰 Herramientas](#-herramientas) | [🚀 Instalación](#-instalación) |
+| [🔍 Cómo busca el sitio](#-cómo-busca-el-sitio-y-por-qué-importa) | [🔒 Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio) |
+| [📇 Índice local de sumarios](#-índice-local-de-sumarios) | [🧪 Desarrollo](#-desarrollo) |
+| [🏛️ Portal antiguo (melilla.es)](#-portal-antiguo-melillaes) | [🚧 Limitaciones conocidas](#-limitaciones-conocidas) |
+| [📖 Leer documentos largos](#-leer-documentos-largos) | [📜 Licencia](#-licencia) |
+| [💾 PDF descargados](#-pdf-descargados) | |
 
 ---
 
@@ -31,13 +32,15 @@
 
 `bome-navaja` es un programa local que tu cliente de IA (Claude Desktop, Claude Code…) lanza en tu máquina y con el que habla por el protocolo MCP. Le da al modelo acceso a [bomemelilla.es](https://bomemelilla.es): el calendario de boletines, el árbol de artículos de cada boletín, el texto completo de artículos y boletines, los PDF, el buscador del sitio y un índice local de sumarios para búsquedas instantáneas.
 
-**Cobertura** (la del propio sitio):
+**Cobertura** (la de bomemelilla.es):
 
 | Periodo | Qué hay |
 | --- | --- |
-| Desde el 3 de enero de 2014 | Todos los boletines, ordinarios (`BOME-B`) y extraordinarios (`BOME-BX`), en el calendario y con su árbol de artículos |
+| Desde el 3 de enero de 2014 | Los boletines ordinarios (`BOME-B`) y extraordinarios (`BOME-BX`), en el calendario y con su árbol de artículos (antes de 2018 faltan boletines) |
 | Desde finales de 2016 | Sumario de cada artículo, texto HTML completo y PDF |
-| 2014–2016 | Los artículos **no tienen sumario ni texto**, y los PDF del boletín y de los artículos **no se pueden descargar** (el sitio responde 404 aunque muestre el botón). Lo único que se puede hacer es buscar dentro del contenido con `buscar_bomes` y `ambito="contenido"` |
+| 2014–2016 | Los artículos **no tienen sumario ni texto**, y los PDF del boletín y de los artículos **no se pueden descargar** (el sitio responde 404 aunque muestre el botón). En bomemelilla.es solo se puede buscar dentro del contenido con `buscar_bomes` y `ambito="contenido"` |
+
+Para lo anterior a 2018, y para todo lo anterior a 2014, está el **[portal antiguo de melilla.es](#-portal-antiguo-melillaes)**: boletines del 3 de enero de 1985 al 12 de marzo de 2021, con sumarios de artículos desde ~1991 y el PDF de cada página.
 
 `bome-navaja` **solo lee datos públicos**: no inicia sesión, no usa credenciales y no envía nada al sitio más allá de las consultas.
 
@@ -45,11 +48,11 @@
 
 ## 🧰 Herramientas
 
-Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `error_http`, `sitio_bloqueando`, `indice_no_disponible`…); nunca rompen la conversación con una excepción.
+Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `argumento_invalido`, `error_http`, `sitio_bloqueando`, `pausa_preventiva`, `indice_no_disponible`, y para el portal antiguo `url_pdf_invalida` y `boletin_ambiguo`…). Los mensajes de error nombran el sitio que falló (bomemelilla.es o melilla.es); nunca rompen la conversación con una excepción.
 
 | Grupo | Herramienta | Para qué sirve |
 | --- | --- | --- |
-| **Navegar** | `listar_bomes` | Boletines publicados entre dos fechas (por defecto, los últimos 30 días; como mucho 500, del más reciente al más antiguo) |
+| **Navegar** | `listar_bomes` | Boletines publicados entre dos fechas (por defecto, los últimos 30 días; como mucho 500, del más reciente al más antiguo), cada uno con su `origen`; antes del 13 de marzo de 2021 añade los que solo tiene el portal antiguo |
 | | `ver_bome` | Un boletín con su árbol departamento → consejería → organismo → artículos; con `recuperar_ocultos` busca los artículos que la página omite |
 | | `ver_sumario` | La vista web del sumario, con la primera página de cada artículo (algunos sumarios son texto libre y dan 0 entradas: usa `ver_bome`) |
 | | `resolver_cve` | URL canónica de cualquier CVE (boletín, artículo, sumario o página) |
@@ -57,17 +60,19 @@ Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `err
 | | `listar_organismos` | Organismos de una consejería con su id, para filtrar búsquedas |
 | **Leer y descargar** | `leer_articulo` | Texto completo de un artículo, paginado |
 | | `leer_boletin` | Texto completo de un boletín entero (su PDF) con sus metadatos, paginado |
-| | `leer_pdf` | Texto del PDF de cualquier CVE, paginado |
-| | `descargar_pdf` | Guarda el PDF de un CVE en la caché local y devuelve su ruta |
+| | `leer_pdf` | Texto del PDF de cualquier CVE, o de un PDF del portal antiguo con `url`, paginado |
+| | `descargar_pdf` | Guarda el PDF de un CVE (o de una `url` del portal antiguo) en la caché local y devuelve su ruta |
 | **Buscar en vivo** | `buscar_bomes` | El buscador avanzado del sitio: devuelve **boletines**, 10 por página |
 | | `buscar_articulos` | Devuelve **artículos**: busca boletines, abre cada uno y se queda con los artículos cuyo sumario coincide |
 | **Índice local** | `buscar_en_indice` | Búsqueda instantánea de artículos en el índice local de sumarios |
 | | `estado_indice` | Qué hay indexado y cómo va la sincronización |
 | | `sincronizar_indice` | Arranca en segundo plano la sincronización del índice |
 | | `cancelar_sincronizacion` | Pide parar la sincronización en curso |
-| **Servidor** | `estado_servidor` | Versión, rutas de datos, SQLite disponible y configuración, sin tocar la red |
+| **Portal antiguo** | `buscar_bome_antiguo` | Búsqueda literal de artículos en melilla.es (1985–2021), con sumario y PDF de cada página |
+| | `ver_bome_antiguo` | Un boletín del portal antiguo (por CVE o `dboid`): PDF entero y artículos con sus páginas |
+| **Servidor** | `estado_servidor` | Versión, rutas de datos, SQLite disponible, guardias de los dos sitios y configuración, sin tocar la red |
 
-Los CVE tienen la forma `BOME-L-AAAA-N`: `BOME-B-2026-6416` (boletín), `BOME-BX-2026-41` (extraordinario), `BOME-A-2026-1051` (artículo), `BOME-S-2026-6416` (sumario), `BOME-P-2026-4784` (página). Se aceptan en minúsculas y con espacios.
+Los CVE tienen la forma `BOME-L-AAAA-N`: `BOME-B-2026-6416` (boletín), `BOME-BX-2026-41` (extraordinario), `BOME-A-2026-1051` (artículo), `BOME-S-2026-6416` (sumario), `BOME-P-2026-4784` (página), `BOME-PX-2021-362` (página de un extraordinario). Se aceptan en minúsculas y con espacios.
 
 ---
 
@@ -136,18 +141,44 @@ En los dos modos se ignoran tildes y mayúsculas, y un `*` final se acepta pero 
 
 - **Solo se sincroniza cuando el modelo llama a `sincronizar_indice`.** El servidor nunca recorre el sitio por su cuenta, ni al arrancar.
 - La herramienta vuelve al instante; la sincronización sigue **en segundo plano**, del boletín más reciente al más antiguo.
-- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos. El histórico completo (~1.900 boletines desde 2014) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
-- Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`).
-- Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
-- `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está esperando por un bloqueo); lo ya indexado se conserva.
-- Si el sitio **rechaza las peticiones** (403, 429 o 503: límite de ritmo o cortafuegos), la sincronización no marca esos boletines como error: espera (respetando `Retry-After`, con esperas crecientes de 1, 2… hasta 15 minutos) y reintenta. Si el rechazo sigue, o tres boletines seguidos se quedan sin respuesta, termina en estado **`bloqueado`**. En ese caso no la relances enseguida: si es el cortafuegos, espera unas horas.
+- Por defecto cubre **desde el 1 de enero de 2018 hasta hoy**. Antes de 2018 bomemelilla.es está incompleto e inestable (faltan boletines, sus páginas rotas responden HTTP 500 y de ahí vienen los bloqueos del cortafuegos) y casi no hay sumarios que buscar; esos boletines se consultan mejor en el portal antiguo de melilla.es. Puedes pedir un `desde` anterior, pero no es recomendable.
+- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos (más si el sitio responde con errores; ver abajo). El rango por defecto (~1.100 boletines desde 2018) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
+- Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`), salvo los `roto`.
+- Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`, `rotos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
+- `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está en una pausa); lo ya indexado se conserva.
+- **Cuida el cortafuegos del sitio**, que bloquea la IP tras unas 5 respuestas de error (detalle en [Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio)):
+  - No pasa de **3 respuestas de error cada 10 minutos**: si llega al límite, hace una pausa preventiva (la indica `mensaje`), así que puede ir más lenta.
+  - Tras una página de boletín rota (HTTP 500) hace una pausa de **30–60 s**.
+  - Un boletín cuya página respondió 500 dos veces queda como **`roto`**: las sincronizaciones normales lo saltan y `estado_indice` lo cuenta aparte, no como pendiente. `reintentar_rotos: true` los vuelve a pedir, pero cada uno cuesta un 500 que el cortafuegos cuenta: úsalo solo para comprobar si el sitio los arregló.
+  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), termina en estado **`bloqueado`** y `bome-navaja` no vuelve a pedirle nada durante **75 minutos** (o más, si el sitio lo pide con `Retry-After`); `reintentar_tras_segundos` dice cuánto falta. Relánzala pasado ese tiempo: continúa donde quedó.
 - Si tienes **dos clientes** abiertos con `bome-navaja` (por ejemplo, Claude Desktop y Claude Code), solo uno sincroniza: el otro recibe `en_curso_en_otro_proceso`. El turno se considera abandonado si su dueño deja de dar señales durante 3 minutos.
 
-Cada respuesta de `buscar_en_indice` trae un bloque `cobertura` (rango de fechas indexado, boletines indexados y pendientes, última sincronización, si hay una en curso). Si el índice está vacío, devuelve 0 resultados y un `aviso` que sugiere sincronizar o usar `buscar_articulos` mientras tanto.
+Cada respuesta de `buscar_en_indice` trae un bloque `cobertura` (rango de fechas indexado, boletines indexados y pendientes, última sincronización, si hay una en curso). Los pendientes cuentan solo desde 2018; los boletines anteriores que un índice de una versión previa tenga en su calendario sin indexar salen aparte en `pendientes_anteriores_2018` (también en `estado_indice`). Si el índice está vacío, devuelve 0 resultados y un `aviso` que sugiere sincronizar o usar `buscar_articulos` mientras tanto.
 
 ### Dónde está y cómo rehacerlo
 
-El índice es el fichero `sumarios.sqlite3` dentro de la [carpeta de datos](#-dónde-guarda-los-datos); `estado_servidor` y `estado_indice` muestran su ruta. Para rehacerlo desde cero, cierra el cliente, borra `sumarios.sqlite3` (y `sumarios.sqlite3-wal` / `sumarios.sqlite3-shm` si existen) y vuelve a llamar a `sincronizar_indice`. Un índice de una versión anterior de `bome-navaja` se migra solo al abrirlo, sin volver a descargar nada.
+El índice es el fichero `sumarios.sqlite3` dentro de la [carpeta de datos](#-dónde-guarda-los-datos); `estado_servidor` y `estado_indice` muestran su ruta. Para rehacerlo desde cero, cierra el cliente, borra `sumarios.sqlite3` (y `sumarios.sqlite3-wal` / `sumarios.sqlite3-shm` si existen) y vuelve a llamar a `sincronizar_indice`. Un índice de una versión anterior de `bome-navaja` se migra solo al abrirlo, sin volver a descargar nada; los boletines que tenían anotado un HTTP 500 pasan a `roto`.
+
+---
+
+## 🏛️ Portal antiguo (melilla.es)
+
+bomemelilla.es es una migración **incompleta** antes de 2018: de 2014 a 2017 le faltan **141 boletines** (y ahí se concentran sus páginas rotas), y no tiene **nada anterior a 2014**. El [portal antiguo del BOME](https://www.melilla.es/melillaPortal/contenedor.jsp?seccion=bome.jsp) en melilla.es, congelado desde marzo de 2021, conserva el catálogo entero: **3.260 boletines del 3 de enero de 1985 al 12 de marzo de 2021**, con sumarios de artículos desde ~1991 y el PDF de cada página.
+
+| Qué quieres | Herramienta |
+| --- | --- |
+| Saber qué boletines hay en unas fechas | `listar_bomes`: antes del 13 de marzo de 2021 junta los dos catálogos (si un boletín está en los dos gana bomemelilla.es); los que solo tiene el portal antiguo traen `origen: "melilla.es"`, su `dboid` y `ver_con` |
+| Buscar artículos | `buscar_bome_antiguo`: búsqueda **literal** en el texto de los artículos (3–200 caracteres; no busca por número de boletín). El portal devuelve todo en una sola página, así que conviene usar términos concretos. Cada artículo trae boletín, fecha, número, tipo, sumario, consejería/dirección/sección y el PDF de cada página. Filtra por fechas (`desde`/`hasta`) y devuelve como mucho `limite` artículos (por defecto 100, máximo 500) con `total` y `truncado` |
+| Ver un boletín | `ver_bome_antiguo` con `cve` o `dboid`: el PDF del boletín entero y sus artículos con sus páginas |
+| Leer o guardar un PDF | `leer_pdf` / `descargar_pdf` con `url` (solo las URL `https://www.melilla.es/mandar.php/...` que dan las dos herramientas anteriores) |
+
+Si `ver_bome` no encuentra un boletín anterior a 2022 en bomemelilla.es, su error sugiere `ver_bome_antiguo`.
+
+**Identificadores.** Desde 2014 la numeración del portal antiguo coincide con los CVE de bomemelilla.es (`BOME-B-2016-5302`, `BOME-BX-2021-16`). Antes de 2014 los identificadores tienen la misma forma pero **no son CVE de bomemelilla.es** (`cve_oficial: false`) y algunos se repiten (24 casos, por ejemplo dos «Extra 1» en 1986): `ver_bome_antiguo` responde entonces `boletin_ambiguo` con los candidatos (`dboid`, fecha, sufijo), y basta con repetir con el `dboid`. Además, **14 boletines tienen una fecha distinta en cada sitio** (por ejemplo `BOME-B-2015-5230`: 17-12-2015 en bomemelilla.es y 01-05-2015 en melilla.es); cita la fecha junto al origen.
+
+**robots.txt y política de uso.** El `robots.txt` de melilla.es no permite a los robots las fichas de boletín (`ficha_bome.jsp`) ni los PDF (`/mandar.php`). `bome-navaja` solo los pide **bajo demanda**: cuando el modelo llama a una herramienta para responderte, una petición cada vez. **Nunca los recorre en masa** y la sincronización del índice no toca el portal antiguo.
+
+**Su propia guardia y su caché.** El portal antiguo es otro sitio, así que tiene su propia [guardia](#-seguridad-y-cortesía-con-el-sitio) con las mismas reglas (como mucho 3 respuestas de error cada 10 minutos; 75 minutos sin pedirle nada si bloquea), guardada aparte en `estado_sitio_melilla.json`; sus errores nunca cuentan para bomemelilla.es, y `estado_servidor` la muestra en `guardia_portal_antiguo`. Va a su propio ritmo (~1–1,5 s entre peticiones, de una en una). El catálogo (~1 MB) se descarga con una sola petición la primera vez que hace falta y se guarda en `catalogo_portal_antiguo.json`; como el portal está congelado, se reutiliza siempre (`estado_servidor` lo muestra en `catalogo_portal_antiguo`; borrarlo fuerza una nueva descarga). Si el portal no responde, `listar_bomes` devuelve igualmente lo de bomemelilla.es con un `aviso`.
 
 ---
 
@@ -173,7 +204,8 @@ Para seguir leyendo, pasa `desde_pagina` y `desde_caracter` tal cual vienen en `
 ## 💾 PDF descargados
 
 - `descargar_pdf` (y los lectores cuando hace falta) guardan cada PDF en la carpeta de PDF, por defecto `pdfs/` dentro de la [carpeta de datos](#-dónde-guarda-los-datos).
-- El nombre del fichero es **siempre el CVE canónico** (`BOME-P-2026-4784.pdf`): nunca sale de datos del servidor ni de lo que escriba el modelo, y **no hay parámetro para elegir otra ruta**. Solo tú puedes moverla, con `BOME_NAVAJA_PDF_DIR`.
+- El nombre del fichero es **siempre el CVE canónico** (`BOME-P-2026-4784.pdf`) o, para un PDF del portal antiguo, la ruta de su URL ya validada (`https://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf` → `melilla-9-4914-5302_73.pdf`): nunca sale de datos del servidor ni de lo que escriba el modelo, y **no hay parámetro para elegir otra ruta**. Solo tú puedes moverla, con `BOME_NAVAJA_PDF_DIR`.
+- Del portal antiguo solo se aceptan URL `https://www.melilla.es/mandar.php/n/<número>/<número>/<nombre>.pdf` (sus enlaces `http://` se pasan a https); cualquier otra se rechaza con `url_pdf_invalida` sin tocar la red.
 - Una copia válida en caché se reutiliza; `refrescar: true` fuerza la descarga. La escritura es atómica, y una descarga fallida conserva la copia anterior.
 - Límite: **100 MB** por PDF (`documento_demasiado_grande`). Como referencia, un boletín ordinario ronda los 4 MB.
 
@@ -187,7 +219,7 @@ Para seguir leyendo, pasa `desde_pagina` y `desde_caracter` tal cual vienen en `
 | macOS | `~/Library/Application Support/bome-navaja` |
 | Linux y otros | `$XDG_DATA_HOME/bome-navaja` o, si no está definida, `~/.local/share/bome-navaja` |
 
-Dentro están el índice (`sumarios.sqlite3`) y los PDF (`pdfs/`). Nada se crea hasta que hace falta.
+Dentro están el índice (`sumarios.sqlite3`), los PDF (`pdfs/`), el estado de la [guardia del sitio](#-seguridad-y-cortesía-con-el-sitio) (`estado_sitio.json`, y `estado_sitio_melilla.json` para el portal antiguo) y la caché del catálogo del [portal antiguo](#-portal-antiguo-melillaes) (`catalogo_portal_antiguo.json`). Nada se crea hasta que hace falta.
 
 | Variable | Efecto |
 | --- | --- |
@@ -207,7 +239,7 @@ Hay tres caminos, de menos a más técnico. Todos necesitan [`uv`](#requisito-uv
 1. **Consigue el paquete.** Descarga `bome-navaja-<versión>.mcpb` desde la sección [Releases](https://github.com/jgarcialaneitor/bome-navaja/releases) del repositorio (la primera es [v0.0.1](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.1)). Otras opciones:
    - El artefacto `bome-navaja-mcpb` de una ejecución en verde del flujo **CI** (pestaña *Actions* del repositorio), para probar una versión sin publicar.
    - O constrúyelo desde un clon (necesitas `uv` y Node.js con `npx`): `scripts/build_mcpb.sh` en macOS/Linux o `scripts\build_mcpb.ps1` en Windows PowerShell. El resultado queda en `dist/bome-navaja-<versión>.mcpb` (unos 70 KB).
-2. Haz **doble clic** en el archivo, o arrástralo a la ventana de Claude Desktop. Aparece el diálogo de instalación con las 17 herramientas.
+2. Haz **doble clic** en el archivo, o arrástralo a la ventana de Claude Desktop. Aparece el diálogo de instalación con las 19 herramientas.
 3. Opcional: en **Carpeta de datos** elige dónde guardar el índice y los PDF. Si la dejas vacía se usa la [carpeta por defecto](#-dónde-guarda-los-datos) de tu sistema.
 4. Acepta y reinicia Claude por completo si te lo pide.
 
@@ -308,13 +340,20 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 
 - **Pausa de cortesía** de ~0,5 s entre peticiones en las herramientas, con tiempos de espera acotados.
 - **Un único cliente serializado** para todas las herramientas: aunque el modelo lance varias a la vez, las peticiones al sitio salen de una en una.
-- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio empieza a rechazarla. Puedes ajustarla con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion`):
+- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio la bloquea. Puedes ajustarla con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion`):
 
   | Variable | Por defecto | Qué hace |
   |---|---|---|
   | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización (mínimo 1; un valor menor se sube a 1) |
   | `BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` | Máximo de boletines por ejecución de `sincronizar_indice` |
 
+- **Guardia del sitio.** El cortafuegos de bomemelilla.es bloquea la IP (en torno a una hora) tras unas 5 respuestas de error, por despacio que vayan las peticiones, y muchas son HTTP 500 de páginas de boletín rotas del propio sitio. Para no llegar a eso:
+  - Entre todas las herramientas y la sincronización se admiten como mucho **3 respuestas de error (cualquier 4xx o 5xx) cada 10 minutos**; con el cupo lleno, la sincronización espera y las herramientas responden `pausa_preventiva` con `reintentar_tras_segundos`, sin tocar el sitio.
+  - La sincronización hace una pausa de **30–60 s** tras una página rota y no vuelve a pedir un boletín **`roto`** (su página respondió 500 dos veces) salvo con `reintentar_rotos`.
+  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), `bome-navaja` **deja de tocarlo durante 75 minutos** (o más, si pide `Retry-After`): las herramientas responden `sitio_bloqueando` con `reintentar_tras_segundos` y la sincronización termina `bloqueado`.
+
+  Todos los procesos de `bome-navaja` comparten esta guardia y se conserva entre reinicios: vive en `estado_sitio.json`, en la [carpeta de datos](#-dónde-guarda-los-datos). `estado_servidor` la muestra en `guardia_sitio`. El portal antiguo de melilla.es tiene otra guardia igual pero aparte (`estado_sitio_melilla.json`, `guardia_portal_antiguo`).
+- **Portal antiguo solo bajo demanda**: sus fichas y PDF (que su `robots.txt` no permite a los robots) se piden solo cuando una herramienta los necesita para responderte, nunca en masa; ver [Portal antiguo](#-portal-antiguo-melillaes).
 - **No recorre el sitio si no se le pide**: nada al arrancar, y la sincronización solo con `sincronizar_indice`. Dos procesos nunca sincronizan a la vez.
 - Se identifica con un **User-Agent de navegador real** y no usa ni guarda credenciales.
 - **El modelo no elige dónde se escribe**: los PDF se nombran por su CVE canónico dentro de la carpeta configurada, y las rutas solo las cambias tú con variables de entorno.
@@ -350,7 +389,8 @@ La CI (`.github/workflows/ci.yml`) tiene cuatro trabajos:
 - **El O del sitio no funciona**: su buscador trata el O como Y. `buscar_bomes` lo rechaza; el O solo funciona en `buscar_articulos` y `buscar_en_indice`.
 - **Artículos ocultos en los extremos**: los artículos que la página del boletín omite se recuperan cuando dejan un hueco en la numeración, pero no se detectan si faltan al principio o al final del boletín.
 - **2014–2016 sin texto ni PDF**: solo se puede buscar en el contenido con `buscar_bomes` y `ambito="contenido"`.
-- **El índice solo cubre sumarios**, no el texto completo de los artículos ni de los PDF.
+- **El índice solo cubre sumarios**, no el texto completo de los artículos ni de los PDF, y no incluye el portal antiguo.
+- **Portal antiguo**: su búsqueda es literal y sin paginar (una búsqueda muy genérica puede superar el límite de 15 MB y pide términos más concretos); los identificadores anteriores a 2014 no son CVE de bomemelilla.es y algunos se repiten; 14 boletines tienen una fecha distinta en cada sitio.
 - **Claves mixtas**: algunas respuestas (`ver_bome`, `ver_sumario`, `listar_bomes`) usan claves en inglés (`number`, `date`, `sections`) junto a las castellanas del resto.
 - **Política de privacidad**: el sitio no publica un aviso legal, así que el enlace de privacidad del paquete `.mcpb` apunta a su [política de cookies](https://bomemelilla.es/politica-cookies).
 

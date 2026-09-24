@@ -247,6 +247,22 @@ def test_article_page_split_on_page_anchors(read_fixture: Reader) -> None:
     assert article.pages[3].text in article.text
 
 
+def test_article_page_accepts_extraordinary_page_cves(read_fixture: Reader) -> None:
+    # Pages of extraordinary bulletins are ``PX`` (seen with BOME-BX-2021-46 → BOME-PX-2021-362).
+    html = read_fixture("art1051.html").replace("BOME-P-2026-4784", "BOME-PX-2026-4784")
+    article = parse_article_page(html)
+    first = article.pages[0]
+    assert first.cve == "BOME-PX-2026-4784"
+    assert first.pdf_url == f"{BASE}/bome/descargar/BOME-PX-2026-4784.pdf"
+    assert article.pages[1].cve == "BOME-P-2026-4785"
+
+
+def test_article_page_with_unknown_page_cve_kind_raises(read_fixture: Reader) -> None:
+    html = read_fixture("art1051.html").replace("BOME-P-2026-4784", "BOME-PQ-2026-4784")
+    with pytest.raises(BomeParseError):
+        parse_article_page(html)
+
+
 def test_article_2014_stub_has_empty_fields(read_fixture: Reader) -> None:
     article = parse_article_page(read_fixture("art2014.html"))
     assert article.cve == "BOME-A-2014-2"

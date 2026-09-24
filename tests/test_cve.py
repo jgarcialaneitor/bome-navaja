@@ -29,6 +29,7 @@ from bome_navaja.models import BomeError
         ("BOME-S-2026-6416", CveKind.SUMARIO, 2026, 6416),
         ("BOME-SX-2026-41", CveKind.EXTRA_SUMARIO, 2026, 41),
         ("BOME-P-2026-4784", CveKind.PAGE, 2026, 4784),
+        ("BOME-PX-2021-362", CveKind.EXTRA_PAGE, 2021, 362),
         ("BOME-A-2014-1", CveKind.ARTICLE, 2014, 1),
     ],
 )
@@ -72,6 +73,31 @@ def test_kind_properties() -> None:
     assert not CveKind.BULLETIN.is_extraordinary
     assert CveKind.BULLETIN.is_bulletin and CveKind.EXTRA_BULLETIN.is_bulletin
     assert not CveKind.ARTICLE.is_bulletin
+
+
+def test_extra_page_kind_is_the_extraordinary_sibling_of_page() -> None:
+    cve = parse_cve(" bome - px - 2021 - 0362 ")
+    assert cve == Cve(CveKind.EXTRA_PAGE, 2021, 362)
+    assert str(cve) == "BOME-PX-2021-362"
+    assert CveKind.EXTRA_PAGE.value == "PX"
+    assert CveKind.EXTRA_PAGE.is_extraordinary
+    assert not CveKind.PAGE.is_extraordinary
+    for kind in (CveKind.PAGE, CveKind.EXTRA_PAGE):
+        assert not kind.is_bulletin
+        assert not kind.is_sumario
+    # Like a P page, a PX page identifies no bulletin, sumario or article.
+    with pytest.raises(InvalidCveError):
+        cve.bulletin_cve()
+    with pytest.raises(InvalidCveError):
+        cve.sumario_cve()
+    with pytest.raises(InvalidCveError):
+        cve.article_cve(1)
+    with pytest.raises(InvalidCveError):
+        bulletin_url(cve)
+    with pytest.raises(InvalidCveError):
+        sumario_url(cve)
+    assert pdf_url(cve) == f"{BASE_URL}/bome/descargar/BOME-PX-2021-362.pdf"
+    assert resolve_url("bome-px-2021-362") == f"{BASE_URL}/buscar-cve?cve=BOME-PX-2021-362"
 
 
 def test_derived_cves() -> None:

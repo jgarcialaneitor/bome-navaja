@@ -30,6 +30,19 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_live)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the data folder at a temporary directory for every test.
+
+    The site guard persists its state (``estado_sitio.json``) in the data
+    folder, so a test that reaches a server tool without its own override must
+    never write into the real user folder. Tests that need a specific folder
+    still set ``BOME_NAVAJA_DATA_DIR`` themselves.
+    """
+    monkeypatch.setenv("BOME_NAVAJA_DATA_DIR", str(tmp_path_factory.mktemp("datos") / "bome-navaja"))
+    monkeypatch.delenv("BOME_NAVAJA_PDF_DIR", raising=False)
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     """Directory holding real captured samples from bomemelilla.es."""

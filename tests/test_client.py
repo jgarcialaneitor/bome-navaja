@@ -513,3 +513,172 @@ def test_zero_jitter_never_draws_randomness(recorder: Recorder, monkeypatch: pyt
 def test_negative_pace_is_rejected(recorder: Recorder, kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError):
         recorder.client(**kwargs)
+
+
+# --------------------------------------------------------------------------- site guard (site-guard task 3)
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _guard():
+    from bome_navaja.guard import GuardiaSitio
+
+    return GuardiaSitio(None, clock=_Clock())
+
+
+def test_a_guarded_client_records_every_answer(recorder: Recorder) -> None:
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    recorder.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(500)
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        bome.organismos(38)
+        assert guard.errores_en_ventana() == 0
+        with pytest.raises(BomeHTTPError):
+            bome.bulletin("BOME-B-2026-6416")
+        with pytest.raises(BomeNotFoundError):
+            bome.bulletin("BOME-B-2026-9999")
+        with pytest.raises(BomeNotFoundError):
+            bome.download("BOME-P-2026-4784")
+    assert guard.errores_en_ventana() == 3
+    assert not guard.en_enfriamiento()
+
+
+def test_a_guarded_client_refuses_without_the_network_when_the_budget_is_full(recorder: Recorder) -> None:
+    from bome_navaja.models import BomePausaPreventivaError
+
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    guard = _guard()
+    for _ in range(3):
+        guard.registrar(500)
+    with recorder.client(guard=guard) as bome:
+        with pytest.raises(BomePausaPreventivaError) as info:
+            bome.organismos(38)
+        assert info.value.retry_after == pytest.approx(600)
+        assert info.value.url == f"{BASE}/api/section/organismos/38"
+        with pytest.raises(BomePausaPreventivaError):
+            bome.download("BOME-P-2026-4784")
+    assert recorder.requests == []
+
+
+def test_a_blocking_answer_closes_the_guard_and_later_calls_never_reach_the_site(
+    recorder: Recorder,
+) -> None:
+    from bome_navaja.guard import ENFRIAMIENTO_SEGUNDOS
+    from bome_navaja.models import BomePausaPreventivaError
+
+    recorder.routes["/bome/BOME-B-2026-6416"] = lambda request: httpx.Response(
+        429, headers={"retry-after": "120"}
+    )
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        with pytest.raises(BomeBlockedError) as info:
+            bome.bulletin("BOME-B-2026-6416")
+        assert info.value.status == 429
+        # The caller learns how long the guard keeps the site closed, not only Retry-After.
+        assert info.value.retry_after == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+        assert guard.en_enfriamiento()
+        for call in (lambda: bome.organismos(38), lambda: bome.download("BOME-P-2026-4784")):
+            with pytest.raises(BomeBlockedError) as info:
+                call()
+            assert not isinstance(info.value, BomePausaPreventivaError)
+            assert info.value.status is None
+            assert info.value.retry_after == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+    assert len(recorder.requests) == 1
+
+
+def test_a_blocked_download_closes_the_guard(recorder: Recorder) -> None:
+    recorder.routes["/bome/descargar/BOME-P-2026-4784.pdf"] = lambda request: httpx.Response(503)
+    guard = _guard()
+    with recorder.client(guard=guard) as bome, pytest.raises(BomeBlockedError):
+        bome.download("BOME-P-2026-4784")
+    assert guard.en_enfriamiento()
+
+
+def test_transport_failures_close_the_guard(recorder: Recorder) -> None:
+    def dropped(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    recorder.routes["/bome/BOME-B-2026-6416"] = dropped
+    recorder.routes["/bome/descargar/BOME-P-2026-4784.pdf"] = dropped
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        with pytest.raises(BomeHTTPError) as info:
+            bome.bulletin("BOME-B-2026-6416")
+        assert info.value.status is None
+        assert not guard.en_enfriamiento()
+        with pytest.raises(BomeHTTPError) as info:
+            bome.download("BOME-P-2026-4784")
+        assert not isinstance(info.value, BomeBlockedError)
+        assert guard.en_enfriamiento()
+        with pytest.raises(BomeBlockedError):
+            bome.bulletin("BOME-B-2026-6416")
+    assert len(recorder.requests) == 2
+    assert guard.errores_en_ventana() == 0
+
+
+def test_an_invalid_url_is_not_a_transport_failure(recorder: Recorder) -> None:
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        for _ in range(2):
+            with pytest.raises(BomeHTTPError):
+                bome._request("/bome/\x00")
+    assert not guard.en_enfriamiento()
+
+
+def test_a_successful_download_resets_the_streak(recorder: Recorder) -> None:
+    recorder.fixture("/bome/descargar/BOME-P-2026-4784.pdf", "BOME-P-2026-4784.pdf", "application/pdf")
+    guard = _guard()
+    guard.registrar(None)
+    with recorder.client(guard=guard) as bome:
+        bome.download("BOME-P-2026-4784")
+    guard.registrar(None)
+    assert not guard.en_enfriamiento()
+
+
+# --------------------------------------------------------------------------- fetch_bytes (shared with the old portal)
+
+
+def test_fetch_bytes_posts_content_through_the_guard(recorder: Recorder) -> None:
+    seen: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"<html>ok</html>", headers={"content-type": "text/html"})
+
+    recorder.routes["/form"] = answer
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        content, response = bome.fetch_bytes(
+            "POST",
+            "/form",
+            params={"a": "1"},
+            content=b"q=x",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+    assert content == b"<html>ok</html>" and response.status_code == 200
+    (request,) = seen
+    assert request.method == "POST" and request.content == b"q=x"
+    assert request.url.params["a"] == "1"
+    assert request.headers["content-type"] == "application/x-www-form-urlencoded"
+
+
+def test_fetch_bytes_caps_the_size_and_records_errors(recorder: Recorder) -> None:
+    from bome_navaja.models import BomeDocumentTooLargeError
+
+    recorder.routes["/big"] = lambda request: httpx.Response(200, content=b"x" * 5000)
+    recorder.routes["/broken"] = lambda request: httpx.Response(500)
+    guard = _guard()
+    with recorder.client(guard=guard) as bome:
+        with pytest.raises(BomeDocumentTooLargeError) as info:
+            bome.fetch_bytes("GET", "/big", max_bytes=1000)
+        assert info.value.limit == 1000
+        with pytest.raises(BomeHTTPError):
+            bome.fetch_bytes("GET", "/broken")
+    assert guard.errores_en_ventana() == 1
