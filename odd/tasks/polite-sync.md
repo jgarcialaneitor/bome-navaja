@@ -58,3 +58,13 @@ Out of scope:
 
 - User-Agent: still a spoofed Chrome UA (point 5 of the proposal); the user has not decided.
 - `.mcpb` manifest does not expose the two sync overrides as user settings yet.
+
+## Delivery
+
+- 2026-09-24 (user decision): branch pushed, [PR #2](https://github.com/jgarcialaneitor/bome-navaja/pull/2)
+  opened; CI green on all 4 jobs (test, test-windows, bundle, bundle-windows). Version bumped to
+  0.0.2 (`4428ece`, native review `review-0311aaaa77bee3a1` approved and acknowledged).
+- Local bundle `dist/bome-navaja-0.0.2.mcpb` built from `4428ece` (82,624 bytes, sha256
+  `0bab5d22…a412`); independent verify PASS: 17 files, no strays, unpacked bundle answers 17
+  tools, version 0.0.2, `cortesia_sincronizacion` 2.0 s / 1.0 s / 250. Not verified: install inside
+  Claude Desktop, any network tool (the user's IP is blocked by the site). Not merged, not released.
