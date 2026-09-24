@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
+import socket
+import time
+from collections.abc import Callable
+from datetime import datetime, timezone
 
 import pytest
 
-from bome_navaja.ajustes import VARIABLES, Ajustes, ajustes_desde_entorno
+from bome_navaja.ajustes import MAX_TIEMPO_SEGUNDOS, VARIABLES, Ajustes, ajustes_desde_entorno
 
 DEFAULTS = {
     "pausa_sincronizacion_segundos": 2.0,
@@ -121,7 +126,9 @@ def test_safer_values_are_used_without_any_message() -> None:
 
 
 @pytest.mark.parametrize("variable", sorted(FIELD))
-@pytest.mark.parametrize("raw", ["abc", "nan", "inf", "-inf", "1,5", "-1", "2s"])
+@pytest.mark.parametrize(
+    "raw", ["abc", "nan", "inf", "-inf", "-1", "2s", "1.000,5", "1,000.5", "1,5,5", "1,,5", ",", "-0,5"]
+)
 def test_an_invalid_value_keeps_the_default_with_a_warning(variable: str, raw: str) -> None:
     ajustes, message = one({variable: raw})
     assert getattr(ajustes, FIELD[variable]) == DEFAULTS[FIELD[variable]]
@@ -161,6 +168,106 @@ def test_zero_is_accepted_where_it_can_work(variable: str) -> None:
     ajustes, message = one({variable: "0"})
     assert getattr(ajustes, FIELD[variable]) == 0
     assert ajustes.riesgos == (message,)
+
+
+@pytest.mark.parametrize("variable", sorted(FIELD))
+def test_a_spanish_decimal_comma_is_accepted(variable: str) -> None:
+    ajustes = ajustes_desde_entorno({variable: " 3,0 "})
+    assert getattr(ajustes, FIELD[variable]) == 3
+    assert ajustes.avisos == ()
+
+
+@pytest.mark.parametrize(
+    ("variable", "raw", "expected"),
+    [
+        ("BOME_NAVAJA_QUERY_DELAY", "0,5", 0.5),
+        ("BOME_NAVAJA_SYNC_DELAY", "2,75", 2.75),
+        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "12,5", 12.5),
+        ("BOME_NAVAJA_SYNC_MAX_BOLETINES", "100,0", 100),
+    ],
+)
+def test_a_decimal_comma_gives_the_same_value_as_a_dot(variable: str, raw: str, expected: float) -> None:
+    assert ajustes_desde_entorno({variable: raw}) == ajustes_desde_entorno({variable: raw.replace(",", ".")})
+    assert getattr(ajustes_desde_entorno({variable: raw}), FIELD[variable]) == expected
+
+
+def test_a_decimal_comma_in_a_count_must_still_be_integral() -> None:
+    _, message = one({"BOME_NAVAJA_GUARD_MAX_ERRORS": "2,5"})
+    assert message.startswith("BOME_NAVAJA_GUARD_MAX_ERRORS='2,5' no es válido: tiene que ser un número entero")
+
+
+YEAR = 365 * 24 * 60 * 60
+"""One year in seconds: the longest valid time."""
+
+TOO_BIG = "es un tiempo demasiado grande (más de un año)"
+
+
+def test_the_longest_valid_time_is_one_year() -> None:
+    assert MAX_TIEMPO_SEGUNDOS == YEAR == 31_536_000
+
+
+@pytest.mark.parametrize(
+    ("variable", "raw", "default"),
+    [
+        # Seconds settings: the value itself.
+        ("BOME_NAVAJA_SYNC_DELAY", "31536000.001", "2 s"),
+        ("BOME_NAVAJA_SYNC_JITTER", "31536001", "1 s"),
+        ("BOME_NAVAJA_QUERY_DELAY", "1e10", "0.5 s"),
+        ("BOME_NAVAJA_TIMEOUT", "1e10", "30 s"),
+        ("BOME_NAVAJA_TIMEOUT", "1e308", "30 s"),
+        # Minutes settings: the value times 60.
+        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "525600,01", "10 min"),
+        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "525601", "75 min"),
+        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "1e307", "75 min"),
+        # Error pause: its top, twice the value.
+        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "15768000.5", "30 s"),
+        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "1e308", "30 s"),
+    ],
+)
+def test_a_time_longer_than_a_year_keeps_the_default_with_a_warning(
+    variable: str, raw: str, default: str
+) -> None:
+    ajustes, message = one({variable: raw})
+    assert getattr(ajustes, FIELD[variable]) == DEFAULTS[FIELD[variable]]
+    assert ajustes.avisos == (message,) and ajustes.riesgos == ()
+    assert message == f"{variable}={raw!r} no es válido: {TOO_BIG}. Se usa el valor por defecto, {default}."
+
+
+@pytest.mark.parametrize(
+    ("variable", "raw", "seconds"),
+    [
+        ("BOME_NAVAJA_SYNC_DELAY", "31536000", lambda a: a.pausa_sincronizacion_segundos),
+        ("BOME_NAVAJA_TIMEOUT", "31536000", lambda a: a.tiempo_espera_segundos),
+        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "525600", lambda a: a.guardia_enfriamiento_segundos),
+        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "525600", lambda a: a.guardia_ventana_segundos),
+        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "15768000", lambda a: a.pausa_tras_error_max_segundos),
+    ],
+)
+def test_a_time_of_exactly_one_year_is_used(variable: str, raw: str, seconds: Callable[[Ajustes], float]) -> None:
+    ajustes = ajustes_desde_entorno({variable: raw})
+    assert getattr(ajustes, FIELD[variable]) == float(raw)
+    assert ajustes.avisos == ()
+    assert seconds(ajustes) == YEAR
+
+
+def test_the_longest_valid_times_still_work_at_runtime() -> None:
+    ajustes = ajustes_desde_entorno(
+        {
+            "BOME_NAVAJA_SYNC_DELAY": "31536000",
+            "BOME_NAVAJA_SYNC_JITTER": "31536000",
+            "BOME_NAVAJA_GUARD_COOLDOWN_MINUTES": "525600",
+            "BOME_NAVAJA_TIMEOUT": "31536000",
+        }
+    )
+    assert ajustes.avisos == ()
+    # The sync sleeps up to delay + jitter: finite, so time.sleep accepts it.
+    assert math.isfinite(ajustes.pausa_sincronizacion_segundos + ajustes.variacion_sincronizacion_segundos)
+    # A cooldown deadline still fits a datetime.
+    datetime.fromtimestamp(time.time() + ajustes.guardia_enfriamiento_segundos, tz=timezone.utc)
+    # A socket accepts the timeout (no connection is made).
+    with socket.socket() as sock:
+        sock.settimeout(ajustes.tiempo_espera_segundos)
+        assert sock.gettimeout() == YEAR
 
 
 def test_every_bad_variable_gets_its_own_warning() -> None:

@@ -144,11 +144,11 @@ En los dos modos se ignoran tildes y mayúsculas, y un `*` final se acepta pero 
 - **Solo se sincroniza cuando el modelo llama a `sincronizar_indice`.** El servidor nunca recorre el sitio por su cuenta, ni al arrancar.
 - La herramienta vuelve al instante; la sincronización sigue **en segundo plano**, del boletín más reciente al más antiguo.
 - Por defecto cubre **desde el 1 de enero de 2018 hasta hoy**. Antes de 2018 bomemelilla.es está incompleto e inestable (faltan boletines, sus páginas rotas responden HTTP 500 y de ahí vienen los bloqueos del cortafuegos) y casi no hay sumarios que buscar; esos boletines se consultan mejor en el portal antiguo de melilla.es. Puedes pedir un `desde` anterior, pero no es recomendable.
-- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos (más si el sitio responde con errores; ver abajo). El rango por defecto (~1.100 boletines desde 2018) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
+- Va **despacio a propósito** (por defecto, ~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos (más si el sitio responde con errores; ver abajo). El rango por defecto (~1.100 boletines desde 2018) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
 - Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`), salvo los `roto`.
 - Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`, `rotos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
 - `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está en una pausa); lo ya indexado se conserva.
-- **Cuida el cortafuegos del sitio**, que bloquea la IP tras unas 5 respuestas de error (detalle en [Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio)):
+- **Cuida el cortafuegos del sitio**, que bloquea la IP tras unas 5 respuestas de error (detalle en [Seguridad y cortesía](#-seguridad-y-cortesía-con-el-sitio)). Estas cifras, como el ritmo y el límite de arriba, son los valores por defecto: puedes cambiarlas en los [ajustes de ritmo y protección](#ajustes-de-ritmo-y-protección):
   - No pasa de **3 respuestas de error cada 10 minutos**: si llega al límite, hace una pausa preventiva (la indica `mensaje`), así que puede ir más lenta.
   - Tras una página de boletín rota (HTTP 500) hace una pausa de **30–60 s**.
   - Un boletín cuya página respondió 500 dos veces queda como **`roto`**: las sincronizaciones normales lo saltan y `estado_indice` lo cuenta aparte, no como pendiente. `reintentar_rotos: true` los vuelve a pedir, pero cada uno cuesta un 500 que el cortafuegos cuenta: úsalo solo para comprobar si el sitio los arregló.
@@ -166,7 +166,7 @@ Cada respuesta de `buscar_en_indice` trae un bloque `cobertura` (rango de fechas
 ```
 
 - **Qué indexa**: los sumarios de la ficha de cada boletín (`ficha_bome.jsp`), con **una petición por boletín** y nunca los PDF. Por defecto, los boletines del **1 de enero de 1991 al 31 de diciembre de 2017**: antes de 1991 las fichas no traen artículos (solo el PDF del boletín entero) y desde 2018 está bomemelilla.es. Admite otro `desde`/`hasta`.
-- **El mismo ritmo y el mismo límite** que la de bomemelilla.es: 2 s más hasta 1 s aleatorio entre peticiones y como mucho **250 boletines por ejecución** (`max_boletines`), unos 15–20 minutos. El rango por defecto tiene unos 2.000–2.500 boletines, así que hacen falta **unas 8–10 ejecuciones**, mejor espaciadas; `pendientes_tras_limite` dice cuántos quedan. `BOME_NAVAJA_SYNC_DELAY` y `BOME_NAVAJA_SYNC_MAX_BOLETINES` se aplican igual.
+- **El mismo ritmo y el mismo límite** que la de bomemelilla.es: por defecto, 2 s más hasta 1 s aleatorio entre peticiones y como mucho **250 boletines por ejecución** (`max_boletines`), unos 15–20 minutos. El rango por defecto tiene unos 2.000–2.500 boletines, así que hacen falta **unas 8–10 ejecuciones**, mejor espaciadas; `pendientes_tras_limite` dice cuántos quedan. Los [ajustes de ritmo y protección](#ajustes-de-ritmo-y-protección) (`BOME_NAVAJA_SYNC_DELAY`, `BOME_NAVAJA_SYNC_MAX_BOLETINES` y el resto) son los mismos para los dos orígenes.
 - Es **reanudable** y no repite trabajo: se salta los boletines ya indexados con sumarios (de cualquier origen) y los que el portal ya dio sin artículos. Reintenta los fallidos (`reintentar_errores`) y los `roto` solo con `reintentar_rotos`. `reindexar_recientes_dias` no se aplica: el portal está congelado.
 - Usa la **guardia del portal antiguo** (`estado_sitio_melilla.json`), no la de bomemelilla.es: termina `bloqueado` si melilla.es la bloquea, y sus errores no cuentan para el otro sitio.
 - **Un solo turno por índice**: mientras corre la sincronización de un origen, la del otro recibe `en_curso_en_otro_proceso`. `cancelar_sincronizacion` para la que esté en curso, sea del origen que sea.
@@ -195,9 +195,9 @@ Si `ver_bome` no encuentra un boletín anterior a 2022 en bomemelilla.es, su err
 
 **Identificadores.** Desde 2014 la numeración del portal antiguo coincide con los CVE de bomemelilla.es (`BOME-B-2016-5302`, `BOME-BX-2021-16`). Antes de 2014 los identificadores tienen la misma forma pero **no son CVE de bomemelilla.es** (`cve_oficial: false`) y algunos se repiten (24 casos, por ejemplo dos «Extra 1» en 1986): `ver_bome_antiguo` responde entonces `boletin_ambiguo` con los candidatos (`dboid`, fecha, sufijo), y basta con repetir con el `dboid`. Además, **14 boletines tienen una fecha distinta en cada sitio** (por ejemplo `BOME-B-2015-5230`: 17-12-2015 en bomemelilla.es y 01-05-2015 en melilla.es); cita la fecha junto al origen.
 
-**robots.txt y política de uso.** El `robots.txt` de melilla.es no permite a los robots las fichas de boletín (`ficha_bome.jsp`) ni los PDF (`/mandar.php`). Las herramientas solo los piden **bajo demanda**: cuando el modelo llama a una para responderte, una petición cada vez. Desde la versión 0.0.4 hay una excepción deliberada, porque el portal está congelado y puede desaparecer: la [indexación del portal antiguo](#indexar-el-portal-antiguo-melillaes) recorre las fichas en masa, pero solo cuando se pide con `sincronizar_indice` y `origen="melilla.es"` (nunca por su cuenta), despacio (~2–3 s entre peticiones), con un máximo de 250 boletines por ejecución y bajo la guardia del portal. **Los PDF nunca se recorren en masa**: solo se piden bajo demanda.
+**robots.txt y política de uso.** El `robots.txt` de melilla.es no permite a los robots las fichas de boletín (`ficha_bome.jsp`) ni los PDF (`/mandar.php`). Las herramientas solo los piden **bajo demanda**: cuando el modelo llama a una para responderte, una petición cada vez. Desde la versión 0.0.4 hay una excepción deliberada, porque el portal está congelado y puede desaparecer: la [indexación del portal antiguo](#indexar-el-portal-antiguo-melillaes) recorre las fichas en masa, pero solo cuando se pide con `sincronizar_indice` y `origen="melilla.es"` (nunca por su cuenta), despacio (por defecto, ~2–3 s entre peticiones), con un máximo de 250 boletines por ejecución (también por defecto) y bajo la guardia del portal. **Los PDF nunca se recorren en masa**: solo se piden bajo demanda.
 
-**Su propia guardia y su caché.** El portal antiguo es otro sitio, así que tiene su propia [guardia](#-seguridad-y-cortesía-con-el-sitio) con las mismas reglas (como mucho 3 respuestas de error cada 10 minutos; 75 minutos sin pedirle nada si bloquea), guardada aparte en `estado_sitio_melilla.json`; sus errores nunca cuentan para bomemelilla.es, y `estado_servidor` la muestra en `guardia_portal_antiguo`. Va a su propio ritmo (~1–1,5 s entre peticiones, de una en una). El catálogo (~1 MB) se descarga con una sola petición la primera vez que hace falta y se guarda en `catalogo_portal_antiguo.json`; como el portal está congelado, se reutiliza siempre (`estado_servidor` lo muestra en `catalogo_portal_antiguo`; borrarlo fuerza una nueva descarga). Si el portal no responde, `listar_bomes` devuelve igualmente lo de bomemelilla.es con un `aviso`.
+**Su propia guardia y su caché.** El portal antiguo es otro sitio, así que tiene su propia [guardia](#-seguridad-y-cortesía-con-el-sitio) con las mismas reglas y los mismos [ajustes](#ajustes-de-ritmo-y-protección) (por defecto, como mucho 3 respuestas de error cada 10 minutos y 75 minutos sin pedirle nada si bloquea), guardada aparte en `estado_sitio_melilla.json`; sus errores nunca cuentan para bomemelilla.es, y `estado_servidor` la muestra en `guardia_portal_antiguo`. Sus herramientas van a su propio ritmo (~1–1,5 s entre peticiones, de una en una), que no se puede ajustar. El catálogo (~1 MB) se descarga con una sola petición la primera vez que hace falta y se guarda en `catalogo_portal_antiguo.json`; como el portal está congelado, se reutiliza siempre (`estado_servidor` lo muestra en `catalogo_portal_antiguo`; borrarlo fuerza una nueva descarga). Si el portal no responde, `listar_bomes` devuelve igualmente lo de bomemelilla.es con un `aviso`.
 
 ---
 
@@ -259,10 +259,10 @@ Hay tres caminos, de menos a más técnico. Todos necesitan [`uv`](#requisito-uv
    - El artefacto `bome-navaja-mcpb` de una ejecución en verde del flujo **CI** (pestaña *Actions* del repositorio), para probar una versión sin publicar.
    - O constrúyelo desde un clon (necesitas `uv` y Node.js con `npx`): `scripts/build_mcpb.sh` en macOS/Linux o `scripts\build_mcpb.ps1` en Windows PowerShell. El resultado queda en `dist/bome-navaja-<versión>.mcpb` (unos 70 KB).
 2. Haz **doble clic** en el archivo, o arrástralo a la ventana de Claude Desktop. Aparece el diálogo de instalación con las 19 herramientas.
-3. Opcional: en **Carpeta de datos** elige dónde guardar el índice y los PDF. Si la dejas vacía se usa la [carpeta por defecto](#-dónde-guarda-los-datos) de tu sistema.
+3. Opcional: en **Carpeta de datos** elige dónde guardar el índice y los PDF. Si la dejas vacía se usa la [carpeta por defecto](#-dónde-guarda-los-datos) de tu sistema. Los demás ajustes (el ritmo con que se piden páginas y la protección frente al bloqueo del sitio) ya traen los valores recomendados: no los hagas más agresivos sin leer antes [Ajustes de ritmo y protección](#ajustes-de-ritmo-y-protección).
 4. Acepta y reinicia Claude por completo si te lo pide.
 
-La primera vez que arranca, Claude Desktop instala Python y las dependencias por su cuenta (unos segundos).
+La primera vez que arranca, Claude Desktop instala Python y las dependencias por su cuenta (unos segundos). Desde la versión 0.0.5 el paquete incluye `uv.lock`, así que instala las mismas versiones de las dependencias con las que se probó esa versión.
 
 > [!NOTE]
 > El paquete **no está firmado**, así que Claude Desktop puede mostrar una advertencia al instalarlo.
@@ -335,7 +335,7 @@ claude mcp add bome-navaja -- uvx --from git+https://github.com/jgarcialaneitor/
 }
 ```
 
-   La clave `env` es opcional.
+   La clave `env` es opcional; en ella también van los [ajustes de ritmo y protección](#ajustes-de-ritmo-y-protección).
 
 3. Guarda y **cierra Claude por completo** (no solo la ventana). Al reabrirlo deben aparecer las herramientas de `bome-navaja`.
 
@@ -347,7 +347,7 @@ Pídele al asistente:
 Ejecuta estado_servidor de bome-navaja.
 ```
 
-Debe responder con la versión, las rutas de datos, PDF e índice (y por qué se eligió cada una), y si SQLite tiene FTS5 y trigram. No toca la red ni crea el índice. Luego prueba una búsqueda real:
+Debe responder con la versión, las rutas de datos, PDF e índice (y por qué se eligió cada una), si SQLite tiene FTS5 y trigram, y los [ajustes](#ajustes-de-ritmo-y-protección) en uso con sus avisos (`ajustes`). No toca la red ni crea el índice. Luego prueba una búsqueda real:
 
 ```text
 Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
@@ -357,26 +357,15 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 
 ## 🔒 Seguridad y cortesía con el sitio
 
-- **Pausa de cortesía** de ~0,5 s entre peticiones en las herramientas, con tiempos de espera acotados.
+Las cifras de esta sección son los valores por defecto, que son también los recomendados; cómo cambiarlas y qué arriesgas al hacerlo está en [Ajustes de ritmo y protección](#ajustes-de-ritmo-y-protección).
+
+- **Pausa de cortesía** entre peticiones en las herramientas (~0,5 s por defecto), con tiempos de espera acotados (30 s por defecto).
 - **Un único cliente serializado** para todas las herramientas: aunque el modelo lance varias a la vez, las peticiones al sitio salen de una en una.
-- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio la bloquea. La del portal antiguo va igual. Puedes ajustar las dos con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion` y `cortesia_sincronizacion_portal_antiguo`):
-
-  | Variable | Por defecto | Qué hace |
-  |---|---|---|
-  | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización, de los dos orígenes (un valor menor de 2 funciona, pero `estado_servidor` avisa del riesgo) |
-  | `BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` | Máximo de boletines por ejecución de `sincronizar_indice`, de los dos orígenes |
-  | `BOME_NAVAJA_SYNC_JITTER` | `1` | Segundos aleatorios, como mucho, que se suman a cada pausa de la sincronización |
-  | `BOME_NAVAJA_QUERY_DELAY` | `0.5` | Segundos entre peticiones de las herramientas de bomemelilla.es |
-  | `BOME_NAVAJA_GUARD_MAX_ERRORS` | `3` | Respuestas de error del sitio que admite la guardia en su ventana antes de pausar |
-  | `BOME_NAVAJA_GUARD_WINDOW_MINUTES` | `10` | Minutos de la ventana en la que la guardia cuenta los errores |
-  | `BOME_NAVAJA_GUARD_COOLDOWN_MINUTES` | `75` | Minutos sin tocar el sitio tras una señal de bloqueo |
-  | `BOME_NAVAJA_ERROR_PAUSE_SECONDS` | `30` | Segundos mínimos de pausa de la sincronización tras una página rota (como mucho, el doble) |
-  | `BOME_NAVAJA_TIMEOUT` | `30` | Segundos de espera máxima de cada petición a los sitios |
-
+- **La sincronización del índice va más despacio**: por defecto, su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio la bloquea. La del portal antiguo va igual.
 - **Guardia del sitio.** El cortafuegos de bomemelilla.es bloquea la IP (en torno a una hora) tras unas 5 respuestas de error, por despacio que vayan las peticiones, y muchas son HTTP 500 de páginas de boletín rotas del propio sitio. Para no llegar a eso:
-  - Entre todas las herramientas y la sincronización se admiten como mucho **3 respuestas de error (cualquier 4xx o 5xx) cada 10 minutos**; con el cupo lleno, la sincronización espera y las herramientas responden `pausa_preventiva` con `reintentar_tras_segundos`, sin tocar el sitio.
-  - La sincronización hace una pausa de **30–60 s** tras una página rota y no vuelve a pedir un boletín **`roto`** (su página respondió 500 dos veces) salvo con `reintentar_rotos`.
-  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), `bome-navaja` **deja de tocarlo durante 75 minutos** (o más, si pide `Retry-After`): las herramientas responden `sitio_bloqueando` con `reintentar_tras_segundos` y la sincronización termina `bloqueado`.
+  - Entre todas las herramientas y la sincronización se admiten como mucho **3 respuestas de error (cualquier 4xx o 5xx) cada 10 minutos** (valores por defecto); con el cupo lleno, la sincronización espera y las herramientas responden `pausa_preventiva` con `reintentar_tras_segundos`, sin tocar el sitio.
+  - La sincronización hace una pausa de **30–60 s** (por defecto) tras una página rota y no vuelve a pedir un boletín **`roto`** (su página respondió 500 dos veces) salvo con `reintentar_rotos`.
+  - Si el sitio bloquea igualmente (403, 429 o 503, o dos peticiones seguidas sin respuesta), `bome-navaja` **deja de tocarlo durante 75 minutos** por defecto (o más, si pide `Retry-After`): las herramientas responden `sitio_bloqueando` con `reintentar_tras_segundos` y la sincronización termina `bloqueado`.
 
   Todos los procesos de `bome-navaja` comparten esta guardia y se conserva entre reinicios: vive en `estado_sitio.json`, en la [carpeta de datos](#-dónde-guarda-los-datos). `estado_servidor` la muestra en `guardia_sitio`. El portal antiguo de melilla.es tiene otra guardia igual pero aparte (`estado_sitio_melilla.json`, `guardia_portal_antiguo`).
 - **Portal antiguo**: sus PDF (que su `robots.txt` no permite a los robots) se piden solo bajo demanda, cuando una herramienta los necesita para responderte, nunca en masa. Sus fichas (que tampoco permite) solo se recorren en masa con la [indexación del portal antiguo](#indexar-el-portal-antiguo-melillaes), que arranca solo a mano, va despacio y tiene límite por ejecución; ver [Portal antiguo](#-portal-antiguo-melillaes).
@@ -384,6 +373,37 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 - Se identifica con un **User-Agent de navegador real** y no usa ni guarda credenciales.
 - **El modelo no elige dónde se escribe**: los PDF se nombran por su CVE canónico dentro de la carpeta configurada, y las rutas solo las cambias tú con variables de entorno.
 - stdout lleva exclusivamente JSON-RPC; los mensajes para personas van a stderr.
+
+### Ajustes de ritmo y protección
+
+> [!WARNING]
+> **Uso responsable.** El cortafuegos de bomemelilla.es bloquea tu IP durante cerca de 1 hora tras unas 5 respuestas de error en poco tiempo, vayas al ritmo que vayas. Los valores por defecto son los recomendados y están pensados para no llegar ahí. Si pones valores más agresivos, tu IP puede acabar bloqueada y cargas más un servicio público que usa mucha gente. El servidor acepta cualquier valor válido, pero `estado_servidor` te lo advierte: `ajustes.riesgos` lista los valores más arriesgados que lo recomendado, y `ajustes.avisos` los que no son válidos (no son un número, son negativos, son cero donde no puede funcionar…), que se ignoran y se sustituyen por el valor por defecto.
+
+Los nueve ajustes son los mismos para bomemelilla.es y para el portal antiguo de melilla.es (cada sitio con su propia guardia). **Los cambios se aplican al reiniciar la extensión** (o el servidor MCP en otros clientes): el servidor los lee una sola vez por proceso.
+
+- **Con el paquete `.mcpb`**: en Claude Desktop, abre la configuración de la extensión **BOME Melilla — Boletín Oficial de Melilla**. Cada ajuste aparece con el nombre de la tabla y una descripción con lo que hace, lo que arriesgas y el valor recomendado.
+- **Con otros clientes** (Claude Code, la [configuración manual](#opción-c--configuración-manual-de-claude-desktop)…): define las variables de entorno de la tabla en la configuración del servidor, por ejemplo en la clave `env`:
+
+```json
+"env": {
+  "BOME_NAVAJA_SYNC_DELAY": "3",
+  "BOME_NAVAJA_SYNC_MAX_BOLETINES": "100"
+}
+```
+
+Una variable vacía o sin definir usa el valor por defecto. Los decimales admiten punto o coma (`0.5` o `0,5`), y los recuentos, un entero escrito como `250.0`. Un tiempo de más de un año no es válido: se usa el valor por defecto. `estado_servidor` muestra los valores en uso en `ajustes` (y el ritmo de la sincronización en `cortesia_sincronizacion` y `cortesia_sincronizacion_portal_antiguo`).
+
+| Ajuste en Claude Desktop y variable | Por defecto (recomendado) | Qué hace | Si lo haces más agresivo |
+| --- | --- | --- | --- |
+| **Pausa entre peticiones al sincronizar (segundos)**<br>`BOME_NAVAJA_SYNC_DELAY` | `2` (2 o más) | Segundos de espera entre cada página que pide la sincronización del índice, de los dos orígenes | Si la bajas, sincroniza antes, pero pide páginas más deprisa y el cortafuegos puede bloquear tu IP |
+| **Variación al azar de la pausa al sincronizar (segundos)**<br>`BOME_NAVAJA_SYNC_JITTER` | `1` (1 o más) | Hasta cuántos segundos al azar se suman a cada pausa de la sincronización, para no pedir a un ritmo fijo | Si la bajas, el ritmo es más regular, más fácil de tomar por un robot y de bloquear |
+| **Máximo de boletines por sincronización**<br>`BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` (250 o menos) | Cuántos boletines procesa como mucho cada ejecución de `sincronizar_indice` sin `max_boletines`; los que falten quedan para la siguiente | Si lo subes, cada ejecución hace más peticiones seguidas y aumenta el riesgo de bloqueo |
+| **Pausa entre peticiones en las consultas (segundos)**<br>`BOME_NAVAJA_QUERY_DELAY` | `0.5` (0,5 o más) | Segundos de espera entre peticiones de las herramientas que consultan bomemelilla.es en vivo (buscar, abrir boletines, leer artículos). Las del portal antiguo van a su propio ritmo, que no cambia | Si la bajas, las respuestas llegan antes, pero el sitio puede bloquear tu IP |
+| **Errores del sitio tolerados antes de parar**<br>`BOME_NAVAJA_GUARD_MAX_ERRORS` | `3` (3 o menos) | Cuántas respuestas de error (4xx o 5xx) admite la guardia dentro de la ventana antes de hacer una pausa preventiva | Si lo subes, deja menos margen frente al bloqueo; con 5 o más ya no para antes de que el sitio bloquee tu IP |
+| **Ventana para contar los errores del sitio (minutos)**<br>`BOME_NAVAJA_GUARD_WINDOW_MINUTES` | `10` (10 o más) | Minutos durante los que la guardia recuerda cada respuesta de error para contarla | Si la acortas, los errores se olvidan antes y caben más en poco tiempo, lo que acerca el bloqueo |
+| **Espera tras una señal de bloqueo (minutos)**<br>`BOME_NAVAJA_GUARD_COOLDOWN_MINUTES` | `75` (75 o más) | Minutos sin pedir nada al sitio cuando da señales de bloqueo (403, 429 o 503, o dos peticiones seguidas sin respuesta), o más si lo pide con `Retry-After` | El bloqueo dura cerca de 1 hora: si esperas menos (sobre todo menos de 60), vuelves a un sitio que aún te bloquea y puedes alargar el bloqueo |
+| **Pausa tras un error del sitio al sincronizar (segundos)**<br>`BOME_NAVAJA_ERROR_PAUSE_SECONDS` | `30` (30 o más) | Pausa mínima de la sincronización tras una página rota; la real es al azar entre este valor y el doble (30–60 s por defecto) | Si la bajas, vuelve a pedir antes, y varios errores seguidos provocan el bloqueo de tu IP |
+| **Tiempo máximo de espera de cada petición (segundos)**<br>`BOME_NAVAJA_TIMEOUT` | `30` (30 o más) | Segundos que se espera la respuesta de cualquiera de los dos sitios antes de dar la petición por fallida | Si lo bajas, un sitio lento puede parecer bloqueado: dos peticiones seguidas sin respuesta se toman como bloqueo y se deja de pedir durante la espera tras bloqueo |
 
 ---
 

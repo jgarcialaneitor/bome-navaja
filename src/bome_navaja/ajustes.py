@@ -21,9 +21,15 @@ Variable                                  Default  Riskier than recommended when
 There are no hard limits: any physically valid value is used as given, and a
 value riskier than recommended adds a line to :attr:`Ajustes.riesgos`. A value
 that cannot work (not a number, NaN or infinite, negative, zero where it must
-be positive, a non-integral count) keeps the default and adds a line to
-:attr:`Ajustes.avisos`. Blank values count as unset; counts accept an integral
-float such as ``250.0`` (Claude Desktop may render numbers that way).
+be positive, a non-integral count, or a time longer than one year) keeps the
+default and adds a line to :attr:`Ajustes.avisos`. The one-year cap is technical
+validity, not a safety limit: larger finite times crash at runtime (a socket
+timeout overflows, a cooldown deadline no longer fits a ``datetime``, the
+sync delay plus its jitter can reach infinity). It applies to the longest time
+in seconds a value produces (minutes times 60; twice the error pause, its top),
+never to the counts. Blank values count as unset; counts accept an integral
+float such as ``250.0`` (Claude Desktop may render numbers that way), and a
+Spanish decimal comma is accepted (``0,5``) when it is the only separator.
 
 :func:`ajustes_desde_entorno` is pure and never raises. The server reads the
 settings once per process, when a client, guard or sync is first needed, and
@@ -62,6 +68,9 @@ UMBRAL_ERRORES_BLOQUEO = 5
 
 DURACION_BLOQUEO_MINUTOS = 60
 """Approximate length of the site's ban (field evidence 2026-09-24)."""
+
+MAX_TIEMPO_SEGUNDOS = 365 * 24 * 60 * 60
+"""Longest valid time, one year in seconds: larger ones crash at runtime."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +137,9 @@ class _Ajuste:
     consecuencia: str
     muy_arriesgado: Callable[[float], bool] | None = None
     consecuencia_grave: str = ""
+    factor_segundos: float = 1.0
+    """Largest number of seconds derived from a value of 1 (60 for minutes; 2 for the
+    error pause, whose top is twice the value); counts ignore it."""
 
     @property
     def entero(self) -> bool:
@@ -211,6 +223,7 @@ _AJUSTES: tuple[_Ajuste, ...] = (
         f"{VENTANA_ERRORES_SEGUNDOS / 60:g} min o más",
         lambda v: v < VENTANA_ERRORES_SEGUNDOS / 60,
         "los errores se olvidan antes y caben más en poco tiempo, lo que acerca el bloqueo del sitio",
+        factor_segundos=60,
     ),
     _Ajuste(
         ENV_GUARD_COOLDOWN_MINUTES,
@@ -224,6 +237,7 @@ _AJUSTES: tuple[_Ajuste, ...] = (
         lambda v: v < DURACION_BLOQUEO_MINUTOS,
         "el bloqueo del sitio dura cerca de 1 h, así que volver antes choca con un sitio que aún te "
         "bloquea y puede alargar el bloqueo",
+        factor_segundos=60,
     ),
     _Ajuste(
         ENV_ERROR_PAUSE_SECONDS,
@@ -235,6 +249,7 @@ _AJUSTES: tuple[_Ajuste, ...] = (
         lambda v: v < PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
         "tras una página rota la sincronización vuelve a pedir antes, y los errores seguidos "
         "provocan el bloqueo del sitio",
+        factor_segundos=2,
     ),
     _Ajuste(
         ENV_TIMEOUT,
@@ -253,20 +268,28 @@ VARIABLES: tuple[str, ...] = tuple(spec.variable for spec in _AJUSTES)
 """Every variable read by :func:`ajustes_desde_entorno`, in table order."""
 
 
-def _parse(spec: _Ajuste, raw: str) -> float | None:
-    """The valid value of ``raw`` for ``spec``, or ``None``."""
+def _parse(spec: _Ajuste, raw: str) -> float | str:
+    """The valid value of ``raw`` (stripped, not blank) for ``spec``, or why it is invalid.
+
+    A Spanish decimal comma is accepted when it is the only separator
+    (``"0,5"``); ``"1.000,5"`` or ``"1,000.5"`` stay invalid.
+    """
+    text = raw.replace(",", ".") if raw.count(",") == 1 and "." not in raw else raw
+    requisito = f"tiene que ser {spec.requisito()}"
     try:
-        value = float(raw)
+        value = float(text)
     except ValueError:
-        return None
+        return requisito
     if not math.isfinite(value):
-        return None
+        return requisito
     if spec.entero:
         if not value.is_integer():
-            return None
+            return requisito
         value = int(value)
     if value < spec.minimo or (value == spec.minimo and not spec.minimo_incluido):
-        return None
+        return requisito
+    if not spec.entero and value * spec.factor_segundos > MAX_TIEMPO_SEGUNDOS:
+        return "es un tiempo demasiado grande (más de un año)"
     return value
 
 
@@ -286,9 +309,9 @@ def ajustes_desde_entorno(environ: Mapping[str, str]) -> Ajustes:
         if not raw:
             continue
         value = _parse(spec, raw)
-        if value is None:
+        if isinstance(value, str):
             avisos.append(
-                f"{spec.variable}={raw!r} no es válido: tiene que ser {spec.requisito()}. "
+                f"{spec.variable}={raw!r} no es válido: {value}. "
                 f"Se usa el valor por defecto, {spec.mostrar(spec.defecto)}."
             )
             continue
@@ -317,6 +340,7 @@ __all__ = [
     "ENV_SYNC_JITTER",
     "ENV_SYNC_MAX_BOLETINES",
     "ENV_TIMEOUT",
+    "MAX_TIEMPO_SEGUNDOS",
     "UMBRAL_ERRORES_BLOQUEO",
     "VARIABLES",
     "Ajustes",

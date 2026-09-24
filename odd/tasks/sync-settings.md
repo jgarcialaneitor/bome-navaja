@@ -49,6 +49,13 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
       native review `review-d190a663d5477e7a` approved (4 lenses) and acknowledged. Follow-up
       (advisory, ajustes.py:85-92): huge finite minute values overflow to infinity when turned
       into seconds.
-- [ ] 2. Bundle: one numeric `user_config` field per setting in the manifest (title, description
+- [x] 2. Bundle: one numeric `user_config` field per setting in the manifest (title, description
       with effect, consequence and recommendation), mapped to its env var; stage `uv.lock`; tests.
-- [ ] 3. README section on the settings and responsible use; version 0.0.5; tests.
+      Nine `number` fields, no `max`, `min` only for physical validity; responsible-use line in
+      `long_description`. `mcpb validate` passes; mcpb renders defaults as `"2"`, `"0.5"`, `"250"`.
+      `uv.lock` staged; no `--frozen` (a stale lock would then install silently). Verified:
+      `992 passed, 18 skipped`. Commit `5f12f41`; native review `review-c7b65e4e98b89bc6` approved
+      and acknowledged. Not verified: how the Claude Desktop settings UI handles decimals and `min`.
+- [ ] 3. README section on the settings and responsible use; version 0.0.5 (with the re-locked
+      `uv.lock`); hardening: accept a decimal comma (`0,5`) and reject values that overflow to
+      infinity once converted (advisory from task 1); tests.
