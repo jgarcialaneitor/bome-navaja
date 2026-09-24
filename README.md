@@ -113,7 +113,7 @@ Solo para los ceses, sin el O, basta con:
 Con esta última consulta, el sitio devolvió 12 boletines el 23 de septiembre de 2026.
 
 > [!TIP]
-> `buscar_articulos` es lenta a propósito: una petición por boletín, con una pausa de cortesía. Está acotada por `max_bomes` (por defecto 20, máximo 100) y `max_articulos` (por defecto 100, máximo 500). Mira `truncado` y `total_bomes` antes de concluir que no hay más. Los boletines que el sitio encontró pero donde ningún sumario coincide (por ejemplo, los de 2014–2016, que no tienen sumarios) salen en `bomes_sin_coincidencia`.
+> `buscar_articulos` es lenta a propósito: una petición por boletín, con una pausa de cortesía. Está acotada por `max_bomes` (por defecto 20, máximo 100) y `max_articulos` (por defecto 100, máximo 500). Mira `truncado` y `total_bomes` antes de concluir que no hay más. Con O, `total_bomes` suma los resultados de cada grupo y puede contar un boletín dos veces: `total_bomes_exacto` es `false` en ese caso. Los boletines que el sitio encontró pero donde ningún sumario coincide (por ejemplo, los de 2014–2016, que no tienen sumarios) salen en `bomes_sin_coincidencia`.
 
 Para buscar **dentro del texto de las páginas** (la única vía para 2014–2016), usa `buscar_bomes` con `ambito="contenido"`; devuelve boletines, no artículos.
 
@@ -156,7 +156,7 @@ El índice es el fichero `sumarios.sqlite3` dentro de la [carpeta de datos](#-d�
 
 | Campo | Significado |
 | --- | --- |
-| `max_caracteres` | Presupuesto por llamada: entre 1000 y 100000 (por defecto 20000) |
+| `max_caracteres` | Presupuesto por llamada: entre 1000 y 100000 (por defecto 20000); un valor fuera de rango se ajusta al límite más cercano |
 | `paginas` | Páginas enteras hasta llenar el presupuesto, **siempre al menos una** |
 | `siguiente` | `{desde_pagina, desde_caracter}` para la siguiente llamada, o `null` si no queda nada |
 | `cortada` | `true` si una página sola no cabía y se entregó un trozo; `siguiente` apunta dentro de esa página |

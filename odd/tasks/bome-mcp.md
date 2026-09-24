@@ -188,8 +188,18 @@ Out of scope, deliberately:
       native review (high tier) `review-906b6781f322161e` approved and acknowledged.
       Follow-up (advisory, build_mcpb.py:75): a staging target INSIDE a staged source dir
       (e.g. `--out src/x`) is not refused.
-- [ ] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
+- [x] 8. README (Spanish) with install paths (Claude Desktop .mcpb, Claude Code, Linux, Windows)
       and a live smoke run.
+      README `60ceaa9` (353 lines, tuteo, navaja structure) with `tests/test_readme.py` (tools,
+      env vars, repo paths and anchors kept in sync). Live smoke 2026-09-24, verdict READY:
+      `uvx --from git+...@feat/bome-mcp bome-navaja-mcp` installed from the private repo in
+      7.2 s cold; a stdio session ran all 17 tools (list, tree, article cursor over 4 pages,
+      bulletin PDF 37 pages, PDF cache hit, README example → 12 bulletins / 12 articles,
+      contenido search 141, empty-index aviso, July-2025 sync 12/12 in ~9 s, index hits incl.
+      hidden BOME-A-2025-745 in both modes, error codes); every stdout line JSON-RPC, empty
+      stderr, clean exit; ~80 GETs. Its 3 low findings (docstring keys, OR `total_bomes`,
+      clamped `max_caracteres`) fixed in the README/docstrings.
+      Not verified: an install inside Claude Desktop; unpinned install from main (after merge).
 
 ## Evidence
 
@@ -202,6 +212,7 @@ Out of scope, deliberately:
 - `0ac7ff3` feat: switch the sumario index to trigrams with word-start mode (task 5b).
 - `e15698e` feat: add the bome-navaja MCP server; `f319653` fix: Windows portability (task 6).
 - `dc62e89` feat: add the Claude Desktop .mcpb bundle (task 7).
+- `60ceaa9` docs: write the Spanish README (task 8).
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.

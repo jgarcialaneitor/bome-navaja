@@ -298,7 +298,7 @@ def listar_bomes(desde: str | None = None, hasta: str | None = None) -> dict:
     Fechas en AAAA-MM-DD o DD/MM/AAAA, ambas incluidas. Por defecto, los últimos 30 días
     hasta hoy. Devuelve como máximo 500 boletines, del más reciente al más antiguo; si hay
     más, 'truncado' es true y 'total' dice cuántos hay: acota el rango. Cada boletín trae
-    cve, numero, fecha, extraordinario (BOME-BX) y url. Para ver sus artículos usa ver_bome.
+    cve, number, date, extraordinary (BOME-BX), title y url. Para ver sus artículos usa ver_bome.
     """
     end = _fecha(hasta, "hasta", ArgumentoInvalidoError) or date.today()
     start = _fecha(desde, "desde", ArgumentoInvalidoError) or end - timedelta(days=DEFAULT_LISTADO_DIAS)
@@ -322,7 +322,7 @@ def ver_bome(cve: str, recuperar_ocultos: bool = False) -> dict:
     """Muestra un boletín (BOME-B-AAAA-N o BOME-BX-AAAA-N) con su árbol de artículos.
 
     Estructura: sections (departamento) → consejerias → organismos → articles, cada
-    artículo con cve, numero, sumario, url y pdf_url. Antes de finales de 2016 los
+    artículo con cve, number, sumario, url y pdf_url. Antes de finales de 2016 los
     artículos no tienen sumario. La página del sitio a veces omite artículos; con
     recuperar_ocultos=true se buscan los huecos de numeración (una petición por hueco) y se
     devuelven en 'articulos_ocultos'. Para el texto de un artículo usa leer_articulo.
