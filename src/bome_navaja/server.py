@@ -17,6 +17,14 @@ sync owns a separate client created by the same factory, but asked for the
 slower sync pace (:func:`bome_navaja.sync.sync_settings_from_env`: its
 environment overrides are read when the sync is first used).
 
+Site guard: one :class:`~bome_navaja.guard.GuardiaSitio` per process,
+created lazily and persisted in the data folder (``estado_sitio.json``, so
+restarts and other server processes share its error budget and cooldown; a
+memory-only guard when the data folder is unavailable), is wired into both
+the shared client and the sync client. While it refuses, tools answer
+``sitio_bloqueando`` or ``pausa_preventiva`` with ``reintentar_tras_segundos``
+without touching the network.
+
 Nothing touches the network or the index file at import time; the index is
 opened only by the index tools, and a sync starts only through
 ``sincronizar_indice`` (user decision 2026-09-23).
@@ -47,6 +55,7 @@ from .documents import descargar_pdf as _descargar_pdf
 from .documents import leer_articulo as _leer_articulo
 from .documents import leer_boletin as _leer_boletin
 from .documents import leer_pdf as _leer_pdf
+from .guard import FICHERO_ESTADO, GuardiaSitio
 from .index import SumarioIndex
 from .models import (
     BomeBlockedError,
@@ -57,6 +66,7 @@ from .models import (
     BomeIndexVersionError,
     BomeNotFoundError,
     BomeParseError,
+    BomePausaPreventivaError,
     BomeStorageError,
 )
 from .paths import data_dir, index_path, pdf_dir
@@ -108,28 +118,52 @@ class ArgumentoInvalidoError(BomeError, ValueError):
 
 
 def _default_client_factory(
-    *, polite_delay: float = RECOMMENDED_POLITE_DELAY, jitter: float = 0.0
+    *,
+    polite_delay: float = RECOMMENDED_POLITE_DELAY,
+    jitter: float = 0.0,
+    guard: GuardiaSitio | None = None,
 ) -> BomeClient:
-    return BomeClient(polite_delay=polite_delay, jitter=jitter)
+    return BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
 
 
 _client_factory: Callable[..., BomeClient] = _default_client_factory
-"""Builds every client. The shared (interactive) client is built with no
-arguments, the sync client with the sync pace as ``polite_delay``/``jitter``
-keywords. Tests replace it with a MockTransport one."""
+"""Builds every client, always with the process's site guard as ``guard=``.
+The shared (interactive) client gets no other argument, the sync client the
+sync pace as ``polite_delay``/``jitter`` keywords. Tests replace it with a
+MockTransport one."""
 
 _state_lock = threading.Lock()
 _client_use_lock = threading.Lock()
 _client: BomeClient | None = None
 _index: SumarioIndex | None = None
 _sync: SincronizadorIndice | None = None
+_guard: GuardiaSitio | None = None
+
+
+def _get_guard() -> GuardiaSitio:
+    """The process's site guard, persisted in the data folder when there is one."""
+    global _guard
+    with _state_lock:
+        if _guard is None:
+            try:
+                path = data_dir()[0] / FICHERO_ESTADO
+            except BomeError as exc:
+                print(
+                    f"bome-navaja: no data folder for the site guard ({exc}); "
+                    "its state is kept in memory for this process",
+                    file=sys.stderr,
+                )
+                path = None
+            _guard = GuardiaSitio(path)
+        return _guard
 
 
 def _get_client() -> BomeClient:
     global _client
+    guard = _get_guard()
     with _state_lock:
         if _client is None:
-            _client = _client_factory()
+            _client = _client_factory(guard=guard)
         return _client
 
 
@@ -188,27 +222,36 @@ def _sync_settings() -> SyncSettings:
 def _get_sync() -> SincronizadorIndice:
     global _sync
     index = _get_index()
+    guard = _get_guard()
     with _state_lock:
         if _sync is None:
             settings = _sync_settings()
             for warning in settings.warnings:
                 print(f"bome-navaja: {warning}", file=sys.stderr)
+
+            def sync_client(*, guard: GuardiaSitio | None = None) -> BomeClient:
+                return _client_factory(
+                    polite_delay=settings.polite_delay, jitter=settings.jitter, guard=guard
+                )
+
             _sync = SincronizadorIndice(
                 index,
-                lambda: _client_factory(polite_delay=settings.polite_delay, jitter=settings.jitter),
+                sync_client,
                 polite_delay=settings.polite_delay,
                 jitter=settings.jitter,
                 max_boletines=settings.max_boletines,
+                guard=guard,
             )
         return _sync
 
 
 def close_shared_state() -> None:
     """Stop the sync, close the shared client and the index (shutdown and tests)."""
-    global _client, _index, _sync
+    global _client, _index, _sync, _guard
     with _state_lock:
         sync, index, client = _sync, _index, _client
         _sync = _index = _client = None
+        _guard = None
     if sync is not None:
         sync.cancelar()
         if not sync.esperar(SYNC_SHUTDOWN_WAIT):
@@ -253,11 +296,18 @@ _ERRORS: tuple[tuple[type[BaseException], str, str], ...] = (
     (BomeDocumentTooLargeError, "documento_demasiado_grande", "El documento supera el límite de tamaño"),
     (BomeStorageError, "error_almacenamiento", "Error de almacenamiento local"),
     (
+        BomePausaPreventivaError,
+        "pausa_preventiva",
+        "Pausa de seguridad propia de bome-navaja para no activar el cortafuegos de "
+        "bomemelilla.es (no es un bloqueo del sitio); espera los segundos de "
+        "reintentar_tras_segundos antes de reintentar y no repitas la llamada en bucle",
+    ),
+    (
         BomeBlockedError,
         "sitio_bloqueando",
         "bomemelilla.es está rechazando nuestras peticiones (límite de peticiones o "
-        "cortafuegos); espera varios minutos antes de reintentar y no repitas la llamada "
-        "en bucle",
+        "cortafuegos) y bome-navaja no le pedirá nada durante reintentar_tras_segundos; "
+        "espera ese tiempo antes de reintentar y no repitas la llamada en bucle",
     ),
     (BomeNotFoundError, "no_encontrado", "No existe en bomemelilla.es"),
     (BomeHTTPError, "error_http", "bomemelilla.es no respondió correctamente"),
@@ -824,7 +874,9 @@ def estado_servidor() -> dict:
     el directorio de trabajo), si existe el fichero del índice y su estado si ya está
     abierto, versión de SQLite con FTS5/trigram, pausa de cortesía de las herramientas y de
     la sincronización (pausa, variación aleatoria y máximo de boletines por ejecución, con
-    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas) y URL base.
+    BOME_NAVAJA_SYNC_DELAY y BOME_NAVAJA_SYNC_MAX_BOLETINES aplicadas), URL base y la
+    guardia del sitio (guardia_sitio: enfriamiento_hasta y segundos_restantes si el sitio
+    nos bloqueó, errores HTTP en la ventana frente al máximo permitido y su fichero).
     """
     try:
         exists = index_path()[0].exists()
@@ -850,6 +902,7 @@ def estado_servidor() -> dict:
         "cortesia_segundos": RECOMMENDED_POLITE_DELAY,
         "cortesia_sincronizacion": sync_pace,
         "url_base": BASE_URL,
+        "guardia_sitio": _get_guard().estado(),
     }
 
 

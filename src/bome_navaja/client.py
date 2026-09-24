@@ -23,7 +23,7 @@ import time
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -53,6 +53,8 @@ from .models import (
     SearchPage,
     Sumario,
 )
+if TYPE_CHECKING:
+    from .guard import GuardiaSitio
 from .parsers import (
     parse_article_page,
     parse_bulletin_page,
@@ -101,6 +103,15 @@ def _now() -> datetime:
 # Answers meaning "the site is refusing us" (rate limit, WAF, overload), not
 # "this document is broken": bulk callers must stop on them.
 _BLOCKING_STATUSES = frozenset({403, 429, 503})
+
+# Failures meaning "the site did not answer" (what a firewall that drops our
+# packets looks like), as opposed to local mistakes such as an invalid URL.
+_NO_ANSWER: tuple[type[Exception], ...] = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpx.ProxyError,
+)
 
 
 def _retry_after(value: str | None) -> float | None:
@@ -163,6 +174,13 @@ class BomeClient:
     random ``uniform(0, jitter)`` seconds, drawn per request, so a long crawl
     such as the index sync does not hit the site at a fixed rhythm; ``rng``
     is the randomness source (tests inject a deterministic one).
+
+    With a ``guard`` (:class:`~bome_navaja.guard.GuardiaSitio`) every request
+    first asks it (``comprobar``: during a cooldown or with the error budget
+    full it raises before touching the network) and then reports its outcome
+    (``registrar``: the HTTP status, or ``None`` when the site did not
+    answer). A blocking answer's ``retry_after`` then carries what is left of
+    the guard's cooldown. Without a guard the client behaves as before.
     """
 
     def __init__(
@@ -175,6 +193,7 @@ class BomeClient:
         jitter: float = 0.0,
         rng: random.Random | None = None,
         user_agent: str = USER_AGENT,
+        guard: GuardiaSitio | None = None,
     ) -> None:
         if polite_delay < 0:
             raise ValueError(f"polite_delay must be >= 0, got {polite_delay!r}")
@@ -186,6 +205,7 @@ class BomeClient:
         self.jitter = jitter
         self._rng = rng if rng is not None else random.Random()
         self._last_request: float | None = None
+        self.guard = guard
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
@@ -231,6 +251,32 @@ class BomeClient:
         if remaining > 0:
             time.sleep(remaining)
 
+    def _ask_guard(self, url: str) -> None:
+        if self.guard is not None:
+            self.guard.comprobar(url)
+
+    def _no_answer(self, exc: Exception) -> None:
+        if self.guard is not None and isinstance(exc, _NO_ANSWER):
+            self.guard.registrar(None)
+
+    def _check_answer(self, response: httpx.Response) -> None:
+        """Report the answer to the guard, then map failures like :func:`_raise_for_status`."""
+        if self.guard is None:
+            _raise_for_status(response)
+            return
+        try:
+            _raise_for_status(response)
+        except BomeBlockedError as exc:
+            self.guard.registrar(response.status_code, retry_after=exc.retry_after)
+            cooldown = self.guard.segundos_enfriamiento()
+            if cooldown > (exc.retry_after or 0.0):
+                exc.retry_after = cooldown
+            raise
+        except BomeHTTPError:
+            self.guard.registrar(response.status_code)
+            raise
+        self.guard.registrar(response.status_code)
+
     def _request(
         self,
         path: str,
@@ -248,15 +294,17 @@ class BomeClient:
         url = path if path.startswith(("http://", "https://")) else self.base_url + path
         if self._client.is_closed:
             raise BomeHTTPError(f"client is closed; cannot request {url}", status=None, url=url)
+        self._ask_guard(url)
         self._wait_politely()
         try:
             response = self._client.get(path, params=params, follow_redirects=follow_redirects)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            self._no_answer(exc)
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
             if self._paced:
                 self._last_request = time.monotonic()
-        _raise_for_status(response)
+        self._check_answer(response)
         return response
 
     def _get_text(
@@ -391,12 +439,13 @@ class BomeClient:
         url = self.base_url + path
         if self._client.is_closed:
             raise BomeHTTPError(f"client is closed; cannot request {url}", status=None, url=url)
+        self._ask_guard(url)
         self._wait_politely()
         chunks: list[bytes] = []
         received = 0
         try:
             with self._client.stream("GET", path) as response:
-                _raise_for_status(response)
+                self._check_answer(response)
                 announced = response.headers.get("content-length", "")
                 if max_bytes is not None and announced.isdigit() and int(announced) > max_bytes:
                     raise BomeDocumentTooLargeError(
@@ -415,6 +464,7 @@ class BomeClient:
                     chunks.append(chunk)
                 content_type = response.headers.get("content-type")
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            self._no_answer(exc)
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
             if self._paced:

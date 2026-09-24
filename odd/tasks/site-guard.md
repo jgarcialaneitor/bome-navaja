@@ -36,5 +36,7 @@ decision 2026-09-24: leave as they are).
 - [x] 1. `PX` CVE kind. Verified: `515 passed, 16 skipped`.
 - [x] 2. Index v3: `http_status`, failure count, `roto` state, plan skips `roto`, migration.
       Verified: `536 passed, 16 skipped`. Migrated v2 errors with a stored 5xx become `roto` at once.
-- [ ] 3. Site guard: persisted error budget + cooldown, wired into client and sync.
+- [x] 3. Site guard: persisted error budget + cooldown, wired into client and sync.
+      Verified: `593 passed, 16 skipped`. The guard replaces the v0.0.2 exponential block
+      retries: a site block or 2 transport failures close the site for 75 min (or Retry-After).
 - [ ] 4. Server tools, README, version 0.0.3.

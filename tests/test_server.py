@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import queue
@@ -18,6 +19,8 @@ import pytest
 from bome_navaja import __version__
 from bome_navaja import server as srv
 from bome_navaja.client import BomeClient
+from bome_navaja.guard import ENFRIAMIENTO_SEGUNDOS, FICHERO_ESTADO, GuardiaSitio
+from bome_navaja.sync import SincronizadorIndice
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BASE = "https://bomemelilla.es"
@@ -57,6 +60,7 @@ class Site:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.paces: list[dict[str, float]] = []
+        self.guards: list[GuardiaSitio | None] = []
         self.lock = threading.Lock()
         self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {}
         for path, name in {
@@ -98,10 +102,25 @@ class Site:
         handler = self.routes.get(request.url.path)
         return handler(request) if handler else httpx.Response(404, text="Not found")
 
-    def factory(self, **pace: float) -> BomeClient:
+    def factory(self, *, guard: GuardiaSitio | None = None, **pace: float) -> BomeClient:
         """Records the requested pace (empty for interactive clients) but never waits."""
         self.paces.append(pace)
-        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0)
+        self.guards.append(guard)
+        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0, guard=guard)
+
+
+class FakeTime:
+    """Wall clock of the server's guard; the sync's waits move it instead of sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 1_790_000_000.0
+
+    def clock(self) -> float:
+        return self.now
+
+    def wait(self, seconds: float) -> bool:
+        self.now += seconds
+        return False
 
 
 @pytest.fixture
@@ -117,7 +136,16 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 
 @pytest.fixture
-def site(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
+def fake_time(monkeypatch: pytest.MonkeyPatch) -> FakeTime:
+    """The server's guard and sync run on a fake clock: no test ever really waits."""
+    fake = FakeTime()
+    monkeypatch.setattr(srv, "GuardiaSitio", functools.partial(GuardiaSitio, clock=fake.clock))
+    monkeypatch.setattr(srv, "SincronizadorIndice", functools.partial(SincronizadorIndice, wait=fake.wait))
+    return fake
+
+
+@pytest.fixture
+def site(data_dir: Path, fake_time: FakeTime, monkeypatch: pytest.MonkeyPatch) -> Site:
     fake = Site()
     monkeypatch.setattr(srv, "_client_factory", fake.factory)
     return fake
@@ -350,7 +378,7 @@ def test_buscar_en_indice_warns_while_a_sync_runs(site: Site, data_dir: Path) ->
 def test_estado_servidor_touches_neither_network_nor_index(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def no_network() -> BomeClient:
+    def no_network(**kwargs: object) -> BomeClient:
         raise AssertionError("estado_servidor must not create a client")
 
     monkeypatch.setattr(srv, "_client_factory", no_network)
@@ -371,6 +399,15 @@ def test_estado_servidor_touches_neither_network_nor_index(
         "max_boletines_por_ejecucion": 250,
     }
     assert result["url_base"] == BASE
+    assert result["guardia_sitio"] == {
+        "enfriamiento_hasta": None,
+        "segundos_restantes": 0,
+        "motivo": None,
+        "errores_en_ventana": 0,
+        "max_errores": 3,
+        "ventana_segundos": 600,
+        "fichero": str(data_dir / FICHERO_ESTADO),
+    }
     assert not data_dir.exists()
 
 
@@ -517,7 +554,8 @@ def test_blocking_answer_is_sitio_bloqueando(site: Site) -> None:
     )
     result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
     assert result["estado_http"] == 429
-    assert result["reintentar_tras_segundos"] == 120.0
+    # Retry-After was 120 s, but the guard keeps the site closed for its whole cooldown.
+    assert result["reintentar_tras_segundos"] == ENFRIAMIENTO_SEGUNDOS
     assert "espera" in result["error"].lower()
 
 
@@ -525,7 +563,7 @@ def test_blocked_drill_down_is_sitio_bloqueando(site: Site) -> None:
     site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(403)
     result = fail(srv.buscar_articulos(texto="relacion provisional"), "sitio_bloqueando")
     assert result["estado_http"] == 403
-    assert result["reintentar_tras_segundos"] is None
+    assert result["reintentar_tras_segundos"] == ENFRIAMIENTO_SEGUNDOS
 
 
 @pytest.mark.parametrize(
@@ -557,7 +595,7 @@ def test_index_query_errors(site: Site) -> None:
 def test_unexpected_exception_is_error_interno(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def broken() -> BomeClient:
+    def broken(**kwargs: object) -> BomeClient:
         raise RuntimeError("secret internal detail")
 
     monkeypatch.setattr(srv, "_client_factory", broken)
@@ -583,8 +621,8 @@ def test_nothing_is_printed_to_stdout(site: Site, capsys: pytest.CaptureFixture[
 def test_shared_client_is_created_once(site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
     created: list[BomeClient] = []
 
-    def counting() -> BomeClient:
-        client = site.factory()
+    def counting(**kwargs: object) -> BomeClient:
+        client = site.factory(**kwargs)
         created.append(client)
         return client
 
@@ -737,3 +775,103 @@ def test_tool_descriptions_are_accurate() -> None:
     assert "sincronizacion_indice" not in names["estado_indice"]
     for tool in ("leer_articulo", "leer_boletin", "leer_pdf"):
         assert "cortada" in names[tool], tool
+
+
+# --------------------------------------------------------------------------- site guard (site-guard task 3)
+
+
+def test_one_persisted_guard_is_shared_by_the_tools_and_the_sync(site: Site, data_dir: Path) -> None:
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    guard = srv._get_guard()
+    assert guard is srv._get_guard()
+    assert guard.estado()["fichero"] == str(data_dir / FICHERO_ESTADO)
+    stored = json.loads((data_dir / FICHERO_ESTADO).read_text("utf-8"))
+    assert len(stored["errores"]) == 1  # the 404 was counted in the data folder
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30", reindexar_recientes_dias=0))
+    assert srv._get_sync().esperar(10)
+    assert srv._get_sync().guard is guard
+    assert site.guards == [guard, guard]  # interactive client, then the sync client
+
+
+def test_tools_refuse_without_the_network_during_a_cooldown(site: Site, fake_time: FakeTime) -> None:
+    srv._get_guard().registrar(None)
+    srv._get_guard().registrar(None)  # two requests in a row lost: the site is closed
+    fake_time.now += 500
+    for call in (
+        lambda: srv.ver_bome("BOME-B-2026-6416"),
+        lambda: srv.leer_articulo("BOME-B-2026-6416", 1051),
+        lambda: srv.descargar_pdf("BOME-P-2026-4784"),
+        lambda: srv.listar_consejerias(1),
+    ):
+        result = fail(call(), "sitio_bloqueando")
+        assert result["reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 500)
+        assert result["estado_http"] is None
+        assert "bloque" in result["error"] and "UTC" in result["error"]
+    assert site.requests == []
+    ok(srv.sincronizar_indice(desde="2026-09-01", hasta="2026-09-30"))
+    assert srv._get_sync().esperar(10)
+    state = ok(srv.estado_indice())["sincronizacion"]
+    assert state["estado"] == "bloqueado"
+    assert state["reintentar_tras_segundos"] == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 500)
+    assert site.requests == []
+
+
+def test_a_full_error_budget_is_pausa_preventiva(site: Site, fake_time: FakeTime) -> None:
+    for number in (9997, 9998, 9999):
+        fail(srv.ver_bome(f"BOME-B-2026-{number}"), "no_encontrado")
+    fake_time.now += 100
+    site.requests.clear()
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "pausa_preventiva")
+    assert result["reintentar_tras_segundos"] == pytest.approx(500)
+    assert result["estado_http"] is None
+    text = result["error"].lower()
+    assert "pausa preventiva" in text and "cortafuegos" in text and "500 s" in text
+    assert site.requests == []
+    fake_time.now += 500
+    ok(srv.ver_bome("BOME-B-2026-6416"))
+
+
+def test_a_cooldown_left_by_another_process_is_honoured(
+    site: Site, data_dir: Path, fake_time: FakeTime
+) -> None:
+    data_dir.mkdir(parents=True)
+    (data_dir / FICHERO_ESTADO).write_text(
+        json.dumps({"errores": [], "enfriamiento_hasta": fake_time.now + 3000, "motivo": "HTTP 429"}), "utf-8"
+    )
+    result = fail(srv.ver_bome("BOME-B-2026-6416"), "sitio_bloqueando")
+    assert result["reintentar_tras_segundos"] == pytest.approx(3000)
+    assert site.requests == []
+    state = ok(srv.estado_servidor())["guardia_sitio"]
+    assert state["segundos_restantes"] == 3000
+    assert state["motivo"] == "HTTP 429"
+    assert state["enfriamiento_hasta"].endswith("+00:00")
+
+
+def test_estado_servidor_reports_the_guard(site: Site, data_dir: Path) -> None:
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    state = ok(srv.estado_servidor())["guardia_sitio"]
+    assert (state["errores_en_ventana"], state["max_errores"], state["ventana_segundos"]) == (1, 3, 600)
+    assert state["enfriamiento_hasta"] is None
+    assert state["fichero"] == str(data_dir / FICHERO_ESTADO)
+
+
+def test_without_a_data_folder_the_guard_lives_in_memory(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bome_navaja.models import BomeError
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise BomeError("no data folder")
+
+    monkeypatch.setattr(srv, "data_dir", unavailable)
+    fail(srv.ver_bome("BOME-B-2026-9999"), "no_encontrado")
+    guard = srv._get_guard()
+    assert guard.estado()["fichero"] is None
+    assert guard.errores_en_ventana() == 1
+
+
+def test_close_shared_state_forgets_the_guard(site: Site) -> None:
+    guard = srv._get_guard()
+    srv.close_shared_state()
+    assert srv._get_guard() is not guard
+

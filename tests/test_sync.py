@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -14,10 +15,14 @@ import pytest
 
 from bome_navaja import sync as sync_module
 from bome_navaja.client import BomeClient
+from bome_navaja.guard import ENFRIAMIENTO_SEGUNDOS, GuardiaSitio
 from bome_navaja.index import SumarioIndex
 from bome_navaja.search import BusquedaInvalidaError
 from bome_navaja.sync import (
     DEFAULT_MAX_BULLETINS_PER_RUN,
+    MAX_PAUSAS_PREVENTIVAS_SEGUIDAS,
+    PAUSA_TRAS_ERROR_MAX_SEGUNDOS,
+    PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
     SYNC_JITTER,
     SYNC_POLITE_DELAY,
     SincronizadorIndice,
@@ -50,6 +55,9 @@ def b6415_html() -> str:
 class Site:
     def __init__(self) -> None:
         self.requests: list[str] = []
+        self.guards: list[GuardiaSitio | None] = []
+        self.clock = [1_000_000.0]
+        """Fake wall clock of the tests' guards; the default :class:`Waits` moves it."""
         self.lock = threading.Lock()
         self.routes: dict[str, Callable[[httpx.Request], httpx.Response]] = {
             "/api/bomes/calendar": lambda request: httpx.Response(
@@ -79,8 +87,13 @@ class Site:
         handler = self.routes.get(request.url.path)
         return handler(request) if handler else httpx.Response(404)
 
-    def factory(self) -> BomeClient:
-        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0)
+    def factory(self, *, guard: GuardiaSitio | None = None) -> BomeClient:
+        self.guards.append(guard)
+        return BomeClient(transport=httpx.MockTransport(self), polite_delay=0, guard=guard)
+
+    def guard(self) -> GuardiaSitio:
+        """A memory-only guard on the fake clock."""
+        return GuardiaSitio(None, clock=lambda: self.clock[0])
 
     def bulletin_paths(self) -> list[str]:
         return [u.split("bomemelilla.es", 1)[1] for u in self.requests if "/bome/BOME-" in u]
@@ -99,6 +112,9 @@ def index(tmp_path: Path) -> SumarioIndex:
 
 
 def make_sync(index: SumarioIndex, site: Site, **kwargs) -> SincronizadorIndice:
+    """A sync on a fake-clock guard whose waits never sleep (they move the clock)."""
+    kwargs.setdefault("guard", site.guard())
+    kwargs.setdefault("wait", Waits(clock=site.clock))
     return SincronizadorIndice(index, site.factory, hoy=lambda: TODAY, **kwargs)
 
 
@@ -239,10 +255,10 @@ def test_stale_lease_is_taken_over(site: Site, index: SumarioIndex) -> None:
 
 
 def test_calendar_failure_is_fatal(site: Site, index: SumarioIndex) -> None:
-    site.routes["/api/bomes/calendar"] = lambda request: httpx.Response(503)
+    site.routes["/api/bomes/calendar"] = lambda request: httpx.Response(500)
     state = run(make_sync(index, site))
     assert state.estado == "fallido"
-    assert "503" in (state.mensaje or "")
+    assert "500" in (state.mensaje or "")
     assert state.total_planificado == 0
     assert index.lease() is None
     assert index.estado().ultima_sincronizacion["estado"] == "fallido"
@@ -364,93 +380,231 @@ class Waits:
         return self.on_wait() if self.on_wait else False
 
 
-def test_a_blocked_bulletin_is_retried_after_back_off_and_not_recorded_as_error(
-    site: Site, index: SumarioIndex
+
+def seeded_guard(site: Site, errors: int, *, age: float = 0.0) -> GuardiaSitio:
+    """A fake-clock guard that already counted ``errors`` error answers ``age`` seconds ago."""
+    guard = site.guard()
+    site.clock[0] -= age
+    for _ in range(errors):
+        guard.registrar(500)
+    site.clock[0] += age
+    return guard
+
+
+def _without_article(html: str, cve: str) -> str:
+    """Drop one article block from a bulletin page, as the live site sometimes does."""
+    pattern = re.compile(
+        r'<ul class="articulo-list">(?:(?!<ul class="articulo-list">).)*?' + re.escape(cve) + r".*?</ul>",
+        re.DOTALL,
+    )
+    stripped, count = pattern.subn("", html, count=1)
+    assert count == 1
+    return stripped
+
+
+@pytest.mark.parametrize("status", [403, 429, 503])
+def test_a_site_block_ends_the_sync_at_once_and_closes_the_guard(
+    site: Site, index: SumarioIndex, status: int
 ) -> None:
     site.fix_6415()
-    site.routes[B6416] = sequence(blocked(429), Site.fixture("b6416.html"))
-    waits = Waits()
-    state = run(make_sync(index, site, backoff_base=1, backoff_max=100, wait=waits))
-    assert state.estado == "completado"
-    assert (state.hechos, state.indexados, state.sin_sumarios, state.errores) == (4, 3, 1, 0)
-    assert waits.slices == [1]
-    assert site.bulletin_paths().count(B6416) == 2
-    assert index.estado_boletin("BOME-B-2026-6416") == "indexado"
-    assert index.estado().boletines.get("error", 0) == 0
-    assert state.mensaje is None  # the back-off note is cleared once the bulletin is done
-
-
-def test_a_persistent_block_ends_the_sync_as_bloqueado(site: Site, index: SumarioIndex) -> None:
-    site.fix_6415()
-    site.routes[B6416] = blocked(403)
-    waits = Waits()
-    state = run(make_sync(index, site, backoff_base=1, backoff_max=100, wait=waits))
+    site.routes[B6416] = blocked(status)
+    waits = Waits(clock=site.clock)
+    sync = make_sync(index, site, wait=waits)
+    state = run(sync)
     assert state.estado == "bloqueado"
-    assert waits.slices == [1, 2]  # exponential back-off, 2 retries by default
-    assert site.bulletin_paths() == [B6416] * 3  # later bulletins are never requested
+    assert site.bulletin_paths() == [B6416]  # no retry against a closed guard, no later bulletin
+    assert waits.slices == []
     assert (state.hechos, state.errores, state.indexados) == (0, 0, 0)
     assert index.estado_boletin("BOME-B-2026-6416") is None  # not recorded at all
-    assert "403" in (state.ultimo_error or "")
+    assert str(status) in (state.ultimo_error or "")
     mensaje = state.mensaje or ""
-    assert "firewall" in mensaje and "kept" in mensaje and "hours" in mensaje
-    assert state.reintentar_tras_segundos is None
+    assert "firewall" in mensaje and "kept" in mensaje
+    assert state.reintentar_tras_segundos == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+    assert sync.guard.en_enfriamiento()
     assert index.lease() is None
     assert index.estado().ultima_sincronizacion["estado"] == "bloqueado"
 
 
-def test_retry_after_longer_than_the_back_off_is_honoured(site: Site, index: SumarioIndex) -> None:
+def test_a_long_retry_after_is_reported(site: Site, index: SumarioIndex) -> None:
+    site.routes[B6416] = blocked(429, "9000")
+    state = run(make_sync(index, site))
+    assert state.estado == "bloqueado"
+    assert state.reintentar_tras_segundos == pytest.approx(9000)
+
+
+def test_a_sync_started_during_a_cooldown_ends_at_once_without_any_request(
+    site: Site, index: SumarioIndex
+) -> None:
+    guard = site.guard()
+    guard.registrar(429)
+    site.clock[0] += 500
+    state = run(make_sync(index, site, guard=guard))
+    assert state.estado == "bloqueado"
+    assert site.requests == []
+    assert state.reintentar_tras_segundos == pytest.approx(ENFRIAMIENTO_SEGUNDOS - 500)
+    assert "429" in (state.mensaje or "")
+    assert state.total_planificado == 0
+    assert index.lease() is None
+    assert index.estado().ultima_sincronizacion["estado"] == "bloqueado"
+
+
+def test_a_cooldown_set_meanwhile_by_another_process_stops_the_sync(site: Site, index: SumarioIndex) -> None:
     site.fix_6415()
-    site.routes[B6416] = sequence(blocked(429, "120"), Site.fixture("b6416.html"))
-    waits = Waits()
-    state = run(make_sync(index, site, backoff_base=1, backoff_max=1000, wait=waits))
+    guard = site.guard()
+    body = (FIXTURES / "b6416.html").read_bytes()
+
+    def page_then_blocked_elsewhere(request: httpx.Request) -> httpx.Response:
+        guard.registrar(None)  # e.g. the interactive tools lost two requests in a row
+        guard.registrar(None)
+        return httpx.Response(200, content=body)
+
+    site.routes[B6416] = page_then_blocked_elsewhere
+    state = run(make_sync(index, site, guard=guard))
+    assert state.estado == "bloqueado"
+    assert site.bulletin_paths() == [B6416]
+    assert state.reintentar_tras_segundos == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+
+
+def test_a_block_on_the_calendar_is_bloqueado(site: Site, index: SumarioIndex) -> None:
+    site.routes["/api/bomes/calendar"] = blocked(503)
+    sync = make_sync(index, site)
+    state = run(sync)
+    assert state.estado == "bloqueado"
+    assert state.reintentar_tras_segundos == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+    assert sync.guard.en_enfriamiento()
+    assert site.bulletin_paths() == []
+
+
+def test_the_sync_waits_for_a_full_error_budget_before_a_bulletin(site: Site, index: SumarioIndex) -> None:
+    site.fix_6415()
+    guard = site.guard()
+    body = (FIXTURES / "b6416.html").read_bytes()
+
+    def page_while_others_err(request: httpx.Request) -> httpx.Response:
+        site.clock[0] -= 480
+        for _ in range(3):  # e.g. the interactive tools got three 404s 8 minutes ago
+            guard.registrar(404)
+        site.clock[0] += 480
+        return httpx.Response(200, content=body)
+
+    site.routes[B6416] = page_while_others_err
+    seen: list[tuple[int, str | None]] = []
+    waits = Waits(
+        clock=site.clock,
+        on_wait=lambda: seen.append((len(site.bulletin_paths()), sync.estado().mensaje)) or False,
+    )
+    sync = make_sync(index, site, guard=guard, wait=waits)
+    state = run(sync)
     assert state.estado == "completado"
-    assert sum(waits.slices) == 120
-    assert max(waits.slices) <= 30  # waited in slices so the lease can be renewed
-    assert state.reintentar_tras_segundos == 120
+    assert sum(waits.slices) == pytest.approx(120)  # until the oldest error leaves the window
+    assert max(waits.slices) <= 30  # cancellable slices that renew the lease
+    assert {count for count, _ in seen} == {1}  # after 6416, before 6415
+    mensaje = seen[0][1] or ""
+    assert "preventive pause" in mensaje and "3 HTTP error" in mensaje and "BOME-B-2026-6415" in mensaje
+    assert "not a block" in mensaje
+    assert state.mensaje is None  # the note is cleared once the crawl goes on
+    assert (state.hechos, state.indexados) == (4, 3)
 
 
-def test_back_off_grows_exponentially_and_is_capped(site: Site, index: SumarioIndex) -> None:
-    site.routes[B6416] = blocked(429)
-    waits = Waits()
-    state = run(make_sync(index, site, backoff_base=10, backoff_max=25, max_block_retries=3, wait=waits))
+def test_the_sync_waits_for_a_full_error_budget_before_the_calendar(site: Site, index: SumarioIndex) -> None:
+    site.fix_6415()
+    seen: list[int] = []
+    waits = Waits(clock=site.clock, on_wait=lambda: seen.append(len(site.requests)) or False)
+    state = run(make_sync(index, site, guard=seeded_guard(site, 3, age=590), wait=waits))
+    assert state.estado == "completado"
+    assert sum(waits.slices) == pytest.approx(10)
+    assert set(seen) == {0}
+
+
+def test_a_preventive_pause_inside_a_bulletin_resumes_the_same_bulletin(
+    site: Site, index: SumarioIndex
+) -> None:
+    site.fix_6415()
+    html = _without_article((FIXTURES / "b6416.html").read_text("utf-8"), "BOME-A-2026-1051")
+    html = _without_article(html, "BOME-A-2026-1056")
+    site.routes[B6416] = lambda request: httpx.Response(200, text=html)
+    guard = seeded_guard(site, 2)
+    # Probe 1051 answers 404 (third error: budget full), so probe 1056 must wait.
+    waits = Waits(clock=site.clock)
+    state = run(make_sync(index, site, guard=guard, wait=waits))
+    assert state.estado == "completado"
+    paths = site.bulletin_paths()
+    assert paths.count(B6416) == 1  # the page is not fetched again
+    assert paths.count(B6416 + "/articulo/1051") == 1  # nor the probe that already failed
+    assert paths.count(B6416 + "/articulo/1056") == 1
+    assert paths.index(B6416 + "/articulo/1056") > paths.index(B6416 + "/articulo/1051")
+    assert sum(waits.slices) == pytest.approx(600)
+    assert (state.hechos, state.errores) == (4, 0)
+    assert index.estado_boletin("BOME-B-2026-6416") == "indexado"
+
+
+def test_a_budget_that_stays_full_ends_the_sync_instead_of_waiting_forever(
+    site: Site, index: SumarioIndex
+) -> None:
+    guard = seeded_guard(site, 3)
+    waits = Waits()  # the guard's clock never moves: the budget never frees up
+    state = run(make_sync(index, site, guard=guard, wait=waits))
     assert state.estado == "bloqueado"
-    assert waits.slices == [10, 20, 25]
-    assert site.bulletin_paths() == [B6416] * 4
-
-    site.routes[B6416] = blocked(503, "5000")
-    waits = Waits()
-    state = run(make_sync(index, site, backoff_base=10, backoff_max=25, max_block_retries=3, wait=waits))
-    assert state.estado == "bloqueado"
-    assert waits.slices == [25, 25, 25]  # Retry-After 5000 is capped at backoff_max
-    assert state.reintentar_tras_segundos == 5000
+    assert len([s for s in waits.slices if s]) >= MAX_PAUSAS_PREVENTIVAS_SEGUIDAS
+    assert site.bulletin_paths() == []
+    assert "error budget" in (state.mensaje or "")
 
 
-def test_cancel_during_back_off_ends_the_sync_promptly(site: Site, index: SumarioIndex) -> None:
-    site.routes[B6416] = blocked(429)
-    sync = make_sync(index, site, backoff_base=60)  # real, cancellable wait
+def test_a_broken_page_is_followed_by_a_random_pause(site: Site, index: SumarioIndex) -> None:
+    draws: list[tuple[float, float]] = []
+
+    def pausa(low: float, high: float) -> float:
+        draws.append((low, high))
+        return 42.0
+
+    waits = Waits(clock=site.clock)
+    state = run(make_sync(index, site, wait=waits, pausa_aleatoria=pausa))
+    assert state.estado == "completado"
+    assert draws == [(PAUSA_TRAS_ERROR_MIN_SEGUNDOS, PAUSA_TRAS_ERROR_MAX_SEGUNDOS)]
+    assert (PAUSA_TRAS_ERROR_MIN_SEGUNDOS, PAUSA_TRAS_ERROR_MAX_SEGUNDOS) == (30, 60)
+    assert waits.slices == [30, 12]
+    assert state.errores == 1
+
+
+def test_other_failures_need_no_pause(site: Site, index: SumarioIndex) -> None:
+    site.fix_6415()
+    site.routes["/bome/BOME-BX-2026-41"] = lambda request: httpx.Response(404)
+    waits = Waits(clock=site.clock)
+    state = run(make_sync(index, site, wait=waits, pausa_aleatoria=lambda low, high: 42.0))
+    assert state.errores == 1
+    assert waits.slices == []
+
+
+def test_cancel_during_a_preventive_pause_ends_the_sync_promptly(site: Site, index: SumarioIndex) -> None:
+    guard = seeded_guard(site, 3)  # the guard's clock is frozen: the pause would last forever
+    waiting = threading.Event()
+    sync = SincronizadorIndice(index, site.factory, hoy=lambda: TODAY, guard=guard)  # real, cancellable wait
+    real_wait = sync._wait
+
+    def wait(seconds: float) -> bool:
+        waiting.set()
+        return real_wait(seconds)
+
+    sync._wait = wait
     started = time.monotonic()
     sync.iniciar()
-    deadline = time.monotonic() + TIMEOUT
-    while not site.bulletin_paths() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert site.bulletin_paths() == [B6416]
+    assert waiting.wait(TIMEOUT)
     sync.cancelar()
-    assert sync.esperar(TIMEOUT), "the back-off did not honour the cancellation"
+    assert sync.esperar(TIMEOUT), "the preventive pause did not honour the cancellation"
     assert time.monotonic() - started < TIMEOUT
     state = sync.estado()
     assert state.estado == "cancelado"
     assert (state.hechos, state.errores) == (0, 0)
-    assert index.estado_boletin("BOME-B-2026-6416") is None
-    assert site.bulletin_paths() == [B6416]
+    assert site.bulletin_paths() == []
     assert index.lease() is None
 
 
-def test_the_lease_is_renewed_during_a_long_back_off(
+def test_the_lease_is_renewed_during_a_long_preventive_pause(
     site: Site, index: SumarioIndex, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     site.fix_6415()
-    site.routes[B6416] = sequence(blocked(429), Site.fixture("b6416.html"))
-    clock = [1_000_000.0]
+    clock = site.clock
+    guard = seeded_guard(site, 3, age=540)  # 60 s to wait
     renewals: list[float | None] = []
     real = index.renovar_lease
 
@@ -460,19 +614,16 @@ def test_the_lease_is_renewed_during_a_long_back_off(
 
     monkeypatch.setattr(index, "renovar_lease", counting)
     waits = Waits(clock=clock)
-    sync = make_sync(
-        index, site, backoff_base=60, backoff_max=900, stale_after=40, clock=lambda: clock[0], wait=waits
-    )
+    start = clock[0]
+    sync = make_sync(index, site, guard=guard, stale_after=40, clock=lambda: clock[0], wait=waits)
     state = run(sync)
     assert state.estado == "completado"
     assert waits.slices == [10] * 6  # slices of stale_after / 4
-    assert len(renewals) == 4 + 6  # one per planned bulletin + one per slice
-    during = renewals[1:7]
-    assert during == [1_000_000.0 + 10 * i for i in range(1, 7)]
+    assert len(renewals) == 6 + 4  # one per slice + one per planned bulletin
+    assert renewals[:6] == [start + 10 * i for i in range(1, 7)]
 
 
-def test_losing_the_lease_during_back_off_fails_the_sync(site: Site, index: SumarioIndex) -> None:
-    site.routes[B6416] = blocked(429)
+def test_losing_the_lease_during_a_preventive_pause_fails_the_sync(site: Site, index: SumarioIndex) -> None:
     holder: list[SincronizadorIndice] = []
 
     def steal() -> bool:
@@ -480,29 +631,31 @@ def test_losing_the_lease_during_back_off_fails_the_sync(site: Site, index: Suma
         index.adquirir_lease("otro-proceso", now=time.time())
         return False
 
-    sync = make_sync(index, site, backoff_base=1, wait=Waits(on_wait=steal))
+    sync = make_sync(index, site, guard=seeded_guard(site, 3), wait=Waits(clock=site.clock, on_wait=steal))
     holder.append(sync)
     state = run(sync)
     assert state.estado == "fallido"
     assert "lease" in (state.mensaje or "")
-    assert index.estado_boletin("BOME-B-2026-6416") is None
-    assert site.bulletin_paths() == [B6416]
+    assert site.bulletin_paths() == []
     assert index.lease()["propietario"] == "otro-proceso"
 
 
-def test_consecutive_transport_failures_end_the_sync_as_bloqueado(site: Site, index: SumarioIndex) -> None:
+def test_two_transport_failures_in_a_row_end_the_sync_as_bloqueado(site: Site, index: SumarioIndex) -> None:
     for path in (B6416, "/bome/BOME-B-2026-6415", "/bome/BOME-BX-2026-41"):
         site.routes[path] = dropped
-    waits = Waits()
-    state = run(make_sync(index, site, wait=waits))
+    waits = Waits(clock=site.clock)
+    sync = make_sync(index, site, wait=waits)
+    state = run(sync)
     assert state.estado == "bloqueado"
-    assert (state.hechos, state.errores) == (3, 3)
-    for cve in ("BOME-B-2026-6416", "BOME-B-2026-6415", "BOME-BX-2026-41"):
-        assert index.estado_boletin(cve) == "error"
-    assert "/bome/BOME-B-2014-5092" not in site.bulletin_paths()
+    assert (state.hechos, state.errores, state.rotos) == (2, 2, 0)
+    for cve in ("BOME-B-2026-6416", "BOME-B-2026-6415"):
+        assert index.estado_boletin(cve) == "error"  # recorded, never roto
+    assert site.bulletin_paths() == [B6416, "/bome/BOME-B-2026-6415"]
     assert waits.slices == []  # transport failures are not retried
-    assert "BOME-BX-2026-41" in (state.ultimo_error or "")
+    assert "BOME-B-2026-6415" in (state.ultimo_error or "")
     assert "firewall" in (state.mensaje or "")
+    assert state.reintentar_tras_segundos == pytest.approx(ENFRIAMIENTO_SEGUNDOS)
+    assert sync.guard.en_enfriamiento()
     assert index.lease() is None
 
 
@@ -513,18 +666,18 @@ def test_consecutive_transport_failures_end_the_sync_as_bloqueado(site: Site, in
         pytest.param(lambda request: httpx.Response(500), id="non-transport-failure"),
     ],
 )
-def test_anything_but_a_transport_failure_resets_the_count(
+def test_any_answer_resets_the_transport_failure_streak(
     site: Site, index: SumarioIndex, middle: Callable[[httpx.Request], httpx.Response]
 ) -> None:
-    # Plan order: 6416, 6415, BX-41, 5092. Three transport failures, but never in a row.
+    # Plan order: 6416, 6415, BX-41, 5092. Two transport failures, but not in a row.
     site.routes[B6416] = dropped
     site.routes["/bome/BOME-B-2026-6415"] = middle
     site.routes["/bome/BOME-BX-2026-41"] = dropped
-    site.routes["/bome/BOME-B-2014-5092"] = dropped
-    state = run(make_sync(index, site, wait=Waits()))
+    state = run(make_sync(index, site))
     assert state.estado == "completado"
     assert state.hechos == 4
-    assert index.estado_boletin("BOME-B-2014-5092") == "error"
+    assert index.estado_boletin("BOME-BX-2026-41") == "error"
+    assert index.estado_boletin("BOME-B-2014-5092") == "sin_sumarios"
 
 
 # --------------------------------------------------------------------------- pace and budget (polite-sync task 3)
@@ -590,7 +743,7 @@ def test_the_constructor_sets_the_default_cap(site: Site, index: SumarioIndex) -
 
 def test_a_capped_run_that_gets_blocked_keeps_the_blocked_message(site: Site, index: SumarioIndex) -> None:
     site.routes[B6416] = blocked(403)
-    state = run(make_sync(index, site, backoff_base=1, wait=Waits()), max_boletines=2)
+    state = run(make_sync(index, site), max_boletines=2)
     assert state.estado == "bloqueado"
     assert "firewall" in (state.mensaje or "")
     assert state.pendientes_tras_limite == 2
@@ -616,10 +769,20 @@ def test_the_default_client_factory_uses_the_sync_pace(
 
     monkeypatch.setattr(sync_module, "BomeClient", fake_client)
     site.fix_6415()
-    assert run(SincronizadorIndice(index, hoy=lambda: TODAY)).estado == "completado"
-    assert built == [{"polite_delay": SYNC_POLITE_DELAY, "jitter": SYNC_JITTER}]
-    run(SincronizadorIndice(index, hoy=lambda: TODAY, polite_delay=5.0, jitter=0.5))
-    assert built[-1] == {"polite_delay": 5.0, "jitter": 0.5}
+    default = SincronizadorIndice(index, hoy=lambda: TODAY)
+    assert run(default).estado == "completado"
+    assert built == [{"polite_delay": SYNC_POLITE_DELAY, "jitter": SYNC_JITTER, "guard": default.guard}]
+    assert default.guard.estado()["fichero"] is None  # memory-only unless one is given
+    guard = site.guard()
+    run(SincronizadorIndice(index, hoy=lambda: TODAY, polite_delay=5.0, jitter=0.5, guard=guard))
+    assert built[-1] == {"polite_delay": 5.0, "jitter": 0.5, "guard": guard}
+
+
+def test_the_client_factory_gets_the_sync_guard(site: Site, index: SumarioIndex) -> None:
+    site.fix_6415()
+    sync = make_sync(index, site)
+    run(sync)
+    assert site.guards == [sync.guard]
 
 
 # --------------------------------------------------------------------------- settings from the environment

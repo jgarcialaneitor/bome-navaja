@@ -53,7 +53,21 @@ class BomeBlockedError(BomeHTTPError):
     ) -> None:
         super().__init__(message, status=status, url=url)
         self.retry_after = retry_after
-        """Seconds the site asked us to wait (``Retry-After``), or ``None`` if not sent."""
+        """Seconds to wait before asking again: the site's ``Retry-After`` or, with a
+        :class:`~bome_navaja.guard.GuardiaSitio`, what is left of its cooldown;
+        ``None`` if unknown."""
+
+
+class BomePausaPreventivaError(BomeBlockedError):
+    """Our own error budget is full: a local safety pause, not a block by the site.
+
+    Raised by :class:`~bome_navaja.guard.GuardiaSitio` before any request when
+    the site answered too many errors recently (its firewall bans the IP from
+    the fifth). ``status`` is ``None``; ``retry_after`` is the seconds until the
+    budget has room again.
+    """
+
+    error_code = "pausa_preventiva"
 
 
 class BomeParseError(BomeError):

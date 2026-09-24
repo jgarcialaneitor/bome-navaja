@@ -19,21 +19,36 @@
    :data:`MAX_CONSECUTIVE_STORAGE_FAILURES` bulletins in a row is fatal
    (``fallido``).
 
-Circuit breaker. When the site refuses a bulletin (403/429/503, i.e.
-:class:`~bome_navaja.models.BomeBlockedError`: rate limit or firewall), that
-bulletin is *not* recorded: the sync backs off for
-``max(Retry-After, backoff_base * 2**attempt)`` seconds (capped at
-``backoff_max``) and retries the same bulletin, up to ``max_block_retries``
-times. If the site still refuses, the sync ends as ``bloqueado``: what is
-already indexed is kept and the user should wait (hours for a firewall block)
-before syncing again. The back-off wait is cancellable and runs in slices
-(at most :data:`BACKOFF_SLICE_SECONDS` or a quarter of the lease staleness)
-between which the lease is renewed; a lease lost meanwhile ends the sync as
-``fallido``. Failures without any HTTP answer (timeouts, resets: what a
-firewall that silently drops looks like) are still recorded as ``error``
-rows, but :data:`MAX_CONSECUTIVE_TRANSPORT_FAILURES` bulletins in a row
-failing like that also end the sync as ``bloqueado``; any other outcome
-resets that count.
+Site guard. Every request of the sync goes through a
+:class:`~bome_navaja.guard.GuardiaSitio` shared with the interactive tools
+(the server gives both the one persisted in the data folder), which keeps the
+crawl below the site's firewall threshold:
+
+* A run that starts while the guard is cooling down ends at once as
+  ``bloqueado`` (with ``reintentar_tras_segundos``) without a single request.
+* Before the calendar and before each bulletin the sync waits
+  ``guard.espera_necesaria()`` (the error budget: at most 3 HTTP error answers
+  per 10 minutes), reported in ``mensaje`` as a preventive pause. If the budget
+  fills inside a bulletin (e.g. hidden-article probes answering errors), the
+  client raises :class:`~bome_navaja.models.BomePausaPreventivaError`: the sync
+  waits its ``retry_after`` and resumes the same bulletin, replaying the
+  answers it already has instead of asking the site again. After
+  :data:`MAX_PAUSAS_PREVENTIVAS_SEGUIDAS` pauses in a row for one step the
+  budget is considered stuck and the sync ends as ``bloqueado``.
+* A bulletin page that answers a 5xx (not 503) is recorded as ``error`` and
+  followed by a random pause of :data:`PAUSA_TRAS_ERROR_MIN_SEGUNDOS` to
+  :data:`PAUSA_TRAS_ERROR_MAX_SEGUNDOS` seconds before the next bulletin.
+* A block (403/429/503, or two requests in a row without any answer, which
+  the guard turns into a cooldown) ends the sync as ``bloqueado`` promptly:
+  a refused bulletin is not recorded; a bulletin lost to a timeout or reset is
+  recorded as ``error`` (never ``roto``). There is no retry against a closed
+  site: the guard's cooldown (75 minutes or ``Retry-After``) is far longer than
+  a sync should hold its lease.
+
+Every wait runs in cancellable slices (at most
+:data:`BACKOFF_SLICE_SECONDS` or a quarter of the lease staleness) between
+which the lease is renewed; a lease lost meanwhile ends the sync as
+``fallido``.
 
 Pace and budget. The sync is a long crawl, so it is slower than the
 interactive tools: :data:`SYNC_POLITE_DELAY` seconds plus a random
@@ -64,6 +79,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import socket
 import threading
 import time
@@ -71,11 +87,20 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .client import BomeClient
+from .guard import VENTANA_ERRORES_SEGUNDOS, GuardiaSitio
 from .index import LEASE_STALE_SECONDS, SumarioIndex, utc_iso
-from .models import BomeBlockedError, BomeError, BomeHTTPError, BulletinRef, JsonModel
+from .models import (
+    Article,
+    BomeBlockedError,
+    BomeError,
+    BomeHTTPError,
+    BomePausaPreventivaError,
+    BulletinRef,
+    JsonModel,
+)
 from .search import (
     FIRST_DATE,
     BusquedaInvalidaError,
@@ -114,26 +139,28 @@ MAX_CONSECUTIVE_STORAGE_FAILURES = 3
 """Bulletins in a row whose failure could not even be recorded before the
 index is declared unwritable and the sync ends as ``fallido``."""
 
-BACKOFF_BASE_SECONDS = 60.0
-"""First back-off after the site refuses a bulletin; doubled on each retry."""
-
-BACKOFF_MAX_SECONDS = 900.0
-"""Upper bound of one back-off wait, ``Retry-After`` included."""
-
-MAX_BLOCK_RETRIES = 2
-"""Retries of a refused bulletin before the sync ends as ``bloqueado``."""
-
 BACKOFF_SLICE_SECONDS = 30.0
-"""Longest single wait between lease renewals during a back-off."""
+"""Longest single wait between lease renewals during a pause."""
 
-MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
-"""Bulletins in a row failing without any HTTP answer before the sync ends as
-``bloqueado``."""
+PAUSA_TRAS_ERROR_MIN_SEGUNDOS = 30.0
+PAUSA_TRAS_ERROR_MAX_SEGUNDOS = 60.0
+"""Bounds of the random pause after a bulletin page answered a 5xx."""
+
+MAX_PAUSAS_PREVENTIVAS_SEGUIDAS = 6
+"""Preventive pauses in a row for one step (calendar or bulletin) before the
+error budget is considered stuck and the sync ends as ``bloqueado``."""
 
 _BLOCKED_MESSAGE = (
     "the BOME site is refusing our requests (rate limit or firewall){detail}. "
-    "Bulletins already indexed are kept. Wait before syncing again (hours if it is a "
-    "firewall block); the next sync continues where this one stopped."
+    "Bulletins already indexed are kept. bome-navaja will not ask the site anything for "
+    "{wait} s (reintentar_tras_segundos); sync again after that, the next sync continues "
+    "where this one stopped."
+)
+
+_PAUSE_MESSAGE = (
+    "preventive pause (our own error budget, not a block by the site): {errors} HTTP error "
+    "answers from the site in the last {window} min, and its firewall bans the IP from the "
+    "fifth; waiting {wait} s before {what}"
 )
 
 
@@ -207,6 +234,54 @@ def _check_cap(value: object) -> int:
     return value
 
 
+def _broken_page(exc: BaseException) -> bool:
+    """True for a page that answered a 5xx other than 503 (503 is a block)."""
+    return (
+        isinstance(exc, BomeHTTPError)
+        and not isinstance(exc, BomeBlockedError)
+        and exc.status is not None
+        and exc.status >= 500
+    )
+
+
+class _BulletinMemo:
+    """The requests of one bulletin, remembered across preventive pauses.
+
+    When the error budget fills in the middle of a bulletin (typically while
+    probing hidden articles) the bulletin is resumed, not restarted: the page
+    and every article already answered, including failures, are replayed from
+    here, so a retry never asks the site the same failing question twice.
+    Blocks are not remembered: they end the sync.
+    """
+
+    def __init__(self, client: BomeClient) -> None:
+        self._client = client
+        self._bulletin: Any = None
+        self._articles: dict[tuple[str, str], Article | BomeError] = {}
+
+    def bulletin(self, cve: str) -> Any:
+        if self._bulletin is None:
+            self._bulletin = self._client.bulletin(cve)
+        return self._bulletin
+
+    def article(self, bulletin_cve: Any, n: Any) -> Article:
+        key = (str(bulletin_cve), str(n))
+        known = self._articles.get(key)
+        if isinstance(known, BomeError):
+            raise known
+        if known is not None:
+            return known
+        try:
+            page = self._client.article(bulletin_cve, n)
+        except BomeBlockedError:
+            raise
+        except BomeError as exc:
+            self._articles[key] = exc
+            raise
+        self._articles[key] = page
+        return page
+
+
 class _IndexUnwritable(Exception):
     """Internal: the index refused every write for several bulletins in a row."""
 
@@ -241,7 +316,8 @@ class EstadoSincronizacion(JsonModel):
     ultimo_error: str | None = None
     mensaje: str | None = None
     reintentar_tras_segundos: float | None = None
-    """``Retry-After`` seconds of the site's last refusal, if it sent one."""
+    """Seconds before the site may be asked again when the sync ends ``bloqueado``
+    (what is left of the site guard's cooldown, or the site's ``Retry-After``)."""
     limite_boletines: int | None = None
     """Most bulletins this run indexes (the per-run cap)."""
     pendientes_tras_limite: int = 0
@@ -274,7 +350,7 @@ class SincronizadorIndice:
     def __init__(
         self,
         index: SumarioIndex,
-        client_factory: Callable[[], BomeClient] | None = None,
+        client_factory: Callable[..., BomeClient] | None = None,
         *,
         polite_delay: float = SYNC_POLITE_DELAY,
         jitter: float = SYNC_JITTER,
@@ -283,28 +359,29 @@ class SincronizadorIndice:
         hoy: Callable[[], date] = date.today,
         clock: Callable[[], float] = time.time,
         stale_after: float = LEASE_STALE_SECONDS,
-        backoff_base: float = BACKOFF_BASE_SECONDS,
-        backoff_max: float = BACKOFF_MAX_SECONDS,
-        max_block_retries: int = MAX_BLOCK_RETRIES,
         wait: Callable[[float], bool] | None = None,
+        guard: GuardiaSitio | None = None,
+        pausa_aleatoria: Callable[[float, float], float] = random.uniform,
     ) -> None:
-        """``wait(seconds)`` performs one back-off slice and returns ``True`` when
+        """``wait(seconds)`` performs one pause slice and returns ``True`` when
         cancelled; it defaults to waiting on the cancellation event (tests inject
-        a fake so they never sleep). ``polite_delay`` and ``jitter`` only shape
-        the default client; ``max_boletines`` is the cap of runs started without
-        one."""
+        a fake so they never sleep). ``guard`` is the site guard (default: a
+        memory-only one); ``client_factory`` is called as
+        ``client_factory(guard=guard)`` and must wire it into the client.
+        ``pausa_aleatoria(low, high)`` draws the pause after a broken page.
+        ``polite_delay`` and ``jitter`` only shape the default client;
+        ``max_boletines`` is the cap of runs started without one."""
         self.index = index
-        self._client_factory = client_factory or (
-            lambda: BomeClient(polite_delay=polite_delay, jitter=jitter)
+        self.guard = guard if guard is not None else GuardiaSitio(None)
+        self._client_factory: Callable[..., BomeClient] = client_factory or (
+            lambda *, guard=None: BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
         )
         self._max_boletines = _check_cap(max_boletines)
         self.owner = owner or _default_owner()
         self._today = hoy
         self._clock = clock
         self._stale_after = stale_after
-        self._backoff_base = backoff_base
-        self._backoff_max = backoff_max
-        self._max_block_retries = max_block_retries
+        self._random_pause = pausa_aleatoria
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._wait = wait or self._cancel.wait
@@ -312,7 +389,7 @@ class SincronizadorIndice:
         self._state: dict[str, Any] = {"estado": "inactivo"}
         self._started_clock: float | None = None
         self._storage_failures = 0
-        self._transport_failures = 0
+        self._pending_pause: str | None = None
 
     # ------------------------------------------------------------------ public API
 
@@ -471,10 +548,12 @@ class SincronizadorIndice:
         client: BomeClient | None = None
         final: dict[str, Any] = {}
         self._storage_failures = 0
-        self._transport_failures = 0
+        self._pending_pause = None
         try:
-            client = self._client_factory()
-            refs = client.calendar(start, end)
+            self._stop_if_closed()  # a closed site gets no request at all
+            self._wait_for_budget("the calendar")
+            client = self._client_factory(guard=self.guard)
+            refs = self._guarded("the calendar", lambda: client.calendar(start, end))
             self.index.registrar_calendario(refs)
             plan = self._plan(refs, recent_days, retry_errors, retry_broken)
             deferred = max(len(plan) - cap, 0)
@@ -490,12 +569,13 @@ class SincronizadorIndice:
                 if not self.index.renovar_lease(self.owner, now=self._clock()):
                     final = {"estado": "fallido", "mensaje": "sync lease lost to another process"}
                     break
+                self._stop_if_closed()
+                self._pause_after_error()
+                self._wait_for_budget(ref.cve)
                 self._update(cve_actual=ref.cve)
-                try:
-                    self._process(client, ref)
-                except _StopSync as stop:
-                    final = stop.final
-                    break
+                self._process(client, ref)
+        except _StopSync as stop:
+            final = stop.final
         except BaseException as exc:  # noqa: BLE001 - the worker must always report
             final = {"estado": "fallido", "mensaje": f"{type(exc).__name__}: {exc}"}
         finally:
@@ -519,18 +599,23 @@ class SincronizadorIndice:
     def _process(self, client: BomeClient, ref: BulletinRef) -> None:
         """Fetch and store one bulletin; any failure becomes that bulletin's ``error``.
 
-        Raises :class:`_StopSync` when the site keeps refusing us, the sync is
-        cancelled during a back-off or the lease is lost meanwhile.
+        Raises :class:`_StopSync` when the site blocks us (or the guard is closed
+        after this bulletin), the sync is cancelled during a pause or the lease is
+        lost meanwhile.
         """
+        memo = _BulletinMemo(client)
         try:
-            articles, errors = self._fetch(client, ref)
+            articles, errors = self._guarded(
+                ref.cve, lambda: articulos_del_boletin(cast(BomeClient, memo), memo.bulletin(ref.cve))
+            )
         except _StopSync:
             raise
         except Exception as exc:  # a bad bulletin must not stop the crawl
             self._record_failure(ref, exc)
-            self._count_transport_failure(exc)
+            if _broken_page(exc):
+                self._pending_pause = f"an HTTP {cast(BomeHTTPError, exc).status} on {ref.cve}"
+            self._stop_if_closed()  # e.g. a second request in a row without any answer
             return
-        self._transport_failures = 0
         has_text = any(article.sumario and article.sumario.strip() for article in articles)
         estado = "indexado" if has_text else "sin_sumarios"
         note = f"{errors[0].error_code}: {errors[0].mensaje}" if errors else None
@@ -543,38 +628,102 @@ class SincronizadorIndice:
         self._bump("hechos")
         self._bump("indexados" if has_text else "sin_sumarios")
 
-    def _fetch(self, client: BomeClient, ref: BulletinRef) -> tuple[list[Any], list[Any]]:
-        """Download ``ref`` and its articles, backing off while the site refuses us."""
-        attempt = 0
+    def _guarded(self, what: str, step: Callable[[], Any]) -> Any:
+        """Run ``step`` (the calendar or one bulletin) under the site guard.
+
+        A preventive pause raised inside ``step`` is waited out and ``step`` runs
+        again (a bulletin replays the answers it already has); any other block
+        ends the sync as ``bloqueado``.
+        """
+        pauses = 0
         while True:
             try:
-                bulletin = client.bulletin(ref.cve)
-                result = articulos_del_boletin(client, bulletin)
-            except BomeBlockedError as exc:
-                self._update(reintentar_tras_segundos=exc.retry_after, ultimo_error=f"{ref.cve}: {exc}")
-                if attempt >= self._max_block_retries:
-                    raise _StopSync(
-                        {
-                            "estado": "bloqueado",
-                            "mensaje": _BLOCKED_MESSAGE.format(
-                                detail=f": HTTP {exc.status} after {attempt + 1} attempts on {ref.cve}"
-                            ),
-                            "ultimo_error": str(exc),
-                        }
-                    ) from exc
-                delay = min(
-                    max(exc.retry_after or 0.0, self._backoff_base * 2**attempt), self._backoff_max
-                )
-                attempt += 1
-                self._update(
-                    mensaje=f"the site refused {ref.cve} (HTTP {exc.status}); waiting {delay:g} s "
-                    f"before retry {attempt} of {self._max_block_retries}"
-                )
-                self._back_off(delay)
+                result = step()
+            except BomePausaPreventivaError as exc:
+                pauses += 1
+                if pauses > MAX_PAUSAS_PREVENTIVAS_SEGUIDAS:
+                    raise _StopSync(self._stuck_budget(what)) from exc
+                wait = exc.retry_after if exc.retry_after else self.guard.espera_necesaria()
+                self._preventive_pause(max(wait, 1.0), what)
+                self._stop_if_closed()
                 continue
-            if attempt:
+            except BomeBlockedError as exc:
+                raise _StopSync(self._blocked(exc, what)) from exc
+            if pauses:
                 self._update(mensaje=None)
             return result
+
+    def _wait_for_budget(self, what: str) -> None:
+        """Wait while the error budget is full before asking the site for ``what``."""
+        for _ in range(MAX_PAUSAS_PREVENTIVAS_SEGUIDAS):
+            wait = self.guard.espera_necesaria()
+            if wait <= 0:
+                return
+            self._preventive_pause(wait, what)
+            self._update(mensaje=None)
+            self._stop_if_closed()
+        if self.guard.espera_necesaria() > 0:
+            raise _StopSync(self._stuck_budget(what))
+
+    def _preventive_pause(self, seconds: float, what: str) -> None:
+        self._update(
+            mensaje=_PAUSE_MESSAGE.format(
+                errors=self.guard.errores_en_ventana(),
+                window=f"{VENTANA_ERRORES_SEGUNDOS / 60:g}",
+                wait=math.ceil(seconds),
+                what=what,
+            )
+        )
+        self._back_off(seconds)
+
+    def _pause_after_error(self) -> None:
+        """The random pause owed after a bulletin page answered a 5xx, if any."""
+        cause, self._pending_pause = self._pending_pause, None
+        if cause is None:
+            return
+        seconds = self._random_pause(PAUSA_TRAS_ERROR_MIN_SEGUNDOS, PAUSA_TRAS_ERROR_MAX_SEGUNDOS)
+        self._update(mensaje=f"pausing {seconds:.0f} s after {cause} (gentle on the site's firewall)")
+        self._back_off(seconds)
+        self._update(mensaje=None)
+
+    def _stop_if_closed(self) -> None:
+        """End the sync as ``bloqueado`` when the guard is cooling down."""
+        remaining = self.guard.segundos_enfriamiento()
+        if remaining > 0:
+            motivo = self.guard.motivo or "the site guard is closed"
+            raise _StopSync(
+                {
+                    "estado": "bloqueado",
+                    "mensaje": _BLOCKED_MESSAGE.format(detail=f": {motivo}", wait=math.ceil(remaining)),
+                    "reintentar_tras_segundos": remaining,
+                }
+            )
+
+    def _blocked(self, exc: BomeBlockedError, what: str) -> dict[str, Any]:
+        remaining = self.guard.segundos_enfriamiento()
+        wait = remaining if remaining > 0 else exc.retry_after
+        if exc.status is not None:
+            detail = f": HTTP {exc.status} on {what}"
+        else:
+            detail = f": {self.guard.motivo or 'the site guard is closed'}"
+        return {
+            "estado": "bloqueado",
+            "mensaje": _BLOCKED_MESSAGE.format(
+                detail=detail, wait=math.ceil(wait) if wait is not None else "a while"
+            ),
+            "ultimo_error": f"{what}: {exc}",
+            "reintentar_tras_segundos": wait,
+        }
+
+    def _stuck_budget(self, what: str) -> dict[str, Any]:
+        wait = self.guard.espera_necesaria()
+        return {
+            "estado": "bloqueado",
+            "mensaje": f"the error budget stayed full after {MAX_PAUSAS_PREVENTIVAS_SEGUIDAS} "
+            f"preventive pauses before {what} (other bome-navaja processes keep getting errors "
+            "from the site); bulletins already indexed are kept, sync again later",
+            "reintentar_tras_segundos": wait or None,
+        }
 
     def _back_off(self, seconds: float) -> None:
         """Wait ``seconds`` in slices, renewing the lease; stop on cancel or lease loss."""
@@ -587,23 +736,6 @@ class SincronizadorIndice:
             remaining -= chunk
             if not self.index.renovar_lease(self.owner, now=self._clock()):
                 raise _StopSync({"estado": "fallido", "mensaje": "sync lease lost to another process"})
-
-    def _count_transport_failure(self, exc: BaseException) -> None:
-        """Track bulletins failing without an HTTP answer; too many in a row is a block."""
-        if not (isinstance(exc, BomeHTTPError) and exc.status is None):
-            self._transport_failures = 0
-            return
-        self._transport_failures += 1
-        if self._transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-            raise _StopSync(
-                {
-                    "estado": "bloqueado",
-                    "mensaje": _BLOCKED_MESSAGE.format(
-                        detail=f": {self._transport_failures} bulletins in a row got no answer at "
-                        "all (timeouts or dropped connections)"
-                    ),
-                }
-            )
 
     def _record_failure(self, ref: BulletinRef, exc: BaseException) -> None:
         """Store ``ref`` as ``error`` (the index may make it ``roto``); if even that
@@ -630,17 +762,16 @@ class SincronizadorIndice:
 
 
 __all__ = [
-    "BACKOFF_BASE_SECONDS",
-    "BACKOFF_MAX_SECONDS",
     "BACKOFF_SLICE_SECONDS",
     "DEFAULT_MAX_BULLETINS_PER_RUN",
     "DEFAULT_RECENT_DAYS",
     "ENV_SYNC_DELAY",
     "ENV_SYNC_MAX_BOLETINES",
-    "MAX_BLOCK_RETRIES",
     "MAX_CONSECUTIVE_STORAGE_FAILURES",
-    "MAX_CONSECUTIVE_TRANSPORT_FAILURES",
+    "MAX_PAUSAS_PREVENTIVAS_SEGUIDAS",
     "MIN_SYNC_POLITE_DELAY",
+    "PAUSA_TRAS_ERROR_MAX_SEGUNDOS",
+    "PAUSA_TRAS_ERROR_MIN_SEGUNDOS",
     "SYNC_JITTER",
     "SYNC_POLITE_DELAY",
     "EstadoSincronizacion",
