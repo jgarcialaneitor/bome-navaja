@@ -17,6 +17,16 @@ sync owns a separate client created by the same factory, but asked for the
 slower sync pace (:func:`bome_navaja.sync.sync_settings_from_env`: its
 environment overrides are read when the sync is first used).
 
+Two syncs, one per origin, each created lazily once per process with its own
+lease owner: :class:`~bome_navaja.sync.SincronizadorIndice` (bomemelilla.es)
+and :class:`~bome_navaja.sync_antiguo.SincronizadorPortalAntiguo` (the old
+portal, built with the old-portal guard and a portal client from
+``_portal_factory`` at the same sync pace and cap). Both write the same index,
+so they share its single lease: only one of them runs at a time.
+``sincronizar_indice(origen=...)`` picks one; ``cancelar_sincronizacion`` and
+the ``sincronizacion`` field of the state tools follow whichever is running
+(else the last one started).
+
 Site guard: one :class:`~bome_navaja.guard.GuardiaSitio` per process,
 created lazily and persisted in the data folder (``estado_sitio.json``, so
 restarts and other server processes share its error budget and cooldown; a
@@ -31,8 +41,9 @@ Old portal (melilla.es, bulletins 1985-2021-03-12): one lazy
 persisted as ``estado_sitio_melilla.json`` (memory-only without a data
 folder). Its errors never count against bomemelilla.es's budget, and the
 model-facing messages name the site that failed. robots.txt of melilla.es
-disallows the ficha and ``mandar.php``: they are requested only on demand,
-one tool call at a time, never in bulk (user decision 2026-09-24).
+disallows the ficha and ``mandar.php``. PDFs are requested only on demand, one
+tool call at a time. Fichas are also crawled in bulk, but only by the
+old-portal sync, started by hand, slow and capped (user decision 2026-09-24).
 
 Nothing touches the network or the index file at import time; the index is
 opened only by the index tools, and a sync starts only through
@@ -67,10 +78,13 @@ from .antiguo import (
     estado_catalogo,
     texto_busqueda_valido,
 )
+from .antiguo import DEFAULT_JITTER as PORTAL_JITTER
+from .antiguo import DEFAULT_POLITE_DELAY as PORTAL_POLITE_DELAY
 from .antiguo import SITIO as SITIO_ANTIGUO
 from .client import BomeClient
-from .cve import BASE_URL, InvalidCveError, parse_cve
+from .cve import BASE_URL, Cve, CveKind, InvalidCveError, parse_cve, pdf_url
 from .documents import LecturaInvalidaError
+from .documents import localizar_articulo as _localizar_articulo
 from .documents import descargar_pdf as _descargar_pdf
 from .documents import descargar_pdf_antiguo as _descargar_pdf_antiguo
 from .documents import leer_articulo as _leer_articulo
@@ -78,7 +92,7 @@ from .documents import leer_boletin as _leer_boletin
 from .documents import leer_pdf as _leer_pdf
 from .documents import leer_pdf_antiguo as _leer_pdf_antiguo
 from .guard import FICHERO_ESTADO, FICHERO_ESTADO_MELILLA, SITIO_POR_DEFECTO, GuardiaSitio
-from .index import SumarioIndex
+from .index import ORIGEN_ANTIGUO, ORIGEN_BOME, ORIGENES, SumarioIndex
 from .models import (
     BomeBlockedError,
     BomeDocumentTooLargeError,
@@ -95,7 +109,8 @@ from .paths import data_dir, index_path, pdf_dir
 from .search import RECOMMENDED_POLITE_DELAY, BusquedaInvalidaError, articulos_del_boletin
 from .search import buscar_articulos as _buscar_articulos
 from .search import buscar_bomes as _buscar_bomes
-from .sync import SincronizadorIndice, SyncSettings, sync_settings_from_env
+from .sync import SincronizadorBase, SincronizadorIndice, SyncSettings, sync_settings_from_env
+from .sync_antiguo import SincronizadorPortalAntiguo
 
 MAX_LISTADO = 500
 """``listar_bomes`` returns at most this many bulletins (newest first)."""
@@ -131,6 +146,10 @@ listar_bomes ya junta los dos catálogos antes de 2021-03-13. Los identificadore
 Qué herramienta usar:
 - Buscar por sumario de artículo (lo habitual): buscar_en_indice si el índice local está
   sincronizado (mira estado_indice); si no, buscar_articulos (en vivo, más lento).
+- Antes de 2018: si el índice ya tiene el portal antiguo (estado_indice, por_origen
+  "melilla.es"; cubre 1991-2017 tras sincronizar_indice(origen="melilla.es")), usa
+  buscar_en_indice para búsquedas con Y / O / no contiene o que abarquen varios años; si no,
+  buscar_bome_antiguo en vivo (literal, una sola frase).
 - Texto completo: leer_articulo (un anuncio), leer_boletin (boletín entero), leer_pdf; todas
   paginan con el cursor 'siguiente'. Descargar el PDF: descargar_pdf.
 - Buscar dentro del contenido de las páginas: buscar_bomes con ambito="contenido" (devuelve
@@ -142,7 +161,10 @@ Qué herramienta usar:
   e inestable (faltan boletines y hay páginas rotas), y los boletines anteriores se consultan
   mejor en el portal antiguo de melilla.es. Un 'desde' anterior es posible pero no
   recomendable. Los boletines "rotos" (su página da error interno del sitio) se saltan;
-  reintentar_rotos solo para comprobar si el sitio los arregló.
+  reintentar_rotos solo para comprobar si el sitio los arregló. Con origen="melilla.es"
+  indexa los sumarios del portal antiguo (por defecto 1991-01-01..2017-12-31, también 250
+  boletines por ejecución; ~2.000-2.500 boletines, varias ejecuciones). Solo corre una
+  sincronización a la vez por índice, sea del origen que sea.
 
 Cortafuegos del sitio: bomemelilla.es bloquea la IP tras unas 5 respuestas de error, y
 bome-navaja se protege sola (como mucho 3 errores cada 10 minutos entre todas las
@@ -190,16 +212,26 @@ _client_use_lock = threading.Lock()
 _client: BomeClient | None = None
 _index: SumarioIndex | None = None
 _sync: SincronizadorIndice | None = None
+_sync_antiguo: SincronizadorPortalAntiguo | None = None
+_sync_reciente: SincronizadorBase | None = None
+"""The sync of this process started last (either origin)."""
 _guard: GuardiaSitio | None = None
 
 
-def _default_portal_factory(*, guard: GuardiaSitio) -> PortalAntiguo:
-    return PortalAntiguo(guard=guard)
+def _default_portal_factory(
+    *,
+    guard: GuardiaSitio,
+    polite_delay: float = PORTAL_POLITE_DELAY,
+    jitter: float = PORTAL_JITTER,
+) -> PortalAntiguo:
+    return PortalAntiguo(guard=guard, polite_delay=polite_delay, jitter=jitter)
 
 
 _portal_factory: Callable[..., PortalAntiguo] = _default_portal_factory
-"""Builds the old-portal client with the process's old-portal guard as ``guard=``.
-Tests replace it with a MockTransport one."""
+"""Builds every old-portal client with the process's old-portal guard as
+``guard=``. The shared (interactive) portal gets no other argument, the
+old-portal sync's portal the sync pace as ``polite_delay``/``jitter``
+keywords. Tests replace it with a MockTransport one."""
 
 _portal_use_lock = threading.Lock()
 _portal: PortalAntiguo | None = None
@@ -337,6 +369,20 @@ def _open_index_if_present() -> SumarioIndex | None:
     return _get_index() if exists else None
 
 
+def _boletin_indexado(cve: Cve) -> Cve | None:
+    """Bulletin of an article CVE according to the local index, if present and it knows it.
+
+    The shortcut the readers use for ``BOME-AX`` (the site's resolver sends those to
+    ordinary bulletins). Any index problem just means "unknown": it is optional.
+    """
+    try:
+        index = _open_index_if_present()
+        found = index.boletin_de_articulo(str(cve)) if index is not None else None
+        return parse_cve(found) if found is not None else None
+    except (BomeError, sqlite3.Error, OSError):
+        return None
+
+
 def _sync_settings() -> SyncSettings:
     return sync_settings_from_env(os.environ)
 
@@ -367,17 +413,57 @@ def _get_sync() -> SincronizadorIndice:
         return _sync
 
 
-def close_shared_state() -> None:
-    """Stop the sync, close the shared client and the index (shutdown and tests)."""
-    global _client, _index, _sync, _guard, _portal, _portal_guard
+def _get_sync_antiguo() -> SincronizadorPortalAntiguo:
+    """The old-portal sync: the old-portal guard, the sync pace and cap, its own lease owner."""
+    global _sync_antiguo
+    index = _get_index()
+    guard = _get_portal_guard()
     with _state_lock:
-        sync, index, client, portal = _sync, _index, _client, _portal
-        _sync = _index = _client = _portal = None
+        if _sync_antiguo is None:
+            settings = _sync_settings()
+            for warning in settings.warnings:
+                print(f"bome-navaja: {warning}", file=sys.stderr)
+
+            def sync_portal(*, guard: GuardiaSitio) -> PortalAntiguo:
+                return _portal_factory(guard=guard, polite_delay=settings.polite_delay, jitter=settings.jitter)
+
+            _sync_antiguo = SincronizadorPortalAntiguo(
+                index,
+                sync_portal,
+                polite_delay=settings.polite_delay,
+                jitter=settings.jitter,
+                max_boletines=settings.max_boletines,
+                guard=guard,
+            )
+        return _sync_antiguo
+
+
+def _sync_actual() -> SincronizadorBase | None:
+    """The sync of this process that is running, else the one started last, else any."""
+    syncs = [job for job in (_sync, _sync_antiguo) if job is not None]
+    for job in syncs:
+        if job.estado().estado == "en_curso":
+            return job
+    if _sync_reciente is not None and _sync_reciente in syncs:
+        return _sync_reciente
+    return syncs[0] if syncs else None
+
+
+def close_shared_state() -> None:
+    """Stop both syncs, close the shared clients and the index (shutdown and tests)."""
+    global _client, _index, _sync, _sync_antiguo, _sync_reciente, _guard, _portal, _portal_guard
+    with _state_lock:
+        syncs = (_sync, _sync_antiguo)
+        index, client, portal = _index, _client, _portal
+        _sync = _sync_antiguo = _sync_reciente = None
+        _index = _client = _portal = None
         _guard = _portal_guard = None
-    if sync is not None:
-        sync.cancelar()
-        if not sync.esperar(SYNC_SHUTDOWN_WAIT):
-            print("bome-navaja: the index sync did not stop in time", file=sys.stderr)
+    for sync in syncs:
+        if sync is not None:
+            sync.cancelar()
+    for sync in syncs:
+        if sync is not None and not sync.esperar(SYNC_SHUTDOWN_WAIT):
+            print(f"bome-navaja: the {sync.origen} index sync did not stop in time", file=sys.stderr)
     if client is not None:
         client.close()
     if portal is not None:
@@ -663,10 +749,31 @@ def resolver_cve(cve: str) -> dict:
     """Devuelve la URL canónica de cualquier CVE (boletín, artículo, sumario o página).
 
     Útil para citar o para saber a qué boletín y artículo pertenece un CVE de artículo
-    (BOME-A-...) o de página (BOME-P-... / BOME-PX-...). Comprueba que la página exista.
+    (BOME-A-...) o de página (BOME-P-...). Comprueba que la página exista. El resolutor del
+    sitio confunde los extraordinarios con los ordinarios: un BOME-AX se localiza sin él
+    (índice local o calendario del año y páginas de sus boletines extraordinarios; puede
+    costar unas peticiones más) y se comprueba el artículo; para un BOME-PX se devuelve la
+    URL de su PDF, con un aviso. Nunca se da por buena una redirección a un boletín del otro
+    tipo (extraordinario frente a ordinario).
     """
-    canonical = str(parse_cve(cve))
+    parsed = parse_cve(cve)
+    canonical = str(parsed)
     client = _cliente()
+    if parsed.kind is CveKind.EXTRA_ARTICLE:
+        article = _localizar_articulo(client, parsed, boletin_de_articulo=_boletin_indexado)
+        return {"cve": canonical, "url": article.url}
+    if parsed.kind is CveKind.EXTRA_PAGE:
+        return {
+            "cve": canonical,
+            "url": pdf_url(parsed, base_url=client.base_url),
+            "aviso": (
+                "El resolutor de CVE de bomemelilla.es confunde las páginas de boletines "
+                "extraordinarios (BOME-PX) con las de boletines ordinarios y lleva a un "
+                "artículo equivocado, así que no se usa: esta es la URL del PDF de la página, "
+                "que no pasa por el resolutor (no se ha comprobado que exista). Para leerla usa "
+                "leer_pdf."
+            ),
+        }
     url = client.resolve_cve(canonical)
     return {"cve": canonical, "url": url}
 
@@ -706,7 +813,11 @@ def leer_articulo(
     """Texto completo de un artículo (anuncio), página a página.
 
     cve: el CVE del artículo (BOME-A-2026-1051) o el del boletín (BOME-B-...) junto con
-    numero (el número del artículo). Los artículos de 2014-2016 no tienen texto en el sitio:
+    numero (el número del artículo). Un artículo extraordinario (BOME-AX-...) se localiza sin
+    el resolutor del sitio, que lo confunde con el artículo ordinario del mismo número: se usa
+    el índice local si lo tiene y, si no, el calendario del año y las páginas de sus boletines
+    extraordinarios (puede costar unas peticiones más). Nunca se devuelve un artículo distinto
+    del pedido. Los artículos de 2014-2016 no tienen texto en el sitio:
     fuente="ninguna" y un aviso. Paginación: devuelve páginas enteras hasta max_caracteres
     (1000-100000, por defecto 20000), siempre al menos una; una página
     más larga que max_caracteres se corta ahí (cortada=true). Si 'siguiente' no es null, vuelve
@@ -721,6 +832,7 @@ def leer_articulo(
         desde_pagina=desde_pagina,
         desde_caracter=desde_caracter,
         max_caracteres=max_caracteres,
+        boletin_de_articulo=_boletin_indexado,
     ).to_dict()
 
 
@@ -1020,7 +1132,9 @@ def _index_aviso(cobertura: dict[str, Any], sync_state: str | None) -> str | Non
 
 
 def _sync_state() -> dict[str, Any] | None:
-    return _sync.estado().to_dict() if _sync is not None else None
+    """State of this process's running sync (either origin), else of the last one started."""
+    job = _sync_actual()
+    return job.estado().to_dict() if job is not None else None
 
 
 @server.tool()
@@ -1046,12 +1160,21 @@ def buscar_en_indice(
     desde esa fecha y pendientes_anteriores_2018 los anteriores del calendario sin indexar
     (bomemelilla.es está incompleto antes de 2018; esos boletines se consultan mejor en el
     portal antiguo de melilla.es).
+    Incluye también los boletines del portal antiguo (melilla.es, 1991-2017) una vez
+    sincronizados con sincronizar_indice(origen="melilla.es"): cada artículo trae 'origen'
+    ("bomemelilla.es" o "melilla.es"); en los de melilla.es, url es la ficha del boletín en el
+    portal antiguo, pdf_url el PDF de la página del artículo (léelo con leer_pdf(url=...)),
+    bome_cve el identificador del portal (antes de 2014 no es un CVE de bomemelilla.es) y cve
+    una clave interna MEL-<dboid>-<numero>. cobertura.por_origen da lo indexado de cada origen.
+    Un boletín que está en los dos sale una sola vez, del origen con mejor resultado (con
+    sumarios gana; a igualdad, bomemelilla.es).
     coincidencia: "fragmento" (subcadena, como el sitio: "cese" encuentra "ceses" y
     "procese") o "palabra" (cada frase debe empezar una palabra: "cese" → cese, ceses, no
     procese). terminos=[{texto, operador: "y"|"o", modo: "contiene"|"no_contiene"}]; Y dentro
     del mismo artículo. consejeria: parte del nombre (sin tildes). orden: "fecha" o
     "relevancia". Pagina con limite (máx. 200) y desplazamiento ('siguiente' da el próximo).
-    Solo cubre sumarios (desde finales de 2016).
+    Solo cubre sumarios: de bomemelilla.es desde finales de 2016 y del portal antiguo desde
+    ~1991.
     """
     index = _open_index_if_present()
     if index is None:
@@ -1064,6 +1187,7 @@ def buscar_en_indice(
             "rotos": None,
             "ultima_sincronizacion": None,
             "sincronizacion_en_curso": False,
+            "por_origen": None,
         }
         return {
             "articulos": [],
@@ -1105,7 +1229,14 @@ def estado_indice() -> dict:
     (hechos, total_planificado, eta_segundos). 'pendientes' cuenta solo boletines desde
     2018-01-01 (el inicio por defecto de sincronizar_indice); los anteriores del calendario sin
     indexar (de sincronizaciones antiguas o con un 'desde' anterior) salen aparte en
-    pendientes_anteriores_2018 y no son trabajo pendiente. Úsalo para seguir una sincronización lanzada con sincronizar_indice.
+    pendientes_anteriores_2018 y no son trabajo pendiente. Úsalo para seguir una
+    sincronización lanzada con sincronizar_indice.
+    Por origen: indice.por_origen cuenta boletines, artículos y fechas de cada origen
+    ("bomemelilla.es" y "melilla.es", el portal antiguo) e indice.ultimas_sincronizaciones
+    guarda el resumen de la última sincronización de cada uno (ultima_sincronizacion es la de
+    bomemelilla.es). 'sincronizacion' es la de este proceso que está en curso (o la última
+    lanzada), de cualquiera de los dos orígenes, con su 'origen'; indice.sincronizacion_en_curso
+    dice qué origen sincroniza ahora cualquier proceso.
     Estados de la sincronización: en_curso, completado, cancelado, fallido y bloqueado (el sitio
     nos bloqueó: 403/429/503 o dos peticiones seguidas sin respuesta; lo indexado se conserva y
     bome-navaja no le pide nada durante reintentar_tras_segundos, ~75 min: no vuelvas a
@@ -1135,15 +1266,21 @@ def sincronizar_indice(
     reintentar_errores: bool = True,
     max_boletines: int | None = None,
     reintentar_rotos: bool = False,
+    origen: str = ORIGEN_BOME,
 ) -> dict:
     """Arranca en segundo plano la sincronización del índice local de sumarios y vuelve al
     instante.
 
-    Recorre el calendario (por defecto 2018-01-01..hoy) del más reciente al más antiguo:
-    indexa los boletines que falten, re-indexa los de los últimos reindexar_recientes_dias
-    días y, si reintentar_errores, los que fallaron. Empieza en 2018 porque antes
-    bomemelilla.es está incompleto e inestable (faltan boletines y sus páginas rotas responden
-    HTTP 500, que el cortafuegos castiga) y apenas tiene texto buscable; los boletines
+    origen: "bomemelilla.es" (por defecto, el sitio actual) o "melilla.es" (el portal
+    antiguo). Solo corre una a la vez por índice, sea del origen que sea: si ya hay una
+    sincronización en curso (de cualquiera de los dos, en este u otro proceso) devuelve su
+    estado o en_curso_en_otro_proceso con el origen que la ocupa, sin arrancar otra.
+
+    origen="bomemelilla.es": recorre el calendario (por defecto 2018-01-01..hoy) del más
+    reciente al más antiguo: indexa los boletines que falten, re-indexa los de los últimos
+    reindexar_recientes_dias días y, si reintentar_errores, los que fallaron. Empieza en 2018
+    porque antes bomemelilla.es está incompleto e inestable (faltan boletines y sus páginas
+    rotas responden HTTP 500, que el cortafuegos castiga) y apenas tiene texto buscable; los boletines
     anteriores se consultan mejor en el portal antiguo de melilla.es. Un 'desde' anterior es
     posible pero no recomendable. Para no saturar el sitio va despacio
     (~2-3 s entre peticiones) y cada ejecución indexa como mucho max_boletines boletines
@@ -1163,29 +1300,70 @@ def sincronizar_indice(
     Los boletines "rotos" (su página respondió con error interno, HTTP 500, dos veces) se
     saltan; reintentar_rotos=True los vuelve a pedir: úsalo solo para comprobar si el sitio
     los arregló, porque cada uno cuesta un HTTP 500 que el cortafuegos del sitio cuenta.
+
+    origen="melilla.es" indexa los sumarios de artículos de las fichas de boletín del portal
+    antiguo: por defecto los boletines de 1991-01-01 a 2017-12-31 (antes de 1991 las fichas no
+    traen artículos; desde 2018 manda bomemelilla.es), del más reciente al más antiguo, y se
+    salta los que ya están indexados con sumarios desde cualquiera de los dos orígenes. Una
+    petición por boletín (la ficha, nunca los PDF), igual de despacio (~2-3 s entre
+    peticiones) y con el mismo límite max_boletines (por defecto 250, ~15-20 minutos por
+    ejecución): los ~2.000-2.500 boletines del rango necesitan varias ejecuciones espaciadas
+    (mira pendientes_tras_limite). Es reanudable, reintenta los fallidos si
+    reintentar_errores y los rotos solo con reintentar_rotos. reindexar_recientes_dias no se
+    aplica (el portal está congelado). El portal antiguo tiene su propia guardia
+    (guardia_portal_antiguo): sus errores no cuentan para bomemelilla.es. Rellena también los
+    boletines de 2014-2016 que bomemelilla.es tiene sin sumarios.
     """
-    sync = _get_sync()
-    return sync.iniciar(
-        desde=_fecha(desde, "desde", ArgumentoInvalidoError),
-        hasta=_fecha(hasta, "hasta", ArgumentoInvalidoError),
-        reindexar_recientes_dias=reindexar_recientes_dias,
-        reintentar_errores=reintentar_errores,
-        max_boletines=max_boletines,
-        reintentar_rotos=reintentar_rotos,
-    ).to_dict()
+    global _sync_reciente
+    if origen not in ORIGENES:
+        raise ArgumentoInvalidoError(
+            f"'origen' debe ser \"{ORIGEN_BOME}\" (el sitio actual) o \"{ORIGEN_ANTIGUO}\" "
+            f"(el portal antiguo), no {origen!r}"
+        )
+    start = _fecha(desde, "desde", ArgumentoInvalidoError)
+    end = _fecha(hasta, "hasta", ArgumentoInvalidoError)
+    job: SincronizadorBase
+    if origen == ORIGEN_ANTIGUO:
+        old_portal = _get_sync_antiguo()
+        job = old_portal
+        state = old_portal.iniciar(
+            desde=start,
+            hasta=end,
+            reintentar_errores=reintentar_errores,
+            max_boletines=max_boletines,
+            reintentar_rotos=reintentar_rotos,
+        )
+    else:
+        current = _get_sync()
+        job = current
+        state = current.iniciar(
+            desde=start,
+            hasta=end,
+            reindexar_recientes_dias=reindexar_recientes_dias,
+            reintentar_errores=reintentar_errores,
+            max_boletines=max_boletines,
+            reintentar_rotos=reintentar_rotos,
+        )
+    if state.estado == "en_curso":
+        _sync_reciente = job
+    return state.to_dict()
 
 
 @server.tool()
 @_herramienta
 def cancelar_sincronizacion() -> dict:
-    """Pide parar la sincronización en curso; termina tras el boletín que esté procesando (o al
-    instante si está en una pausa: preventiva o tras una página rota del sitio).
+    """Pide parar la sincronización en curso de este proceso, sea cual sea su origen
+    (bomemelilla.es o el portal antiguo melilla.es: cualquiera de las dos, solo corre una a la
+    vez); termina tras el boletín que esté procesando (o al instante si está en una pausa:
+    preventiva o tras una página rota del sitio).
 
-    Lo ya indexado se conserva y una nueva sincronizar_indice continúa desde ahí.
+    Devuelve el estado de esa sincronización, con su 'origen'. Lo ya indexado se conserva y
+    una nueva sincronizar_indice (con el mismo origen) continúa desde ahí.
     """
-    if _sync is None:
+    job = _sync_actual()
+    if job is None:
         return {"estado": "inactivo", "mensaje": "No hay ninguna sincronización en este proceso."}
-    return _sync.cancelar().to_dict()
+    return job.cancelar().to_dict()
 
 
 # --------------------------------------------------------------------------- server state
@@ -1235,7 +1413,11 @@ def estado_servidor() -> dict:
     compartido por todos los procesos de bome-navaja). Del portal antiguo (melilla.es):
     url_portal_antiguo, su propia guardia (guardia_portal_antiguo, con su fichero
     estado_sitio_melilla.json) y la caché de su catálogo (catalogo_portal_antiguo: ruta,
-    existe, fetched_at y número de boletines).
+    existe, fetched_at y número de boletines). La sincronización del portal antiguo
+    (sincronizar_indice con origen="melilla.es") va al mismo ritmo y con el mismo máximo por
+    ejecución que la de bomemelilla.es, con las mismas variables de entorno aplicadas:
+    cortesia_sincronizacion_portal_antiguo (el portal interactivo va a ~1-1,5 s entre
+    peticiones).
     """
     try:
         exists = index_path()[0].exists()
@@ -1260,6 +1442,7 @@ def estado_servidor() -> dict:
         "sqlite": _sqlite_capabilities(),
         "cortesia_segundos": RECOMMENDED_POLITE_DELAY,
         "cortesia_sincronizacion": sync_pace,
+        "cortesia_sincronizacion_portal_antiguo": dict(sync_pace),
         "url_base": BASE_URL,
         "guardia_sitio": _get_guard().estado(),
         "url_portal_antiguo": PORTAL_URL,

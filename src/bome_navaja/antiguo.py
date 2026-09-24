@@ -26,8 +26,15 @@ catalog from 1985-01-03 to 2021-03-12. Facts the code relies on:
   response is size-capped). Results are articles with per-page PDF links.
 * Ficha: GET ``contenedor.jsp?seccion=ficha_bome.jsp&dboidboletin=<id>``:
   header, whole-bulletin PDF, and a flat sequence of headings and articles.
-* robots.txt disallows ``ficha_bome.jsp`` and ``/mandar.php``. User decision
-  2026-09-24: allowed for on-demand requests only; nothing here crawls them.
+* robots.txt disallows ``ficha_bome.jsp`` and ``/mandar.php``. User decisions
+  2026-09-24: allowed for on-demand requests, and fichas (never PDFs) may be
+  bulk-indexed by the manually started, slow, capped and guarded sync of
+  :mod:`bome_navaja.sync_antiguo`; nothing in this module crawls.
+* Local index keys (:mod:`bome_navaja.index`, schema v4): a bulletin is keyed
+  by its identifier, or ``<cve>~<dboid>`` when the identifier repeats in the
+  catalog (:func:`clave_boletin_antiguo`, :meth:`CatalogoAntiguo.claves`);
+  articles have no CVE and get ``MEL-<dboid>-<numero>`` with ``-2``, ``-3``
+  for numbers repeated in one ficha (:func:`claves_articulos_antiguos`).
 
 The site is not bomemelilla.es: :class:`PortalAntiguo` has its own
 :class:`~bome_navaja.guard.GuardiaSitio` (state file
@@ -43,6 +50,7 @@ import random
 import re
 import sys
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -64,7 +72,7 @@ from .models import (
     JsonModel,
 )
 from .paths import data_dir
-from .search import BusquedaInvalidaError
+from .search import ArticuloEncontrado, BusquedaInvalidaError
 
 PORTAL_URL: Final = "https://www.melilla.es/melillaPortal"
 """Base of the old portal (https only)."""
@@ -239,6 +247,98 @@ class CatalogoAntiguo(JsonModel):
             for b in self.boletines
             if (desde is None or b.fecha >= desde) and (hasta is None or b.fecha <= hasta)
         ]
+
+    def cves_repetidos(self) -> frozenset[str]:
+        """Identifiers listed for more than one bulletin (only pre-2014 ones repeat)."""
+        seen: set[str] = set()
+        repeated: set[str] = set()
+        for boletin in self.boletines:
+            (repeated if boletin.cve in seen else seen).add(boletin.cve)
+        return frozenset(repeated)
+
+    def claves(self) -> dict[int, str]:
+        """``dboid → key`` in the local index for every bulletin (see :func:`clave_boletin_antiguo`)."""
+        repeated = self.cves_repetidos()
+        return {b.dboid: clave_boletin_antiguo(b, b.cve in repeated) for b in self.boletines}
+
+    def clave(self, boletin: BoletinAntiguo) -> str:
+        """Key of one bulletin in the local index (use :meth:`claves` for many)."""
+        return clave_boletin_antiguo(boletin, len(self.por_cve(boletin.cve)) > 1)
+
+
+# --------------------------------------------------------------------------- local index keys
+
+
+SEPARADOR_DBOID: Final = "~"
+"""Joins a repeated identifier and its dboid in a bulletin key (``BOME-BX-1986-1~280058``)."""
+
+PREFIJO_ARTICULO: Final = "MEL"
+"""Prefix of the synthetic article keys (old-portal articles have no CVE)."""
+
+
+def clave_boletin_antiguo(boletin: BoletinAntiguo, repetido: bool) -> str:
+    """Key of an old-portal bulletin in the local index (``bulletins.cve``).
+
+    The catalog identifier when it is unique in the catalog; ``<cve>~<dboid>``
+    when it repeats (``repetido``, see :meth:`CatalogoAntiguo.cves_repetidos`),
+    so both bulletins can be stored.
+    """
+    return f"{boletin.cve}{SEPARADOR_DBOID}{boletin.dboid}" if repetido else boletin.cve
+
+
+def claves_articulos_antiguos(dboid: int, articulos: Sequence[ArticuloAntiguo]) -> list[str]:
+    """Synthetic keys ``MEL-<dboid>-<numero>`` of a ficha's articles, in page order.
+
+    A number seen again in the same ficha gets ``-2``, ``-3``… in page order;
+    an article without number counts as number 0.
+    """
+    seen: dict[int, int] = {}
+    keys: list[str] = []
+    for articulo in articulos:
+        numero = articulo.numero or 0
+        seen[numero] = seen.get(numero, 0) + 1
+        suffix = f"-{seen[numero]}" if seen[numero] > 1 else ""
+        keys.append(f"{PREFIJO_ARTICULO}-{int(dboid)}-{numero}{suffix}")
+    return keys
+
+
+def articulos_para_indice(
+    boletin: BoletinAntiguo, ficha: FichaAntigua, clave: str
+) -> list[ArticuloEncontrado]:
+    """The ficha's articles as rows of the local index, under bulletin key ``clave``.
+
+    The heading chain ``ruta`` maps onto departamento (first heading),
+    consejeria (second) and organismo (the rest joined with ``" / "``), empty
+    when missing. ``url`` is the ficha, ``pdf_url`` the article's first page.
+    Raises ``ValueError`` when ``ficha`` is not ``boletin``'s or ``clave`` is
+    neither its identifier nor ``<cve>~<dboid>``.
+    """
+    if ficha.dboid != boletin.dboid:
+        raise ValueError(f"the ficha has dboid {ficha.dboid}, the bulletin {boletin.dboid}")
+    if clave not in (clave_boletin_antiguo(boletin, False), clave_boletin_antiguo(boletin, True)):
+        raise ValueError(f"{clave!r} is not a key of {boletin.cve} (dboid {boletin.dboid})")
+    rows = []
+    keys = claves_articulos_antiguos(boletin.dboid, ficha.articulos)
+    for key, articulo in zip(keys, ficha.articulos, strict=True):
+        ruta = articulo.ruta
+        rows.append(
+            ArticuloEncontrado(
+                bome_cve=clave,
+                bome_numero=boletin.numero,
+                bome_fecha=boletin.fecha,
+                bome_extraordinario=boletin.extraordinario,
+                cve=key,
+                numero=articulo.numero or 0,
+                sumario=articulo.sumario,
+                departamento=ruta[0] if ruta else "",
+                consejeria=ruta[1] if len(ruta) > 1 else "",
+                organismo=" / ".join(ruta[2:]),
+                url=boletin.url_ficha,
+                pdf_url=articulo.paginas[0].url_pdf if articulo.paginas else None,
+                listado_en_bome=True,
+            )
+        )
+    return rows
 
 
 # --------------------------------------------------------------------------- helpers
@@ -902,17 +1002,23 @@ class PortalAntiguo:
             raise ValueError(f"dboid must be a positive integer, got {dboid!r}")
         return dboid
 
-    def ficha(self, dboid: int | str) -> FichaAntigua:
+    def ficha(self, dboid: int | str, *, boletin: BoletinAntiguo | None = None) -> FichaAntigua:
         """The ficha of the bulletin with portal id ``dboid``.
 
-        When the catalog is already in memory or cached on disk its entry
-        supplies the numbering (suffix, extraordinary flag); the catalog is
-        never downloaded for this.
+        ``boletin`` is its catalog entry when the caller has it (the old-portal
+        sync does); otherwise, when the catalog is already in memory or cached
+        on disk, its entry supplies the numbering (suffix, extraordinary flag).
+        The catalog is never downloaded for this. An entry of another
+        ``dboid`` is a ``ValueError`` raised before any request.
         """
         number = self._valid_dboid(dboid)
+        if boletin is not None and boletin.dboid != number:
+            raise ValueError(f"the catalog entry has dboid {boletin.dboid}, not {number}")
         text = self._page("GET", (("seccion", "ficha_bome.jsp"), ("dboidboletin", str(number)), *_COMMON_PARAMS))
-        cached = self._cached_catalog()
-        hint = cached.por_dboid(number) if cached is not None else None
+        hint = boletin
+        if hint is None:
+            cached = self._cached_catalog()
+            hint = cached.por_dboid(number) if cached is not None else None
         return parse_ficha(text, number, boletin=hint)
 
     def ficha_por_cve(self, cve: str) -> FichaAntigua:
@@ -969,6 +1075,11 @@ __all__ = [
     "PaginaAntigua",
     "PortalAntiguo",
     "UrlPdfInvalidaError",
+    "PREFIJO_ARTICULO",
+    "SEPARADOR_DBOID",
+    "articulos_para_indice",
+    "clave_boletin_antiguo",
+    "claves_articulos_antiguos",
     "guardia_portal_antiguo",
     "normalizar_cve",
     "parse_busqueda",

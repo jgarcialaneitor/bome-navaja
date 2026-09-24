@@ -240,6 +240,46 @@ def test_resolve_cve_redirect_to_home_is_not_found(recorder: Recorder) -> None:
         bome.resolve_cve("BOME-A-2026-999999")
 
 
+@pytest.mark.parametrize(
+    ("cve", "location"),
+    [
+        # Live 2026-09-24: the resolver drops the X of extraordinary article and page CVEs.
+        ("BOME-AX-2019-103", "/bome/BOME-B-2019-5625/articulo/103"),
+        ("BOME-PX-2021-362", "/bome/BOME-B-2021-5839/articulo/170#pagina-362"),
+        # The symmetric contradiction is refused as well.
+        ("BOME-A-2019-103", "/bome/BOME-BX-2019-24/articulo/103"),
+    ],
+)
+@pytest.mark.parametrize("confirm", [True, False])
+def test_resolve_cve_refuses_a_target_of_the_other_bulletin_kind(
+    recorder: Recorder, cve: str, location: str, confirm: bool
+) -> None:
+    recorder.routes["/buscar-cve"] = lambda request: httpx.Response(302, headers={"location": location})
+    with recorder.client() as bome, pytest.raises(client_module.ResolucionIncoherenteError) as info:
+        bome.resolve_cve(cve, confirm=confirm)
+    assert isinstance(info.value, BomeNotFoundError)
+    assert cve in str(info.value)
+    # The contradicting target is never requested.
+    assert [r.url.path for r in recorder.requests] == ["/buscar-cve"]
+
+
+@pytest.mark.parametrize(
+    ("cve", "location"),
+    [
+        # Live 2026-09-24: extraordinary bulletins and sumarios resolve correctly.
+        ("BOME-BX-2019-24", "/bome/BOME-BX-2019-24"),
+        ("BOME-SX-2019-24", "/bome/BOME-SX-2019-24/sumario"),
+        ("BOME-P-2026-4784", "/bome/BOME-B-2026-6416/articulo/1051#pagina-4784"),
+    ],
+)
+def test_resolve_cve_accepts_targets_of_the_same_bulletin_kind(
+    recorder: Recorder, cve: str, location: str
+) -> None:
+    recorder.routes["/buscar-cve"] = lambda request: httpx.Response(302, headers={"location": location})
+    with recorder.client() as bome:
+        assert bome.resolve_cve(cve, confirm=False) == BASE + location
+
+
 # --------------------------------------------------------------------------- search
 
 

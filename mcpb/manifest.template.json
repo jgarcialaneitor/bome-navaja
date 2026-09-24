@@ -4,7 +4,7 @@
   "display_name": "BOME Melilla — Boletín Oficial de Melilla",
   "version": "${VERSION}",
   "description": "Consulta el Boletín Oficial de la Ciudad Autónoma de Melilla (bomemelilla.es): lista y abre boletines, lee artículos y PDF completos, busca en vivo y en un índice local de sumarios.",
-  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014 en bomemelilla.es y, desde 1985 hasta marzo de 2021, los del portal antiguo de melilla.es (catálogo, búsqueda de artículos, fichas y PDF por página, pedidos solo bajo demanda): calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
+  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014 en bomemelilla.es y, desde 1985 hasta marzo de 2021, los del portal antiguo de melilla.es (catálogo, búsqueda de artículos, fichas y PDF por página, pedidos bajo demanda; sus sumarios de 1991 a 2017 también se pueden indexar): calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
   "author": {
     "name": "jgarcialaneitor"
   },
@@ -94,19 +94,19 @@
     },
     {
       "name": "buscar_en_indice",
-      "description": "Búsqueda instantánea de artículos en el índice local de sumarios."
+      "description": "Búsqueda instantánea de artículos en el índice local de sumarios (bomemelilla.es y, una vez indexado, el portal antiguo de melilla.es)."
     },
     {
       "name": "estado_indice",
-      "description": "Estado del índice local de sumarios y de su sincronización."
+      "description": "Estado del índice local de sumarios por origen y de su sincronización."
     },
     {
       "name": "sincronizar_indice",
-      "description": "Arranca en segundo plano la sincronización reanudable del índice local."
+      "description": "Arranca en segundo plano la sincronización reanudable del índice local, de bomemelilla.es o del portal antiguo de melilla.es (1991-2017)."
     },
     {
       "name": "cancelar_sincronizacion",
-      "description": "Pide parar la sincronización en curso del índice local."
+      "description": "Pide parar la sincronización en curso del índice local, sea del origen que sea."
     },
     {
       "name": "buscar_bome_antiguo",
