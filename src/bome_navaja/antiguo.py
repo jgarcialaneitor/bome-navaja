@@ -650,6 +650,35 @@ def _catalog_from_json(raw: str) -> CatalogoAntiguo:
     )
 
 
+def estado_catalogo(path: str | os.PathLike[str] | None) -> dict[str, Any]:
+    """Status of the catalog cache file for ``estado_servidor``; never fetches.
+
+    ``ruta``, ``existe``, ``fetched_at`` and ``boletines`` (count), plus
+    ``error`` when the file exists but cannot be used (it would be refetched
+    on the next catalog use).
+    """
+    status: dict[str, Any] = {
+        "ruta": str(path) if path is not None else None,
+        "existe": False,
+        "fetched_at": None,
+        "boletines": None,
+    }
+    if path is None:
+        return status
+    try:
+        raw = Path(path).read_text("utf-8")
+    except FileNotFoundError:
+        return status
+    except (OSError, UnicodeDecodeError) as exc:
+        return {**status, "existe": Path(path).exists(), "error": f"no se puede leer: {exc}"}
+    status["existe"] = True
+    try:
+        catalogo = _catalog_from_json(raw)
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        return {**status, "error": f"caché no válida, se volverá a descargar al usarla: {exc}"}
+    return {**status, "fetched_at": catalogo.fetched_at, "boletines": len(catalogo.boletines)}
+
+
 def _catalog_url() -> str:
     return (
         f"{PORTAL_URL}/contenedor.jsp?seccion=bome.jsp&language=es&codResi=1"
@@ -948,4 +977,5 @@ __all__ = [
     "pdf_url_valida",
     "texto_busqueda_valido",
     "url_ficha",
+    "estado_catalogo",
 ]

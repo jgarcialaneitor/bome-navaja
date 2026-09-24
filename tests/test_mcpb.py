@@ -68,7 +68,7 @@ def test_manifest_tools_match_registered_server_tools() -> None:
 
     registered = [tool.name for tool in asyncio.run(server_module.server.list_tools())]
     declared = [tool["name"] for tool in _template()["tools"]]
-    assert len(declared) == len(set(declared)) == len(registered) == 17
+    assert len(declared) == len(set(declared)) == len(registered) == 19
     assert set(declared) == set(registered), (
         f"manifest tool list drift: declared={sorted(declared)} registered={sorted(registered)}"
     )

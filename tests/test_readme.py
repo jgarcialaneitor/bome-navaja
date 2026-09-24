@@ -19,7 +19,7 @@ def test_every_registered_tool_is_documented() -> None:
     from bome_navaja.server import server
 
     names = [tool.name for tool in asyncio.run(server.list_tools())]
-    assert len(names) == 17
+    assert len(names) == 19
     missing = [name for name in names if f"`{name}`" not in README]
     assert not missing, f"tools missing from README.md: {missing}"
 
@@ -57,6 +57,28 @@ def test_in_page_anchors_point_to_headings() -> None:
     prose = re.sub(r"^```.*?^```", "", README, flags=re.MULTILINE | re.DOTALL)
     headings = {slug(line.lstrip("#")) for line in prose.splitlines() if line.startswith("#")}
     assert "#-índice-local-de-sumarios" in headings
+    assert "#-portal-antiguo-melillaes" in headings
+    assert "(#-portal-antiguo-melillaes)" in README  # linked from the table of contents
     anchors = set(re.findall(r"\]\((#[^)\s]+)\)", README))
     missing = sorted(anchors - headings)
     assert not missing, f"README.md anchors without a heading: {missing}"
+
+
+def test_the_old_portal_section_states_the_robots_policy_and_its_files() -> None:
+    section = README.split("## 🏛️ Portal antiguo (melilla.es)", 1)[1].split("\n## ", 1)[0]
+    for needle in (
+        "robots.txt",
+        "ficha_bome.jsp",
+        "mandar.php",
+        "bajo demanda",
+        "estado_sitio_melilla.json",
+        "catalogo_portal_antiguo.json",
+        "3.260",
+        "141",
+        "14 boletines",
+        "dboid",
+        "`buscar_bome_antiguo`",
+        "`ver_bome_antiguo`",
+    ):
+        assert needle in section, needle
+    assert "MCP-19%20herramientas" in README and "17 herramientas" not in README

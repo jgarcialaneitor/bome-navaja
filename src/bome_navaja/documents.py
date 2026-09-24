@@ -7,6 +7,10 @@ Public entry points, designed to be exposed 1:1 as MCP tools (task 6):
 * :func:`leer_articulo` — article text from its web page (``#pagina-N``
   blocks), falling back to its PDF for old articles without HTML text.
 * :func:`leer_boletin` — the whole bulletin PDF text plus bulletin metadata.
+* :func:`descargar_pdf_antiguo` / :func:`leer_pdf_antiguo` — the same for a
+  PDF of the old portal on melilla.es, given by its whitelisted ``mandar.php``
+  URL (see :func:`bome_navaja.antiguo.pdf_url_valida`) and fetched through the
+  portal client (its own site guard).
 
 Cursor contract, shared by the three readers (:func:`paginar`):
 
@@ -36,11 +40,11 @@ import io
 import os
 import re
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 import pypdf
@@ -65,6 +69,10 @@ MIN_MAX_CARACTERES = 1_000
 MAX_MAX_CARACTERES = 100_000
 
 _ARTICLE_PATH = re.compile(r"/bome/(BOME-BX?-\d{4}-\d+)/articulo/(\d+)/?$")
+_OLD_PDF_PATH = re.compile(r"https://www\.melilla\.es/mandar\.php/n/(\d+)/(\d+)/([A-Za-z0-9_]+)\.pdf")
+
+ORIGEN_BOMEMELILLA = "bomemelilla.es"
+ORIGEN_ANTIGUO = "melilla.es"
 
 Fuente = Literal["pdf", "html", "ninguna"]
 
@@ -105,7 +113,8 @@ class PaginaTexto(JsonModel):
 class TextoPaginado(JsonModel):
     """One chunk of a document's text, with the cursor to continue."""
 
-    cve: str
+    cve: str | None
+    """``None`` for a PDF of the old portal (it is identified by ``url``)."""
     fuente: Fuente
     url: str
     total_paginas: int
@@ -115,13 +124,16 @@ class TextoPaginado(JsonModel):
     completo: bool
     aviso: str | None = None
     metadatos: dict[str, Any] | None = None
+    origen: str = ORIGEN_BOMEMELILLA
+    """Site the document comes from: ``bomemelilla.es`` or ``melilla.es`` (old portal)."""
 
 
 @dataclass(frozen=True, slots=True)
 class DescargaPdf(JsonModel):
     """A PDF stored in the local cache."""
 
-    cve: str
+    cve: str | None
+    """Canonical CVE; ``None`` for a PDF of the old portal (identified by ``url``)."""
     ruta: str
     tamano_bytes: int
     sha256: str
@@ -130,6 +142,7 @@ class DescargaPdf(JsonModel):
     url: str
     motivo_directorio: str
     """Why this directory was chosen (``BOME_NAVAJA_PDF_DIR``, XDG, ...)."""
+    origen: str = ORIGEN_BOMEMELILLA
 
 
 # --------------------------------------------------------------------------- pagination
@@ -220,7 +233,7 @@ def paginar(
 
 def _chunk(
     *,
-    cve: str,
+    cve: str | None,
     fuente: Fuente,
     url: str,
     textos: Sequence[str],
@@ -230,6 +243,7 @@ def _chunk(
     metadatos: dict[str, Any],
     paginas_bome: Sequence[int | None] | None = None,
     aviso: str | None = None,
+    origen: str = ORIGEN_BOMEMELILLA,
 ) -> TextoPaginado:
     pages, cursor = paginar(
         textos,
@@ -256,6 +270,7 @@ def _chunk(
         completo=desde_pagina == 1 and desde_caracter == 0 and cursor is None and bool(textos),
         aviso=" ".join(notes) or None,
         metadatos=metadatos,
+        origen=origen,
     )
 
 
@@ -350,26 +365,41 @@ def descargar_pdf(client: BomeClient, cve: str | Cve, *, refrescar: bool = False
     directory, reason = pdf_dir()
     target = directory / f"{canonical}.pdf"
     source_url = pdf_url(canonical, base_url=client.base_url)
+    data, pages, hit = _fetch_into_cache(
+        target, lambda: client.download(canonical, max_bytes=MAX_PDF_BYTES), refrescar=refrescar
+    )
+    return _descarga(str(canonical), target, data, pages, hit, source_url, reason)
+
+
+def _fetch_into_cache(target: Path, fetch: Callable[[], bytes], *, refrescar: bool) -> tuple[bytes, int, bool]:
+    """Bytes, page count and cache hit of ``target``: reused when valid, else fetched and stored."""
     if not refrescar:
         cached = _cached(target)
         if cached is not None:
-            data, pages = cached
-            return _descarga(canonical, target, data, pages, True, source_url, reason)
+            return (*cached, True)
+    directory = target.parent
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise BomeStorageError(f"cannot create {directory}: {exc}", path=str(directory)) from exc
-    data = client.download(canonical, max_bytes=MAX_PDF_BYTES)
+    data = fetch()
     pages = _pdf_info(data)
     _atomic_write(target, data)
-    return _descarga(canonical, target, data, pages, False, source_url, reason)
+    return data, pages, False
 
 
 def _descarga(
-    cve: Cve, target: Path, data: bytes, pages: int, hit: bool, url: str, reason: str
+    cve: str | None,
+    target: Path,
+    data: bytes,
+    pages: int,
+    hit: bool,
+    url: str,
+    reason: str,
+    origen: str = ORIGEN_BOMEMELILLA,
 ) -> DescargaPdf:
     return DescargaPdf(
-        cve=str(cve),
+        cve=cve,
         ruta=str(target),
         tamano_bytes=len(data),
         sha256=hashlib.sha256(data).hexdigest(),
@@ -377,7 +407,60 @@ def _descarga(
         cache_hit=hit,
         url=url,
         motivo_directorio=reason,
+        origen=origen,
     )
+
+
+# --------------------------------------------------------------------------- old portal PDFs
+
+
+class PortalPdf(Protocol):
+    """What the old-portal readers need: :meth:`bome_navaja.antiguo.PortalAntiguo.pdf`."""
+
+    def pdf(self, url: str, *, max_bytes: int | None = ...) -> bytes: ...
+
+
+def _old_pdf_url(url: str) -> tuple[str, str]:
+    """The validated https URL of an old-portal PDF and its cache file name.
+
+    Raises :class:`~bome_navaja.antiguo.UrlPdfInvalidaError` for anything
+    outside the ``mandar.php`` whitelist.
+    """
+    from .antiguo import pdf_url_valida  # antiguo imports this module
+
+    valid = pdf_url_valida(url)
+    match = _OLD_PDF_PATH.fullmatch(valid)
+    if match is None:  # pdf_url_valida only returns this shape
+        raise BomeParseError(f"unexpected old-portal PDF URL {valid!r}")
+    first, second, name = match.groups()
+    return valid, f"melilla-{first}-{second}-{name}.pdf"
+
+
+def nombre_pdf_antiguo(url: str) -> str:
+    """Cache file name of an old-portal PDF, derived only from its validated URL path.
+
+    ``https://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf`` →
+    ``melilla-9-4914-5302_73.pdf``: digits, letters and ``_`` only, so no
+    caller text can reach the path, and it never collides with a CVE name.
+    """
+    return _old_pdf_url(url)[1]
+
+
+def descargar_pdf_antiguo(portal: PortalPdf, url: str, *, refrescar: bool = False) -> DescargaPdf:
+    """Download (or reuse) a PDF of the old portal into the PDF cache.
+
+    Same cache contract as :func:`descargar_pdf`; the file is
+    ``pdf_dir()/``:func:`nombre_pdf_antiguo`, the request goes through
+    ``portal`` (its guard), and the result has ``cve=None`` and
+    ``origen="melilla.es"``.
+    """
+    valid, name = _old_pdf_url(url)
+    directory, reason = pdf_dir()
+    target = directory / name
+    data, pages, hit = _fetch_into_cache(
+        target, lambda: portal.pdf(valid, max_bytes=MAX_PDF_BYTES), refrescar=refrescar
+    )
+    return _descarga(None, target, data, pages, hit, valid, reason, ORIGEN_ANTIGUO)
 
 
 @lru_cache(maxsize=8)
@@ -431,6 +514,35 @@ def leer_pdf(
             "sha256": download.sha256,
             "cache_hit": download.cache_hit,
         },
+    )
+
+
+def leer_pdf_antiguo(
+    portal: PortalPdf,
+    url: str,
+    *,
+    desde_pagina: int = 1,
+    desde_caracter: int = 0,
+    max_caracteres: int = DEFAULT_MAX_CARACTERES,
+) -> TextoPaginado:
+    """Text of an old-portal PDF, page by page (see :func:`leer_pdf`)."""
+    budget = _budget(max_caracteres)
+    download = descargar_pdf_antiguo(portal, url)
+    return _chunk(
+        cve=None,
+        fuente="pdf",
+        url=download.url,
+        textos=_page_texts(Path(download.ruta)),
+        desde_pagina=desde_pagina,
+        desde_caracter=desde_caracter,
+        budget=budget,
+        metadatos={
+            "ruta": download.ruta,
+            "tamano_bytes": download.tamano_bytes,
+            "sha256": download.sha256,
+            "cache_hit": download.cache_hit,
+        },
+        origen=ORIGEN_ANTIGUO,
     )
 
 
@@ -607,8 +719,11 @@ __all__ = [
     "PaginaTexto",
     "TextoPaginado",
     "descargar_pdf",
+    "descargar_pdf_antiguo",
     "leer_articulo",
     "leer_boletin",
     "leer_pdf",
+    "leer_pdf_antiguo",
+    "nombre_pdf_antiguo",
     "paginar",
 ]

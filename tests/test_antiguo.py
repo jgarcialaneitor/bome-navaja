@@ -647,3 +647,24 @@ def test_pdf_download_is_size_capped(portal: Portal) -> None:
     )
     with portal.client() as client, pytest.raises(BomeDocumentTooLargeError):
         client.pdf("https://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf", max_bytes=1000)
+
+
+# --------------------------------------------------------------------------- catalog cache status (task 7)
+
+
+def test_estado_catalogo_reads_the_cache_without_network(portal: Portal, tmp_path: Path) -> None:
+    cache = tmp_path / antiguo.FICHERO_CATALOGO
+    assert antiguo.estado_catalogo(cache) == {"ruta": str(cache), "existe": False, "fetched_at": None, "boletines": None}
+    portal.page("bome.jsp", "listado.html")
+    with portal.client(cache_path=cache) as client:
+        cat = client.catalogo()
+    assert antiguo.estado_catalogo(cache) == {
+        "ruta": str(cache),
+        "existe": True,
+        "fetched_at": cat.fetched_at,
+        "boletines": 476,
+    }
+    cache.write_text("[]", "utf-8")
+    broken = antiguo.estado_catalogo(cache)
+    assert broken["existe"] is True and broken["boletines"] is None and broken["error"]
+    assert antiguo.estado_catalogo(None) == {"ruta": None, "existe": False, "fetched_at": None, "boletines": None}

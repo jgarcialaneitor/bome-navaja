@@ -4,7 +4,7 @@
   "display_name": "BOME Melilla — Boletín Oficial de Melilla",
   "version": "${VERSION}",
   "description": "Consulta el Boletín Oficial de la Ciudad Autónoma de Melilla (bomemelilla.es): lista y abre boletines, lee artículos y PDF completos, busca en vivo y en un índice local de sumarios.",
-  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014: calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
+  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014 en bomemelilla.es y, desde 1985 hasta marzo de 2021, los del portal antiguo de melilla.es (catálogo, búsqueda de artículos, fichas y PDF por página, pedidos solo bajo demanda): calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
   "author": {
     "name": "jgarcialaneitor"
   },
@@ -46,7 +46,7 @@
   "tools": [
     {
       "name": "listar_bomes",
-      "description": "Lista los boletines publicados entre dos fechas (calendario del sitio)."
+      "description": "Lista los boletines publicados entre dos fechas (bomemelilla.es y, hasta 2021, el portal antiguo)."
     },
     {
       "name": "ver_bome",
@@ -78,11 +78,11 @@
     },
     {
       "name": "leer_pdf",
-      "description": "Texto del PDF de cualquier CVE (boletín, sumario, artículo o página), paginado."
+      "description": "Texto del PDF de cualquier CVE o de un PDF del portal antiguo, paginado."
     },
     {
       "name": "descargar_pdf",
-      "description": "Descarga el PDF de un CVE a la caché local y devuelve su ruta."
+      "description": "Descarga el PDF de un CVE o del portal antiguo a la caché local y devuelve su ruta."
     },
     {
       "name": "buscar_bomes",
@@ -107,6 +107,14 @@
     {
       "name": "cancelar_sincronizacion",
       "description": "Pide parar la sincronización en curso del índice local."
+    },
+    {
+      "name": "buscar_bome_antiguo",
+      "description": "Busca artículos en el portal antiguo de melilla.es (boletines de 1985 a marzo de 2021)."
+    },
+    {
+      "name": "ver_bome_antiguo",
+      "description": "Ficha de un boletín del portal antiguo de melilla.es: PDF entero y artículos con sus páginas."
     },
     {
       "name": "estado_servidor",

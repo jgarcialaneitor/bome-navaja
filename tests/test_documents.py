@@ -585,3 +585,83 @@ def test_leer_boletin_rejects_non_bulletin_cves(site: Site) -> None:
     with site.client() as client, pytest.raises(LecturaInvalidaError):
         leer_boletin(client, "BOME-A-2026-1051")
     assert site.requests == []
+
+
+# --------------------------------------------------------------------------- old portal PDFs (site-guard task 7)
+
+
+OLD_PDF_URL = "https://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf"
+OLD_PDF = (FIXTURES / "antiguo" / "5302_73.pdf").read_bytes()
+
+
+class FakePortal:
+    """Stands in for PortalAntiguo.pdf: records the URLs it was asked for."""
+
+    def __init__(self, body: bytes = OLD_PDF) -> None:
+        self.body = body
+        self.urls: list[str] = []
+
+    def pdf(self, url: str, *, max_bytes: int | None = None) -> bytes:
+        self.urls.append(url)
+        return self.body
+
+
+@pytest.mark.parametrize(
+    ("url", "name"),
+    [
+        (OLD_PDF_URL, "melilla-9-4914-5302_73.pdf"),
+        ("http://www.melilla.es/mandar.php/n/9/4913/5302.pdf", "melilla-9-4913-5302.pdf"),
+        (" https://www.melilla.es/mandar.php/n/0/1235/9_452.pdf ", "melilla-0-1235-9_452.pdf"),
+    ],
+)
+def test_old_pdf_file_name_comes_only_from_the_validated_url(url: str, name: str) -> None:
+    assert documents_module.nombre_pdf_antiguo(url) == name
+
+
+def test_old_pdf_download_is_cached_under_the_derived_name(pdfs: Path) -> None:
+    portal = FakePortal()
+    first = documents_module.descargar_pdf_antiguo(portal, "http://www.melilla.es/mandar.php/n/9/4914/5302_73.pdf")
+    assert first.ruta == str(pdfs / "melilla-9-4914-5302_73.pdf")
+    assert first.url == OLD_PDF_URL and first.cve is None and first.origen == "melilla.es"
+    assert first.cache_hit is False and first.total_paginas == 1
+    assert first.sha256 == hashlib.sha256(OLD_PDF).hexdigest()
+    assert portal.urls == [OLD_PDF_URL]  # the portal receives the validated https URL
+    again = documents_module.descargar_pdf_antiguo(portal, OLD_PDF_URL)
+    assert again.cache_hit is True and portal.urls == [OLD_PDF_URL]
+    documents_module.descargar_pdf_antiguo(portal, OLD_PDF_URL, refrescar=True)
+    assert len(portal.urls) == 2
+    assert sorted(p.name for p in pdfs.iterdir()) == ["melilla-9-4914-5302_73.pdf"]
+
+
+def test_old_pdf_reading_follows_the_cursor_contract(pdfs: Path) -> None:
+    reading = documents_module.leer_pdf_antiguo(FakePortal(), OLD_PDF_URL)
+    assert reading.cve is None and reading.origen == "melilla.es"
+    assert reading.fuente == "pdf" and reading.url == OLD_PDF_URL
+    assert reading.completo is True and reading.siguiente is None
+    assert "4328" in reading.paginas[0].texto
+    with pytest.raises(LecturaInvalidaError):
+        documents_module.leer_pdf_antiguo(FakePortal(), OLD_PDF_URL, desde_pagina=2)
+
+
+def test_old_pdf_rejects_foreign_urls_before_touching_disk_or_network(pdfs: Path) -> None:
+    from bome_navaja.antiguo import UrlPdfInvalidaError
+
+    portal = FakePortal()
+    for bad in ("https://evil.example/mandar.php/n/9/4914/5302_73.pdf", "../../etc/passwd", ""):
+        with pytest.raises(UrlPdfInvalidaError):
+            documents_module.descargar_pdf_antiguo(portal, bad)
+        with pytest.raises(UrlPdfInvalidaError):
+            documents_module.nombre_pdf_antiguo(bad)
+    assert portal.urls == [] and not pdfs.exists()
+
+
+def test_an_unreadable_old_pdf_is_not_cached(pdfs: Path) -> None:
+    with pytest.raises(BomeParseError):
+        documents_module.descargar_pdf_antiguo(FakePortal(b"%PDF-1.4 garbage"), OLD_PDF_URL)
+    assert not (pdfs / "melilla-9-4914-5302_73.pdf").exists()
+
+
+def test_bomemelilla_downloads_keep_their_origin(site: Site, pdfs: Path) -> None:
+    site.pdf("BOME-P-2026-4784", PAGE_PDF)
+    assert descargar_pdf(site.client(), "BOME-P-2026-4784").origen == "bomemelilla.es"
+    assert leer_pdf(site.client(), "BOME-P-2026-4784").origen == "bomemelilla.es"

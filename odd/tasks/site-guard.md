@@ -74,4 +74,6 @@ proceeding: no bulk crawling of those paths (no index sync from the old portal) 
       1,031 from 2014; 24 pre-2014 identifiers repeat (lookup by CVE returns a list).
       Found: 14 bulletins with the same number but a different date on each site
       (e.g. BOME-B-2015-5230: 2015-12-17 on bomemelilla.es vs 2015-05-01 on melilla.es).
-- [ ] 7. Old-portal tools, README, manifest.
+- [x] 7. Old-portal tools, README, manifest. Verified: `723 passed, 18 skipped`. 19 tools:
+      `buscar_bome_antiguo`, `ver_bome_antiguo`; `listar_bomes` merges both catalogs with `origen`;
+      `leer_pdf`/`descargar_pdf` accept a validated old-portal `url` (cached as `melilla-<a>-<b>-<name>.pdf`).
