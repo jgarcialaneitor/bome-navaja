@@ -36,9 +36,16 @@ Out of scope:
 
 ## Tasks
 
-- [ ] 1. Block detection: `BomeBlockedError` in client/models, propagated by search.
-- [ ] 2. Sync circuit breaker: cancellable back-off, retry, `bloqueado` final state, no
+- [x] 1. Block detection: `BomeBlockedError` in client/models, propagated by search.
+      Verified: `461 passed, 16 skipped`. Commit `2c07e9a`; native review
+      `review-1207b1da90397be0` approved (4 lenses) and acknowledged.
+- [x] 2. Sync circuit breaker: cancellable back-off, retry, `bloqueado` final state, no
       `error` rows for blocked bulletins.
-- [ ] 3. Sync pace and budget: sync-only delay + jitter, per-run bulletin cap, env overrides
+      Verified: `471 passed, 16 skipped`. Commit `cb5f1f6`; native review
+      `review-6e461d0051ad38e0` approved (reliability) and acknowledged.
+- [x] 3. Sync pace and budget: sync-only delay + jitter, per-run bulletin cap, env overrides
       wired through the server.
-- [ ] 4. Docs: README (timings, courtesy, variables, new state), task evidence.
+- [x] 4. Docs: README (timings, courtesy, variables, new state), task evidence.
+      Tasks 3 and 4 share one commit: the README test requires every env var the code
+      reads to be documented, so the docs travel with the behaviour.
+      Verified: `510 passed, 16 skipped`.

@@ -17,6 +17,7 @@ Endpoint map (read-only reconnaissance, 2026-09-23):
 from __future__ import annotations
 
 import math
+import random
 import re
 import time
 from collections.abc import Sequence
@@ -158,7 +159,10 @@ class BomeClient:
     """Synchronous client over :class:`httpx.Client`.
 
     ``polite_delay`` seconds are enforced between consecutive requests (use a
-    small value such as 0.5 for bulk work like index sync or drill-down).
+    small value such as 0.5 for bulk work like drill-down). ``jitter`` adds a
+    random ``uniform(0, jitter)`` seconds, drawn per request, so a long crawl
+    such as the index sync does not hit the site at a fixed rhythm; ``rng``
+    is the randomness source (tests inject a deterministic one).
     """
 
     def __init__(
@@ -168,11 +172,19 @@ class BomeClient:
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
         polite_delay: float = 0.0,
+        jitter: float = 0.0,
+        rng: random.Random | None = None,
         user_agent: str = USER_AGENT,
     ) -> None:
+        if polite_delay < 0:
+            raise ValueError(f"polite_delay must be >= 0, got {polite_delay!r}")
+        if jitter < 0:
+            raise ValueError(f"jitter must be >= 0, got {jitter!r}")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.polite_delay = polite_delay
+        self.jitter = jitter
+        self._rng = rng if rng is not None else random.Random()
         self._last_request: float | None = None
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -205,10 +217,17 @@ class BomeClient:
 
     # ------------------------------------------------------------------ transport
 
+    @property
+    def _paced(self) -> bool:
+        return self.polite_delay > 0 or self.jitter > 0
+
     def _wait_politely(self) -> None:
-        if self.polite_delay <= 0 or self._last_request is None:
+        if not self._paced or self._last_request is None:
             return
-        remaining = self.polite_delay - (time.monotonic() - self._last_request)
+        delay = self.polite_delay
+        if self.jitter > 0:
+            delay += self._rng.uniform(0.0, self.jitter)
+        remaining = delay - (time.monotonic() - self._last_request)
         if remaining > 0:
             time.sleep(remaining)
 
@@ -235,7 +254,7 @@ class BomeClient:
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
-            if self.polite_delay > 0:
+            if self._paced:
                 self._last_request = time.monotonic()
         _raise_for_status(response)
         return response
@@ -398,7 +417,7 @@ class BomeClient:
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise BomeHTTPError(f"request to {url!r} failed: {exc}", status=None, url=url) from exc
         finally:
-            if self.polite_delay > 0:
+            if self._paced:
                 self._last_request = time.monotonic()
         content = b"".join(chunks)
         if not content.lstrip()[:4] == b"%PDF":

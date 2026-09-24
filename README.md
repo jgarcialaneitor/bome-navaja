@@ -45,7 +45,7 @@
 
 ## 🧰 Herramientas
 
-Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `error_http`, `indice_no_disponible`…); nunca rompen la conversación con una excepción.
+Todas devuelven un objeto con `ok`. Si algo falla devuelven `ok: false`, un `error` en castellano y un `error_code` estable (`no_encontrado`, `cve_invalido`, `busqueda_invalida`, `lectura_invalida`, `error_http`, `sitio_bloqueando`, `indice_no_disponible`…); nunca rompen la conversación con una excepción.
 
 | Grupo | Herramienta | Para qué sirve |
 | --- | --- | --- |
@@ -136,10 +136,11 @@ En los dos modos se ignoran tildes y mayúsculas, y un `*` final se acepta pero 
 
 - **Solo se sincroniza cuando el modelo llama a `sincronizar_indice`.** El servidor nunca recorre el sitio por su cuenta, ni al arrancar.
 - La herramienta vuelve al instante; la sincronización sigue **en segundo plano**, del boletín más reciente al más antiguo.
-- La primera sincronización completa (~1.900 boletines desde 2014, a ~0,6 s por boletín) tarda **unos 20–25 minutos**. El índice completo ocupa del orden de **40–50 MB**.
+- Va **despacio a propósito** (~2–3 s entre peticiones) y cada ejecución indexa como mucho **250 boletines** (los más recientes; parámetro `max_boletines`), unos 15–20 minutos. El histórico completo (~1.900 boletines desde 2014) necesita **varias ejecuciones**: si el estado final trae `pendientes_tras_limite` mayor que 0, vuelve a sincronizar más tarde. Espaciar las ejecuciones es más amable con el sitio. El índice completo ocupa del orden de **40–50 MB**.
 - Es **reanudable**: cada boletín se guarda en cuanto se procesa. Si se corta, la siguiente llamada continúa donde quedó. Por defecto también reindexa los boletines de los últimos 7 días (`reindexar_recientes_dias`) y reintenta los que fallaron (`reintentar_errores`).
 - Sigue el progreso con `estado_indice` (`hechos`, `total_planificado`, `eta_segundos`). Mientras tanto `buscar_en_indice` funciona, pero avisa de que los resultados son parciales.
-- `cancelar_sincronizacion` para tras el boletín en curso; lo ya indexado se conserva.
+- `cancelar_sincronizacion` para tras el boletín en curso (o al instante si está esperando por un bloqueo); lo ya indexado se conserva.
+- Si el sitio **rechaza las peticiones** (403, 429 o 503: límite de ritmo o cortafuegos), la sincronización no marca esos boletines como error: espera (respetando `Retry-After`, con esperas crecientes de 1, 2… hasta 15 minutos) y reintenta. Si el rechazo sigue, o tres boletines seguidos se quedan sin respuesta, termina en estado **`bloqueado`**. En ese caso no la relances enseguida: si es el cortafuegos, espera unas horas.
 - Si tienes **dos clientes** abiertos con `bome-navaja` (por ejemplo, Claude Desktop y Claude Code), solo uno sincroniza: el otro recibe `en_curso_en_otro_proceso`. El turno se considera abandonado si su dueño deja de dar señales durante 3 minutos.
 
 Cada respuesta de `buscar_en_indice` trae un bloque `cobertura` (rango de fechas indexado, boletines indexados y pendientes, última sincronización, si hay una en curso). Si el índice está vacío, devuelve 0 resultados y un `aviso` que sugiere sincronizar o usar `buscar_articulos` mientras tanto.
@@ -305,8 +306,15 @@ Busca en el BOME los artículos sobre ceses de personal eventual y cita sus CVE.
 
 ## 🔒 Seguridad y cortesía con el sitio
 
-- **Pausa de cortesía** de ~0,5 s entre peticiones, con tiempos de espera acotados.
-- **Un único cliente serializado** para todas las herramientas: aunque el modelo lance varias a la vez, las peticiones al sitio salen de una en una. La sincronización del índice usa su propio cliente, igual de pausado.
+- **Pausa de cortesía** de ~0,5 s entre peticiones en las herramientas, con tiempos de espera acotados.
+- **Un único cliente serializado** para todas las herramientas: aunque el modelo lance varias a la vez, las peticiones al sitio salen de una en una.
+- **La sincronización del índice va más despacio**: su propio cliente espera 2 s más una variación aleatoria de hasta 1 s entre peticiones, indexa como mucho 250 boletines por ejecución y **se detiene sola** (estado `bloqueado`) si el sitio empieza a rechazarla. Puedes ajustarla con variables de entorno (`estado_servidor` muestra los valores en uso en `cortesia_sincronizacion`):
+
+  | Variable | Por defecto | Qué hace |
+  |---|---|---|
+  | `BOME_NAVAJA_SYNC_DELAY` | `2` | Segundos entre peticiones de la sincronización (mínimo 1; un valor menor se sube a 1) |
+  | `BOME_NAVAJA_SYNC_MAX_BOLETINES` | `250` | Máximo de boletines por ejecución de `sincronizar_indice` |
+
 - **No recorre el sitio si no se le pide**: nada al arrancar, y la sincronización solo con `sincronizar_indice`. Dos procesos nunca sincronizan a la vez.
 - Se identifica con un **User-Agent de navegador real** y no usa ni guarda credenciales.
 - **El modelo no elige dónde se escribe**: los PDF se nombran por su CVE canónico dentro de la carpeta configurada, y las rutas solo las cambias tú con variables de entorno.

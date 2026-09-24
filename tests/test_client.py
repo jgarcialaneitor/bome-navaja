@@ -451,3 +451,65 @@ def test_no_delay_by_default(recorder: Recorder, monkeypatch: pytest.MonkeyPatch
         bome.organismos(38)
         bome.organismos(38)
     assert sleeps == []
+
+
+class FixedRng:
+    """Injected randomness: ``uniform`` returns the queued fractions of its range."""
+
+    def __init__(self, *fractions: float) -> None:
+        self.fractions = list(fractions)
+        self.calls: list[tuple[float, float]] = []
+
+    def uniform(self, low: float, high: float) -> float:
+        self.calls.append((low, high))
+        return low + (high - low) * self.fractions.pop(0)
+
+
+def test_jitter_is_added_to_the_polite_delay_per_request(
+    recorder: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    sleeps: list[float] = []
+    clock = iter([100.0, 100.5, 100.5, 104.0, 104.0])
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(clock))
+    rng = FixedRng(0.5, 0.25)
+    with recorder.client(polite_delay=2.0, jitter=1.0, rng=rng) as bome:
+        bome.organismos(38)  # first request: no wait, no draw
+        bome.organismos(38)  # 0.5 s elapsed of 2.0 + 0.5
+        bome.organismos(38)  # 3.5 s elapsed of 2.0 + 0.25: no sleep
+    assert rng.calls == [(0.0, 1.0), (0.0, 1.0)]
+    assert sleeps == [pytest.approx(2.0)]
+
+
+def test_jitter_alone_paces_requests(recorder: Recorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    sleeps: list[float] = []
+    clock = iter([10.0, 10.0, 10.0])
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(clock))
+    with recorder.client(jitter=1.0, rng=FixedRng(0.75)) as bome:
+        bome.organismos(38)
+        bome.organismos(38)
+    assert sleeps == [pytest.approx(0.75)]
+
+
+def test_zero_jitter_never_draws_randomness(recorder: Recorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder.fixture("/api/section/organismos/38", "org38.json", "application/json")
+    sleeps: list[float] = []
+    clock = iter([100.0, 100.1, 100.1])
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(clock))
+    rng = FixedRng()
+    with recorder.client(polite_delay=0.5, rng=rng) as bome:
+        assert bome.jitter == 0.0
+        bome.organismos(38)
+        bome.organismos(38)
+    assert rng.calls == []
+    assert sleeps == [pytest.approx(0.4)]
+
+
+@pytest.mark.parametrize("kwargs", [{"polite_delay": -0.1}, {"jitter": -1.0}])
+def test_negative_pace_is_rejected(recorder: Recorder, kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError):
+        recorder.client(**kwargs)

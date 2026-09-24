@@ -31,6 +31,16 @@ rows, but :data:`MAX_CONSECUTIVE_TRANSPORT_FAILURES` bulletins in a row
 failing like that also end the sync as ``bloqueado``; any other outcome
 resets that count.
 
+Pace and budget. The sync is a long crawl, so it is slower than the
+interactive tools: :data:`SYNC_POLITE_DELAY` seconds plus a random
+``uniform(0, SYNC_JITTER)`` between requests, and at most
+:data:`DEFAULT_MAX_BULLETINS_PER_RUN` bulletins per run (the newest of the
+plan). A capped run still ends as ``completado``; its state reports the cap
+(``limite_boletines``) and the planned bulletins left for a later run
+(``pendientes_tras_limite``), so the full history is filled over several,
+spread-out runs. :func:`sync_settings_from_env` reads the overrides
+``BOME_NAVAJA_SYNC_DELAY`` and ``BOME_NAVAJA_SYNC_MAX_BOLETINES``.
+
 Every bulletin is committed on its own, so an interrupted sync simply
 continues next time. Cancellation is cooperative: it is checked between
 bulletins, so it takes effect after the bulletin in flight (a few polite
@@ -48,12 +58,13 @@ worker thread) because a client is not shared across threads.
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
@@ -63,7 +74,6 @@ from .index import LEASE_STALE_SECONDS, SumarioIndex, utc_iso
 from .models import BomeBlockedError, BomeError, BomeHTTPError, BulletinRef, JsonModel
 from .search import (
     FIRST_DATE,
-    RECOMMENDED_POLITE_DELAY,
     BusquedaInvalidaError,
     articulos_del_boletin,
 )
@@ -79,6 +89,22 @@ EstadoSync = Literal[
 ]
 
 DEFAULT_RECENT_DAYS = 7
+
+SYNC_POLITE_DELAY = 2.0
+"""Seconds between two requests of the sync (interactive tools use
+:data:`bome_navaja.search.RECOMMENDED_POLITE_DELAY`)."""
+
+SYNC_JITTER = 1.0
+"""Upper bound of the random seconds added to each sync pause."""
+
+MIN_SYNC_POLITE_DELAY = 1.0
+"""Lowest pause accepted from ``BOME_NAVAJA_SYNC_DELAY``; lower values are raised to it."""
+
+DEFAULT_MAX_BULLETINS_PER_RUN = 250
+"""Bulletins one sync run indexes at most; the rest wait for the next run."""
+
+ENV_SYNC_DELAY = "BOME_NAVAJA_SYNC_DELAY"
+ENV_SYNC_MAX_BOLETINES = "BOME_NAVAJA_SYNC_MAX_BOLETINES"
 
 MAX_CONSECUTIVE_STORAGE_FAILURES = 3
 """Bulletins in a row whose failure could not even be recorded before the
@@ -105,6 +131,76 @@ _BLOCKED_MESSAGE = (
     "Bulletins already indexed are kept. Wait before syncing again (hours if it is a "
     "firewall block); the next sync continues where this one stopped."
 )
+
+
+_CAPPED_MESSAGE = (
+    "per-run limit of {cap} bulletins reached: {left} bulletins remain to be indexed. "
+    "Call sincronizar_indice again later to continue; spreading the runs out is gentler "
+    "on the BOME site."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SyncSettings:
+    """Pace and budget of the sync, as resolved by :func:`sync_settings_from_env`."""
+
+    polite_delay: float = SYNC_POLITE_DELAY
+    max_boletines: int = DEFAULT_MAX_BULLETINS_PER_RUN
+    jitter: float = SYNC_JITTER
+    warnings: tuple[str, ...] = ()
+    """One line per ignored or adjusted override, for the operator's log."""
+
+
+def sync_settings_from_env(environ: Mapping[str, str]) -> SyncSettings:
+    """Sync pace and budget from the environment overrides (pure; never raises).
+
+    ``BOME_NAVAJA_SYNC_DELAY`` is seconds between requests: a value below
+    :data:`MIN_SYNC_POLITE_DELAY` is raised to it and an unparsable one keeps
+    :data:`SYNC_POLITE_DELAY`. ``BOME_NAVAJA_SYNC_MAX_BOLETINES`` is an integer
+    >= 1; anything else keeps :data:`DEFAULT_MAX_BULLETINS_PER_RUN`. Empty
+    values count as unset. Every adjustment adds a line to ``warnings``.
+    """
+    warnings: list[str] = []
+    delay = SYNC_POLITE_DELAY
+    raw = environ.get(ENV_SYNC_DELAY, "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = math.nan
+        if not math.isfinite(parsed):
+            warnings.append(
+                f"{ENV_SYNC_DELAY}={raw!r} is not a number of seconds; using {SYNC_POLITE_DELAY:g} s"
+            )
+        elif parsed < MIN_SYNC_POLITE_DELAY:
+            delay = MIN_SYNC_POLITE_DELAY
+            warnings.append(
+                f"{ENV_SYNC_DELAY}={raw} is below the minimum of {MIN_SYNC_POLITE_DELAY:g} s; "
+                f"using {MIN_SYNC_POLITE_DELAY:g} s"
+            )
+        else:
+            delay = parsed
+    cap = DEFAULT_MAX_BULLETINS_PER_RUN
+    raw = environ.get(ENV_SYNC_MAX_BOLETINES, "").strip()
+    if raw:
+        try:
+            parsed_cap = int(raw)
+        except ValueError:
+            parsed_cap = 0
+        if parsed_cap >= 1:
+            cap = parsed_cap
+        else:
+            warnings.append(
+                f"{ENV_SYNC_MAX_BOLETINES}={raw!r} is not an integer >= 1; "
+                f"using {DEFAULT_MAX_BULLETINS_PER_RUN}"
+            )
+    return SyncSettings(polite_delay=delay, max_boletines=cap, warnings=tuple(warnings))
+
+
+def _check_cap(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise BusquedaInvalidaError(f"'max_boletines' must be an integer >= 1, got {value!r}")
+    return value
 
 
 class _IndexUnwritable(Exception):
@@ -140,6 +236,10 @@ class EstadoSincronizacion(JsonModel):
     mensaje: str | None = None
     reintentar_tras_segundos: float | None = None
     """``Retry-After`` seconds of the site's last refusal, if it sent one."""
+    limite_boletines: int | None = None
+    """Most bulletins this run indexes (the per-run cap)."""
+    pendientes_tras_limite: int = 0
+    """Planned bulletins deferred to a later run by the cap."""
     lease: dict[str, Any] | None = None
     """Holder of the lease when another process is syncing."""
     propietario: str | None = field(default=None)
@@ -170,7 +270,9 @@ class SincronizadorIndice:
         index: SumarioIndex,
         client_factory: Callable[[], BomeClient] | None = None,
         *,
-        polite_delay: float = RECOMMENDED_POLITE_DELAY,
+        polite_delay: float = SYNC_POLITE_DELAY,
+        jitter: float = SYNC_JITTER,
+        max_boletines: int = DEFAULT_MAX_BULLETINS_PER_RUN,
         owner: str | None = None,
         hoy: Callable[[], date] = date.today,
         clock: Callable[[], float] = time.time,
@@ -182,9 +284,14 @@ class SincronizadorIndice:
     ) -> None:
         """``wait(seconds)`` performs one back-off slice and returns ``True`` when
         cancelled; it defaults to waiting on the cancellation event (tests inject
-        a fake so they never sleep)."""
+        a fake so they never sleep). ``polite_delay`` and ``jitter`` only shape
+        the default client; ``max_boletines`` is the cap of runs started without
+        one."""
         self.index = index
-        self._client_factory = client_factory or (lambda: BomeClient(polite_delay=polite_delay))
+        self._client_factory = client_factory or (
+            lambda: BomeClient(polite_delay=polite_delay, jitter=jitter)
+        )
+        self._max_boletines = _check_cap(max_boletines)
         self.owner = owner or _default_owner()
         self._today = hoy
         self._clock = clock
@@ -209,10 +316,13 @@ class SincronizadorIndice:
         hasta: date | str | None = None,
         reindexar_recientes_dias: int = DEFAULT_RECENT_DAYS,
         reintentar_errores: bool = True,
+        max_boletines: int | None = None,
     ) -> EstadoSincronizacion:
         """Start a background sync and return its status at once.
 
-        While a sync of this object runs, returns that job. When another
+        At most ``max_boletines`` bulletins (default: the constructor's) are
+        indexed, the newest of the plan. While a sync of this object runs,
+        returns that job. When another
         process holds a live lease, returns ``en_curso_en_otro_proceso`` with
         the lease and starts nothing.
         """
@@ -228,6 +338,7 @@ class SincronizadorIndice:
             raise BusquedaInvalidaError(
                 f"'reindexar_recientes_dias' must be an integer >= 0, got {reindexar_recientes_dias!r}"
             )
+        cap = self._max_boletines if max_boletines is None else _check_cap(max_boletines)
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return self._snapshot()
@@ -253,10 +364,12 @@ class SincronizadorIndice:
                 "sin_sumarios": 0,
                 "errores": 0,
                 "iniciado": utc_iso(),
+                "limite_boletines": cap,
+                "pendientes_tras_limite": 0,
             }
             self._thread = threading.Thread(
                 target=self._run,
-                args=(start, end, reindexar_recientes_dias, bool(reintentar_errores)),
+                args=(start, end, reindexar_recientes_dias, bool(reintentar_errores), cap),
                 name="bome-navaja-index-sync",
                 daemon=True,
             )
@@ -323,7 +436,7 @@ class SincronizadorIndice:
                 chosen[ref.cve] = ref
         return sorted(chosen.values(), key=lambda r: (r.date or date.min, r.number), reverse=True)
 
-    def _run(self, start: date, end: date, recent_days: int, retry_errors: bool) -> None:
+    def _run(self, start: date, end: date, recent_days: int, retry_errors: bool, cap: int) -> None:
         client: BomeClient | None = None
         final: dict[str, Any] = {}
         self._storage_failures = 0
@@ -333,8 +446,12 @@ class SincronizadorIndice:
             refs = client.calendar(start, end)
             self.index.registrar_calendario(refs)
             plan = self._plan(refs, recent_days, retry_errors)
-            self._update(total_planificado=len(plan))
+            deferred = max(len(plan) - cap, 0)
+            plan = plan[:cap]  # newest first: the cap defers the oldest
+            self._update(total_planificado=len(plan), pendientes_tras_limite=deferred)
             final = {"estado": "completado"}
+            if deferred:
+                final["mensaje"] = _CAPPED_MESSAGE.format(cap=cap, left=deferred)
             for ref in plan:
                 if self._cancel.is_set():
                     final = {"estado": "cancelado", "mensaje": "cancelled by request"}
@@ -482,10 +599,18 @@ __all__ = [
     "BACKOFF_BASE_SECONDS",
     "BACKOFF_MAX_SECONDS",
     "BACKOFF_SLICE_SECONDS",
+    "DEFAULT_MAX_BULLETINS_PER_RUN",
     "DEFAULT_RECENT_DAYS",
+    "ENV_SYNC_DELAY",
+    "ENV_SYNC_MAX_BOLETINES",
     "MAX_BLOCK_RETRIES",
     "MAX_CONSECUTIVE_STORAGE_FAILURES",
     "MAX_CONSECUTIVE_TRANSPORT_FAILURES",
+    "MIN_SYNC_POLITE_DELAY",
+    "SYNC_JITTER",
+    "SYNC_POLITE_DELAY",
     "EstadoSincronizacion",
     "SincronizadorIndice",
+    "SyncSettings",
+    "sync_settings_from_env",
 ]
