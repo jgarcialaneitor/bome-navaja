@@ -203,8 +203,8 @@ Hay tres caminos, de menos a más técnico. Todos necesitan [`uv`](#requisito-uv
 
 ### Opción A — Paquete `.mcpb` para Claude Desktop
 
-1. **Consigue el paquete.** Todavía **no hay una Release publicada**, así que tienes dos opciones:
-   - Descarga el artefacto `bome-navaja-mcpb` de una ejecución en verde del flujo **CI** (pestaña *Actions* del repositorio); dentro está `bome-navaja-<versión>.mcpb`.
+1. **Consigue el paquete.** Descarga `bome-navaja-<versión>.mcpb` desde la sección [Releases](https://github.com/jgarcialaneitor/bome-navaja/releases) del repositorio (la primera es [v0.0.1](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.1)). Otras opciones:
+   - El artefacto `bome-navaja-mcpb` de una ejecución en verde del flujo **CI** (pestaña *Actions* del repositorio), para probar una versión sin publicar.
    - O constrúyelo desde un clon (necesitas `uv` y Node.js con `npx`): `scripts/build_mcpb.sh` en macOS/Linux o `scripts\build_mcpb.ps1` en Windows PowerShell. El resultado queda en `dist/bome-navaja-<versión>.mcpb` (unos 70 KB).
 2. Haz **doble clic** en el archivo, o arrástralo a la ventana de Claude Desktop. Aparece el diálogo de instalación con las 17 herramientas.
 3. Opcional: en **Carpeta de datos** elige dónde guardar el índice y los PDF. Si la dejas vacía se usa la [carpeta por defecto](#-dónde-guarda-los-datos) de tu sistema.

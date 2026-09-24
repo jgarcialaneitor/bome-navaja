@@ -213,6 +213,13 @@ Out of scope, deliberately:
 - `e15698e` feat: add the bome-navaja MCP server; `f319653` fix: Windows portability (task 6).
 - `dc62e89` feat: add the Claude Desktop .mcpb bundle (task 7).
 - `60ceaa9` docs: write the Spanish README (task 8).
+- Delivery 2026-09-24 (user decision): PR #1 merged into `main` with a merge commit (`2926df9`,
+  like navaja); release [v0.0.1](https://github.com/jgarcialaneitor/bome-navaja/releases/tag/v0.0.1)
+  tagged on `2926df9` with `bome-navaja-0.0.1.mcpb` built from `main` (76,611 bytes, sha256
+  `f4e6d395…9ab1`, downloaded asset verified). Before publishing: 442 passed on `main`; the
+  unpacked bundle answered 17 tools with a blank data folder (XDG default); unpinned
+  `uvx --from git+https://github.com/jgarcialaneitor/bome-navaja bome-navaja-mcp` built `2926df9`
+  and answered 17 tools. Not verified: an install inside the Claude Desktop app.
 - Checkpoint 2026-09-23 (user decision): private repo https://github.com/jgarcialaneitor/bome-navaja
   (HTTPS remote, like navaja; no SSH key on this host), `main` and `feat/bome-mcp` pushed,
   draft PR #1 that grows with the feature. CI green on Linux and Windows.
