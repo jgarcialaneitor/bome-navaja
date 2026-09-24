@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # CI must never hit the real bomemelilla.es site: the live tests are
+      # opt-in by design (BOME_NAVAJA_LIVE=1) and would make CI flaky and
+      # impolite to a public service.
+      - name: Run tests
+        run: uv run pytest
+
+  test-windows:
+    runs-on: windows-latest
+    # Windows is a first-class target for bome-navaja: this job gates merges
+    # exactly like the Ubuntu job (no continue-on-error).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # CI must never hit the real bomemelilla.es site: the live tests are
+      # opt-in by design (BOME_NAVAJA_LIVE=1) and would make CI flaky and
+      # impolite to a public service.
+      - name: Run tests
+        run: uv run pytest
+
+  bundle:
+    runs-on: ubuntu-latest
+    # Builds and validates the Claude Desktop .mcpb bundle. Only npm (the
+    # mcpb CLI) is contacted; bomemelilla.es is never hit.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Build the .mcpb bundle
+        run: scripts/build_mcpb.sh
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bome-navaja-mcpb
+          path: dist/*.mcpb
+          if-no-files-found: error
+
+  bundle-windows:
+    runs-on: windows-latest
+    # Exercises the PowerShell build wrapper; the artifact comes from `bundle`.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Build the .mcpb bundle (PowerShell)
+        shell: pwsh
+        run: ./scripts/build_mcpb.ps1
+
+      - name: Check the bundle exists
+        shell: pwsh
+        run: if (-not (Get-ChildItem dist\*.mcpb)) { throw 'no bundle produced' }

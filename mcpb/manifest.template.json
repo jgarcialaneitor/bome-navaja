@@ -1,0 +1,129 @@
+{
+  "manifest_version": "0.4",
+  "name": "bome-navaja",
+  "display_name": "BOME Melilla — Boletín Oficial de Melilla",
+  "version": "${VERSION}",
+  "description": "Consulta el Boletín Oficial de la Ciudad Autónoma de Melilla (bomemelilla.es): lista y abre boletines, lee artículos y PDF completos, busca en vivo y en un índice local de sumarios.",
+  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014: calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
+  "author": {
+    "name": "jgarcialaneitor"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "bome_navaja_mcpb.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "bome_navaja_mcpb.py"
+      ],
+      "env": {
+        "BOME_NAVAJA_DATA_DIR": "${user_config.directorio_datos}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  },
+  "user_config": {
+    "directorio_datos": {
+      "type": "directory",
+      "title": "Carpeta de datos",
+      "description": "Opcional. Carpeta para el índice local de sumarios y los PDF descargados. Si se deja vacía se usa la carpeta de datos del usuario del sistema.",
+      "required": false,
+      "default": ""
+    }
+  },
+  "tools": [
+    {
+      "name": "listar_bomes",
+      "description": "Lista los boletines publicados entre dos fechas (calendario del sitio)."
+    },
+    {
+      "name": "ver_bome",
+      "description": "Muestra un boletín con su árbol de departamentos, consejerías, organismos y artículos."
+    },
+    {
+      "name": "ver_sumario",
+      "description": "Vista web del sumario de un boletín: artículos con su primera página."
+    },
+    {
+      "name": "resolver_cve",
+      "description": "Devuelve la URL canónica de cualquier CVE del BOME."
+    },
+    {
+      "name": "listar_consejerias",
+      "description": "Lista las consejerías de un departamento con su id para filtrar búsquedas."
+    },
+    {
+      "name": "listar_organismos",
+      "description": "Lista los organismos de una consejería con su id para filtrar búsquedas."
+    },
+    {
+      "name": "leer_articulo",
+      "description": "Texto completo de un artículo, paginado con un cursor."
+    },
+    {
+      "name": "leer_boletin",
+      "description": "Texto completo de un boletín entero (su PDF), paginado con un cursor."
+    },
+    {
+      "name": "leer_pdf",
+      "description": "Texto del PDF de cualquier CVE (boletín, sumario, artículo o página), paginado."
+    },
+    {
+      "name": "descargar_pdf",
+      "description": "Descarga el PDF de un CVE a la caché local y devuelve su ruta."
+    },
+    {
+      "name": "buscar_bomes",
+      "description": "Búsqueda en vivo en el buscador avanzado del sitio; devuelve boletines."
+    },
+    {
+      "name": "buscar_articulos",
+      "description": "Búsqueda en vivo de artículos por su sumario, abriendo cada boletín coincidente."
+    },
+    {
+      "name": "buscar_en_indice",
+      "description": "Búsqueda instantánea de artículos en el índice local de sumarios."
+    },
+    {
+      "name": "estado_indice",
+      "description": "Estado del índice local de sumarios y de su sincronización."
+    },
+    {
+      "name": "sincronizar_indice",
+      "description": "Arranca en segundo plano la sincronización reanudable del índice local."
+    },
+    {
+      "name": "cancelar_sincronizacion",
+      "description": "Pide parar la sincronización en curso del índice local."
+    },
+    {
+      "name": "estado_servidor",
+      "description": "Configuración y estado del servidor, sin tocar la red."
+    }
+  ],
+  "tools_generated": false,
+  "keywords": [
+    "bome",
+    "melilla",
+    "boletin-oficial",
+    "legislacion",
+    "administracion-publica",
+    "spanish-law"
+  ],
+  "license": "MIT",
+  "privacy_policies": [
+    "https://bomemelilla.es/politica-cookies"
+  ]
+}
