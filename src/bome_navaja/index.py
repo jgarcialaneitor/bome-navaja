@@ -53,6 +53,23 @@ Design choices:
   becomes ``roto`` and normal syncs skip it. 503 is a block signal of the
   site (rate limit or firewall), never evidence of a broken page. A success
   resets both columns; an indexed bulletin is never downgraded to ``roto``.
+* **Origins** (schema v4): bulletins and articles carry ``origen``,
+  ``bomemelilla.es`` (the default, every row migrated from v3) or
+  ``melilla.es`` (the old portal, stored by
+  :meth:`SumarioIndex.guardar_boletin_antiguo` with its ``dboid``). An
+  old-portal bulletin is keyed by its catalog identifier, or
+  ``<cve>~<dboid>`` when the identifier repeats in the catalog (pre-2014);
+  its articles have no CVE and get ``MEL-<dboid>-<numero>`` keys (see
+  :mod:`bome_navaja.antiguo`). A key names ONE row, owned by one origin, and
+  the failure counters count that origin's failures only. A write from the
+  other origin replaces the row only when it brings something better: a
+  bomemelilla.es success always wins; an old-portal success replaces a
+  bomemelilla.es failure (``error``/``roto``) but never an indexed bulletin;
+  a failure never replaces the other origin's success, and an old-portal
+  failure never touches a bomemelilla.es row (so it never makes the
+  bomemelilla.es sync retry or skip a page). Calendar-based ``pendientes``
+  stay about bomemelilla.es; a calendar bulletin covered by the old portal
+  is not pending (the sync plans with every origin's states).
 """
 
 from __future__ import annotations
@@ -66,11 +83,12 @@ import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import wraps
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, ParamSpec, TypeVar
 
+from .antiguo import BoletinAntiguo, FichaAntigua, articulos_para_indice, clave_boletin_antiguo
 from .models import (
     BomeBlockedError,
     BomeError,
@@ -85,10 +103,16 @@ from .paths import index_path
 from .search import ArticuloEncontrado, BusquedaInvalidaError
 from .text import Term, and_groups, ignorable, normalize, phrase_starts, term_from_dict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """v1 (task 5) used a word tokenizer; v2 uses trigram; v3 remembers HTTP failures
-per bulletin (``http_status``, ``fallos_5xx``, state ``roto``). Older files are
-migrated in place."""
+per bulletin (``http_status``, ``fallos_5xx``, state ``roto``); v4 adds the
+origin of bulletins and articles (``origen``) and the old portal's bulletin id
+(``dboid``). Older files are migrated in place."""
+
+ORIGEN_BOME = "bomemelilla.es"
+ORIGEN_ANTIGUO = "melilla.es"
+ORIGENES: tuple[str, ...] = (ORIGEN_BOME, ORIGEN_ANTIGUO)
+"""Every ``origen`` a row can have."""
 
 MIN_SQLITE_VERSION = (3, 34, 0)
 """First SQLite with the FTS5 ``trigram`` tokenizer."""
@@ -146,7 +170,18 @@ _FTS_DDL = (
     "USING fts5 (texto, tokenize = 'trigram case_sensitive 1')"
 )
 
-_BULLETINS_DDL = """CREATE TABLE IF NOT EXISTS bulletins (
+_ORIGEN_COLUMN = (
+    "origen TEXT NOT NULL DEFAULT 'bomemelilla.es' "
+    "CHECK (origen IN ('bomemelilla.es', 'melilla.es'))"
+)
+_DBOID_COLUMN = "dboid INTEGER"
+_V4_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "bulletins": (("origen", _ORIGEN_COLUMN), ("dboid", _DBOID_COLUMN)),
+    "articles": (("origen", _ORIGEN_COLUMN),),
+}
+"""Columns schema v4 adds to a v3 file, per table."""
+
+_BULLETINS_DDL = f"""CREATE TABLE IF NOT EXISTS bulletins (
     cve TEXT PRIMARY KEY,
     number INTEGER NOT NULL,
     date TEXT,
@@ -157,7 +192,9 @@ _BULLETINS_DDL = """CREATE TABLE IF NOT EXISTS bulletins (
     n_articulos INTEGER NOT NULL DEFAULT 0,
     indexed_at TEXT NOT NULL,
     http_status INTEGER,
-    fallos_5xx INTEGER NOT NULL DEFAULT 0
+    fallos_5xx INTEGER NOT NULL DEFAULT 0,
+    {_ORIGEN_COLUMN},
+    {_DBOID_COLUMN}
 )"""
 _BULLETINS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS bulletins_date ON bulletins (date)"
 _V2_BULLETIN_COLUMNS = (
@@ -183,7 +220,8 @@ CREATE TABLE IF NOT EXISTS articles (
     consejeria_norm TEXT NOT NULL,
     url TEXT NOT NULL,
     pdf_url TEXT,
-    listado_en_bome INTEGER NOT NULL
+    listado_en_bome INTEGER NOT NULL,
+    {_ORIGEN_COLUMN}
 );
 CREATE INDEX IF NOT EXISTS articles_bulletin ON articles (bulletin_cve);
 CREATE TABLE IF NOT EXISTS calendar (
@@ -283,6 +321,9 @@ class ArticuloIndexado(JsonModel):
     listado_en_bome: bool
     resaltado: str | None
     """The original sumario (windowed when long) with matches in ``**bold**``."""
+    origen: str = ORIGEN_BOME
+    """``bomemelilla.es`` or ``melilla.es`` (old portal: ``bome_cve`` is the index key,
+    ``cve`` a synthetic ``MEL-<dboid>-<numero>``, ``url`` the bulletin ficha)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,7 +341,8 @@ class ResultadoIndice(JsonModel):
     """Indexed range and count, pending (from :data:`SYNC_DEFAULT_START`, older
     ones apart as ``pendientes_anteriores_2018``) and broken (``rotos``)
     bulletins, last sync time and whether a sync is running: results only cover
-    what has been indexed so far."""
+    what has been indexed so far. ``por_origen`` splits the indexed count, date
+    range and rotos per origin (bomemelilla.es, melilla.es)."""
     nota: str
 
 
@@ -329,6 +371,10 @@ class EstadoIndice(JsonModel):
     ultima_sincronizacion: dict[str, Any] | None
     sincronizacion_en_curso: dict[str, Any] | None
     """Live sync lease (owner, heartbeat), or ``None``."""
+    por_origen: dict[str, Any] = field(default_factory=dict)
+    """Per origin (:data:`ORIGENES`): ``boletines`` (counts per state and
+    ``total``), ``articulos``, ``articulos_con_sumario``, ``fecha_min`` and
+    ``fecha_max``. The top-level fields are the totals over every origin."""
 
 
 # --------------------------------------------------------------------------- query building
@@ -527,9 +573,9 @@ def _require_utf8(text: str, name: str) -> None:
 def _storable(article: ArticuloEncontrado) -> ArticuloEncontrado:
     """Copy of ``article`` with every text field made UTF-8 encodable."""
     changes = {
-        field.name: _utf8(value)
-        for field in fields(article)
-        if isinstance(value := getattr(article, field.name), str)
+        item.name: _utf8(value)
+        for item in fields(article)
+        if isinstance(value := getattr(article, item.name), str)
     }
     return replace(article, **changes)
 
@@ -575,6 +621,46 @@ def _error_info(error: BaseException | str | None) -> tuple[str | None, str | No
         code = getattr(error, "error_code", None) or type(error).__name__
         return _utf8(str(code)), _utf8(str(error))
     return "error", _utf8(str(error))
+
+
+@dataclass(frozen=True, slots=True)
+class _BulletinRow:
+    """The bulletin columns a write stores, whatever its origin."""
+
+    key: str
+    number: int
+    day: str | None
+    extraordinary: bool
+    origen: str
+    dboid: int | None
+
+
+def _check_estado(estado: str) -> None:
+    if estado not in ESTADOS_GUARDABLES:
+        raise ValueError(f"estado must be one of {ESTADOS_GUARDABLES}, got {estado!r}")
+
+
+_OUTCOME_RANK = {"indexado": 2, "sin_sumarios": 1}
+"""Better outcomes win across origins; failures (``error``, ``roto``) rank 0."""
+
+
+def _takes_over(origen: str, estado: str, previous: str) -> bool:
+    """Whether a write from ``origen`` may replace a row the OTHER origin stored.
+
+    The better outcome wins (``indexado`` > ``sin_sumarios`` > failure), so an
+    old-portal bulletin with sumarios replaces a bomemelilla.es ``sin_sumarios``
+    one (2014-2016 bulletins have no sumarios on bomemelilla.es). On a tie
+    bomemelilla.es wins. A failure never replaces the other origin's success,
+    and an old-portal failure never touches a bomemelilla.es row (its counters
+    decide the bomemelilla.es sync).
+    """
+    new_rank = _OUTCOME_RANK.get(estado, 0)
+    old_rank = _OUTCOME_RANK.get(previous, 0)
+    if estado == "error":
+        return origen == ORIGEN_BOME and old_rank == 0
+    if new_rank != old_rank:
+        return new_rank > old_rank
+    return origen == ORIGEN_BOME
 
 
 class SumarioIndex:
@@ -733,7 +819,7 @@ class SumarioIndex:
         inside the same write transaction.
         """
         if self._schema_exists(conn):
-            if self._stored_version(conn) in ("1", "2"):
+            if self._stored_version(conn) in ("1", "2", "3"):
                 self._upgrade()
             self._check_version(conn)
             return
@@ -751,7 +837,7 @@ class SumarioIndex:
             self._check_version(tx)
 
     def _upgrade(self) -> None:
-        """Migrate a v1 or v2 file to the current schema, locally, in ONE transaction.
+        """Migrate a v1, v2 or v3 file to the current schema, locally, in ONE transaction.
 
         Bulletin and article rows are kept, nothing is crawled. The version is
         re-read under the write lock, so a concurrent opener that already
@@ -767,6 +853,9 @@ class SumarioIndex:
             if version == "2":
                 self._upgrade_v2_to_v3(tx)
                 version = "3"
+            if version == "3":
+                self._upgrade_v3_to_v4(tx)
+                version = "4"
             if version != self._stored_version(tx):
                 tx.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
 
@@ -823,6 +912,22 @@ class SumarioIndex:
         tx.execute("ALTER TABLE bulletins_v3 RENAME TO bulletins")
         tx.execute(_BULLETINS_INDEX_DDL)
 
+    @staticmethod
+    def _upgrade_v3_to_v4(tx: sqlite3.Connection) -> None:
+        """v3 → v4: add ``origen`` (bulletins, articles) and ``dboid`` (bulletins).
+
+        ``ALTER TABLE ADD COLUMN`` keeps every row: existing ones take the
+        default origin ``bomemelilla.es`` and ``dboid`` ``NULL``; the FTS table
+        is untouched. Only missing columns are added, since a v1/v2 file reaches
+        this step with ``bulletins`` already rebuilt by :meth:`_upgrade_v2_to_v3`
+        in the current shape.
+        """
+        for table, columns in _V4_COLUMNS.items():
+            present = {row[1] for row in tx.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns:
+                if name not in present:
+                    tx.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
     @_reading
     def version_esquema(self) -> int:
         """Schema version stored in the file."""
@@ -842,7 +947,7 @@ class SumarioIndex:
         estado: EstadoBoletin,
         error: BaseException | str | None = None,
     ) -> str:
-        """Store one bulletin and its articles in a single transaction.
+        """Store one bomemelilla.es bulletin and its articles in a single transaction.
 
         Returns the state the bulletin ends with. Idempotent: the bulletin's
         previous articles are replaced; duplicate article CVEs are collapsed,
@@ -856,10 +961,77 @@ class SumarioIndex:
         answer other than 503 increments ``fallos_5xx``, and a bulletin that is
         not indexed becomes ``roto`` once it reaches
         :data:`ROTO_TRAS_FALLOS_5XX` (a failure without HTTP answer never
-        changes the count). Storing a success resets both columns.
+        changes the count). Storing a success resets both columns. A row the
+        old portal stored under the same CVE is replaced by a success and by a
+        failure only when it is a failure too (see the module docstring).
         """
-        if estado not in ESTADOS_GUARDABLES:
-            raise ValueError(f"estado must be one of {ESTADOS_GUARDABLES}, got {estado!r}")
+        _check_estado(estado)
+        row = _BulletinRow(
+            key=ref.cve,
+            number=ref.number,
+            day=ref.date.isoformat() if ref.date else None,
+            extraordinary=ref.extraordinary,
+            origen=ORIGEN_BOME,
+            dboid=None,
+        )
+        return self._guardar(row, articles, estado, error)
+
+    def guardar_boletin_antiguo(
+        self,
+        boletin: BoletinAntiguo,
+        ficha: FichaAntigua | None,
+        estado: EstadoBoletin,
+        error: BaseException | str | None = None,
+        *,
+        clave: str,
+    ) -> str:
+        """Store one bulletin of the old melilla.es portal and its ficha's articles.
+
+        ``clave`` is the bulletin's key: its catalog identifier, or
+        ``<cve>~<dboid>`` when the identifier repeats in the catalog (see
+        :func:`bome_navaja.antiguo.clave_boletin_antiguo`); anything else is a
+        ``ValueError``. The row gets ``origen="melilla.es"`` and the bulletin's
+        ``dboid``; articles are keyed ``MEL-<dboid>-<numero>`` and mapped by
+        :func:`bome_navaja.antiguo.articulos_para_indice`.
+
+        A success (``"indexado"`` or ``"sin_sumarios"``) needs ``ficha`` (of the
+        same ``dboid``) and the stored state follows it: ``indexado`` when some
+        article has a sumario, else ``sin_sumarios`` (e.g. a ficha without
+        articles). ``"error"`` ignores ``ficha`` and follows the same rules as
+        :meth:`guardar_boletin` (``http_status``, ``fallos_5xx``, ``roto`` after
+        :data:`ROTO_TRAS_FALLOS_5XX` answers 5xx other than 503). A bulletin
+        bomemelilla.es already indexed under the same key is never replaced;
+        a bomemelilla.es failure is replaced only by a success. Returns the
+        state the bulletin ends with.
+        """
+        _check_estado(estado)
+        if clave not in (clave_boletin_antiguo(boletin, False), clave_boletin_antiguo(boletin, True)):
+            raise ValueError(f"{clave!r} is not a key of {boletin.cve} (dboid {boletin.dboid})")
+        articles: list[ArticuloEncontrado] = []
+        if estado != "error":
+            if ficha is None:
+                raise ValueError(f"storing {clave} as {estado!r} needs its ficha")
+            articles = articulos_para_indice(boletin, ficha, clave)
+            has_text = any(article.sumario and article.sumario.strip() for article in articles)
+            estado = "indexado" if has_text else "sin_sumarios"
+        row = _BulletinRow(
+            key=clave,
+            number=boletin.numero,
+            day=boletin.fecha.isoformat(),
+            extraordinary=boletin.extraordinario,
+            origen=ORIGEN_ANTIGUO,
+            dboid=boletin.dboid,
+        )
+        return self._guardar(row, articles, estado, error)
+
+    def _guardar(
+        self,
+        bulletin: _BulletinRow,
+        articles: Sequence[ArticuloEncontrado],
+        estado: str,
+        error: BaseException | str | None,
+    ) -> str:
+        """The transactional write shared by both origins (``estado`` already checked)."""
         # One row per article CVE: a page listing an article twice keeps the
         # last occurrence (at the position of the first one).
         # Lone surrogates (not UTF-8 encodable) are replaced by "?" before storing.
@@ -869,30 +1041,35 @@ class SumarioIndex:
         ]
         code, message = _error_info(error)
         now = utc_iso()
-        day = ref.date.isoformat() if ref.date else None
         status: int | None = None
         failures = 0
         stored = estado
         with self._tx() as conn:
+            previous = conn.execute(
+                "SELECT estado, fallos_5xx, origen FROM bulletins WHERE cve = ?", (bulletin.key,)
+            ).fetchone()
+            if previous is not None and previous[2] != bulletin.origen:
+                if not _takes_over(bulletin.origen, estado, previous[0]):
+                    return str(previous[0])
+                previous = None  # the other origin's failures do not count here
             if estado == "error":
                 status = _http_status(error)
                 broken = _broken_page_answer(status) and not isinstance(error, BomeBlockedError)
-                previous = conn.execute(
-                    "SELECT estado, fallos_5xx FROM bulletins WHERE cve = ?", (ref.cve,)
-                ).fetchone()
                 failures = (previous[1] if previous is not None else 0) + int(broken)
                 if previous is not None and previous[0] not in ("error", "roto"):
                     conn.execute(
                         "UPDATE bulletins SET error_code = ?, error_message = ?, http_status = ?, "
                         "fallos_5xx = ? WHERE cve = ?",
-                        (code, message, status, failures, ref.cve),
+                        (code, message, status, failures, bulletin.key),
                     )
                     return str(previous[0])
                 if failures >= ROTO_TRAS_FALLOS_5XX:
                     stored = "roto"
             stale = [
                 row[0]
-                for row in conn.execute("SELECT id FROM articles WHERE bulletin_cve = ?", (ref.cve,))
+                for row in conn.execute(
+                    "SELECT id FROM articles WHERE bulletin_cve = ?", (bulletin.key,)
+                )
             ]
             for article in articles:
                 row = conn.execute("SELECT id FROM articles WHERE cve = ?", (article.cve,)).fetchone()
@@ -903,21 +1080,23 @@ class SumarioIndex:
                 conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
             conn.execute(
                 "INSERT OR REPLACE INTO bulletins (cve, number, date, extraordinary, estado, "
-                "error_code, error_message, n_articulos, indexed_at, http_status, fallos_5xx) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ref.cve, ref.number, day, int(ref.extraordinary), stored, code, message,
-                 0 if estado == "error" else len(articles), now, status, failures),
+                "error_code, error_message, n_articulos, indexed_at, http_status, fallos_5xx, "
+                "origen, dboid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (bulletin.key, bulletin.number, bulletin.day, int(bulletin.extraordinary), stored,
+                 code, message, 0 if estado == "error" else len(articles), now, status, failures,
+                 bulletin.origen, bulletin.dboid),
             )
             if estado == "error":
                 return stored
             for article in articles:
                 cursor = conn.execute(
                     "INSERT INTO articles (cve, bulletin_cve, number, sumario, departamento, "
-                    "consejeria, organismo, consejeria_norm, url, pdf_url, listado_en_bome) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (article.cve, ref.cve, article.numero, article.sumario, article.departamento,
-                     article.consejeria, article.organismo, normalize(article.consejeria),
-                     article.url, article.pdf_url, int(article.listado_en_bome)),
+                    "consejeria, organismo, consejeria_norm, url, pdf_url, listado_en_bome, origen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (article.cve, bulletin.key, article.numero, article.sumario,
+                     article.departamento, article.consejeria, article.organismo,
+                     normalize(article.consejeria), article.url, article.pdf_url,
+                     int(article.listado_en_bome), bulletin.origen),
                 )
                 folded = normalize(article.sumario)
                 if folded:
@@ -959,9 +1138,25 @@ class SumarioIndex:
         return row[0] if row else None
 
     @_reading
-    def estados_boletines(self) -> dict[str, str]:
-        """``cve → estado`` for every processed bulletin."""
-        return {row[0]: row[1] for row in self._conn().execute("SELECT cve, estado FROM bulletins")}
+    def estados_boletines(self, origen: str | None = None) -> dict[str, str]:
+        """``key → estado`` for every processed bulletin, or only those stored by ``origen``.
+
+        Without ``origen`` every origin counts (what the bomemelilla.es sync
+        plans with: a CVE the old portal covers is not fetched again). With
+        ``origen="melilla.es"`` the keys are the old-portal keys already
+        processed; with ``origen="bomemelilla.es"`` the CVEs bomemelilla.es
+        itself answered (the old-portal sync skips its ``indexado`` and
+        ``sin_sumarios`` ones).
+        """
+        if origen is None:
+            rows = self._conn().execute("SELECT cve, estado FROM bulletins")
+        elif origen in ORIGENES:
+            rows = self._conn().execute(
+                "SELECT cve, estado FROM bulletins WHERE origen = ?", (origen,)
+            )
+        else:
+            raise _invalid(f"'origen' must be one of {ORIGENES} or None, got {origen!r}")
+        return {row[0]: row[1] for row in rows}
 
     def _last_sync(self) -> dict[str, Any] | None:
         raw = self._meta("last_sync")
@@ -983,7 +1178,38 @@ class SumarioIndex:
             "rotos": self._broken(),
             "ultima_sincronizacion": (last or {}).get("finalizado"),
             "sincronizacion_en_curso": self.lease() is not None,
+            "por_origen": {
+                origen: {
+                    "boletines_indexados": info["boletines"]["indexado"]
+                    + info["boletines"]["sin_sumarios"],
+                    "fecha_min": info["fecha_min"],
+                    "fecha_max": info["fecha_max"],
+                    "rotos": info["boletines"]["roto"],
+                }
+                for origen, info in self._bulletins_per_origin().items()
+            },
         }
+
+    def _bulletins_per_origin(self) -> dict[str, dict[str, Any]]:
+        """Per origin: ``boletines`` (per state and ``total``) and the ISO date range
+        of its processed (``indexado``/``sin_sumarios``) bulletins."""
+        result: dict[str, dict[str, Any]] = {
+            origen: {"boletines": {name: 0 for name in ESTADOS}, "fecha_min": None, "fecha_max": None}
+            for origen in ORIGENES
+        }
+        conn = self._conn()
+        for origen, estado, count in conn.execute(
+            "SELECT origen, estado, count(*) FROM bulletins GROUP BY origen, estado"
+        ):
+            result[origen]["boletines"][estado] = count
+        for origen, low, high in conn.execute(
+            "SELECT origen, min(date), max(date) FROM bulletins "
+            "WHERE estado IN ('indexado', 'sin_sumarios') GROUP BY origen"
+        ):
+            result[origen].update(fecha_min=low, fecha_max=high)
+        for info in result.values():
+            info["boletines"]["total"] = sum(info["boletines"][name] for name in ESTADOS)
+        return result
 
     _UNFINISHED_CALENDAR = (
         "SELECT count(*) FROM calendar c LEFT JOIN bulletins b ON b.cve = c.cve "
@@ -1105,7 +1331,7 @@ class SumarioIndex:
                     )
                 rows = conn.execute(
                     "SELECT a.cve, a.number, a.sumario, a.departamento, a.consejeria, "
-                    "a.organismo, a.url, a.pdf_url, a.listado_en_bome, b.cve AS bcve, "
+                    "a.organismo, a.url, a.pdf_url, a.listado_en_bome, a.origen, b.cve AS bcve, "
                     f"b.number AS bnumber, b.date AS bdate, b.extraordinary {sources}{rank_join}"
                     f"{clause} ORDER BY {order} LIMIT ? OFFSET ?",
                     [*params, limit, offset],
@@ -1127,6 +1353,7 @@ class SumarioIndex:
                 url=row["url"],
                 pdf_url=row["pdf_url"],
                 listado_en_bome=bool(row["listado_en_bome"]),
+                origen=row["origen"],
                 resaltado=_highlight(row["sumario"], positives, palabra),
             )
             for row in rows
@@ -1166,6 +1393,17 @@ class SumarioIndex:
             "SELECT min(date), max(date) FROM bulletins WHERE estado IN ('indexado', 'sin_sumarios')"
         ).fetchone()
         known = conn.execute("SELECT count(*) FROM calendar").fetchone()[0]
+        per_origin = self._bulletins_per_origin()
+        for info in per_origin.values():
+            info.update(articulos=0, articulos_con_sumario=0)
+            for key in ("fecha_min", "fecha_max"):
+                info[key] = date.fromisoformat(info[key]) if info[key] else None
+        for origen, total, text in conn.execute(
+            "SELECT origen, count(*), "
+            "sum(CASE WHEN trim(coalesce(sumario, '')) <> '' THEN 1 ELSE 0 END) "
+            "FROM articles GROUP BY origen"
+        ):
+            per_origin[origen].update(articulos=total, articulos_con_sumario=text or 0)
         size = sum(
             candidate.stat().st_size
             for candidate in (self.path, Path(f"{self.path}-wal"))
@@ -1185,6 +1423,7 @@ class SumarioIndex:
             pendientes_anteriores_2018=self._pending_before_default_start(),
             ultima_sincronizacion=self._last_sync(),
             sincronizacion_en_curso=self.lease(),
+            por_origen=per_origin,
         )
 
     # ------------------------------------------------------------------ cross-process lease
@@ -1253,6 +1492,9 @@ __all__ = [
     "MAX_LIMITE",
     "ESTADOS",
     "ESTADOS_GUARDABLES",
+    "ORIGEN_ANTIGUO",
+    "ORIGEN_BOME",
+    "ORIGENES",
     "ROTO_TRAS_FALLOS_5XX",
     "SCHEMA_VERSION",
     "SYNC_DEFAULT_START",

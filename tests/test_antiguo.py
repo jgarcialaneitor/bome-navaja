@@ -668,3 +668,93 @@ def test_estado_catalogo_reads_the_cache_without_network(portal: Portal, tmp_pat
     broken = antiguo.estado_catalogo(cache)
     assert broken["existe"] is True and broken["boletines"] is None and broken["error"]
     assert antiguo.estado_catalogo(None) == {"ruta": None, "existe": False, "fetched_at": None, "boletines": None}
+
+
+# --------------------------------------------------------------------------- index keys (old-portal-index task 1)
+
+
+def test_bulletin_key_is_the_cve_unless_it_repeats(catalogo: tuple[list[BoletinAntiguo], list[str]]) -> None:
+    boletines, _ = catalogo
+    unique = by_dboid(boletines, 216808)
+    assert antiguo.clave_boletin_antiguo(unique, False) == "BOME-B-2016-5302"
+    first, second = (by_dboid(boletines, dboid) for dboid in (280058, 280087))
+    assert antiguo.clave_boletin_antiguo(first, True) == "BOME-BX-1986-1~280058"
+    assert antiguo.clave_boletin_antiguo(second, True) == "BOME-BX-1986-1~280087"
+
+
+def test_catalog_knows_which_identifiers_repeat_and_their_keys(
+    catalogo: tuple[list[BoletinAntiguo], list[str]],
+) -> None:
+    boletines, avisos = catalogo
+    cat = CatalogoAntiguo(boletines=tuple(boletines), avisos=tuple(avisos), fetched_at="2026-09-24T17:00:00+00:00")
+    assert cat.cves_repetidos() == frozenset({"BOME-BX-1986-1"})
+    claves = cat.claves()
+    assert len(claves) == len(boletines) == len(set(claves.values()))
+    assert claves[216808] == "BOME-B-2016-5302"
+    assert claves[280058] == "BOME-BX-1986-1~280058"
+    assert claves[280087] == "BOME-BX-1986-1~280087"
+    assert cat.clave(by_dboid(boletines, 280087)) == "BOME-BX-1986-1~280087"
+    assert cat.clave(by_dboid(boletines, 279997)) == "BOME-B-1986-2899"
+
+
+def _article(numero: int | None, sumario: str = "x", ruta: tuple[str, ...] = ("A",)) -> antiguo.ArticuloAntiguo:
+    return antiguo.ArticuloAntiguo(
+        cve_boletin="BOME-B-1999-3660", fecha=date(1999, 12, 30), numero=numero, tipo=None,
+        sumario=sumario, ruta=ruta, paginas=(),
+    )
+
+
+def test_article_keys_are_synthetic_and_duplicates_are_suffixed_in_page_order() -> None:
+    articles = [_article(7), _article(8), _article(7), _article(None), _article(7), _article(None)]
+    assert antiguo.claves_articulos_antiguos(4242, articles) == [
+        "MEL-4242-7", "MEL-4242-8", "MEL-4242-7-2", "MEL-4242-0", "MEL-4242-7-3", "MEL-4242-0-2",
+    ]
+    assert antiguo.claves_articulos_antiguos(4242, []) == []
+
+
+BOLETIN_1999 = BoletinAntiguo(
+    cve="BOME-B-1999-3660", numero=3660, extraordinario=False, sufijo=None, fecha=date(1999, 12, 30),
+    dboid=276000, url_ficha=url_ficha(276000), cve_oficial=False,
+)
+
+
+def test_ficha_articles_map_onto_index_rows() -> None:
+    ficha = parse_ficha(fixture_bytes("ficha_1999_3660.html"), 276000, boletin=BOLETIN_1999)
+    rows = antiguo.articulos_para_indice(BOLETIN_1999, ficha, "BOME-B-1999-3660")
+    assert len(rows) == len(ficha.articulos) == 73
+    first = rows[0]
+    assert (first.bome_cve, first.bome_numero, first.bome_fecha, first.bome_extraordinario) == (
+        "BOME-B-1999-3660", 3660, date(1999, 12, 30), False,
+    )
+    assert (first.cve, first.numero) == ("MEL-276000-3260", 3260)
+    assert first.sumario == "Renovación de suscripciones al Boletín Oficial de la Ciudad para el ano 2000."
+    assert (first.departamento, first.consejeria, first.organismo) == (
+        "CIUDAD AUTÓNOMA DE MELILLA", "Presidencia (Boletín Oficial)", "",
+    )
+    assert first.url == url_ficha(276000)
+    assert first.pdf_url == "https://www.melilla.es/mandar.php/n/14/7953/3660_3119.pdf"
+    assert first.listado_en_bome is True
+    assert len({row.cve for row in rows}) == 73
+
+
+def test_index_rows_join_deeper_headings_into_organismo_and_tolerate_missing_ones() -> None:
+    ficha = parse_ficha(fixture_bytes("ficha_5302.html"), 216808)
+    boletin = BoletinAntiguo(
+        cve=ficha.cve, numero=ficha.numero, extraordinario=False, sufijo=None, fecha=ficha.fecha,
+        dboid=216808, url_ficha=url_ficha(216808), cve_oficial=True,
+    )
+    first = antiguo.articulos_para_indice(boletin, ficha, ficha.cve)[0]
+    assert (first.departamento, first.consejeria, first.organismo) == (
+        "CIUDAD AUTÓNOMA DE MELILLA",
+        "CONSEJERÍA DE HACIENDA Y ADMINISTRACIONES PÚBLICAS",
+        "Dirección General de Función Pública / Personal Funcionario",
+    )
+    bare = antiguo.FichaAntigua(
+        cve=ficha.cve, numero=ficha.numero, extraordinario=False, sufijo=None, fecha=ficha.fecha,
+        dboid=216808, url_ficha=url_ficha(216808), cve_oficial=True, url_pdf=None,
+        articulos=(_article(None, "Sin encabezados", ruta=()),),
+    )
+    only = antiguo.articulos_para_indice(boletin, bare, ficha.cve)[0]
+    assert (only.departamento, only.consejeria, only.organismo, only.pdf_url, only.numero) == ("", "", "", None, 0)
+    with pytest.raises(ValueError):
+        antiguo.articulos_para_indice(boletin, bare, "BOME-B-2016-9999")

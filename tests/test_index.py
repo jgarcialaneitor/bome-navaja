@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from bome_navaja import index as index_module
+from bome_navaja.antiguo import BoletinAntiguo, FichaAntigua, parse_ficha, url_ficha
 from bome_navaja.index import SCHEMA_VERSION, SumarioIndex
 from bome_navaja.models import (
     BomeBlockedError,
@@ -763,7 +764,7 @@ def test_v1_index_is_migrated_in_place(tmp_path: Path) -> None:
     build_v1(path, ["Cese del director.", "Ceses varios.", "Procese el expediente.", None, "  "])
     index = SumarioIndex(path)
     try:
-        assert index.version_esquema() == SCHEMA_VERSION == 3
+        assert index.version_esquema() == SCHEMA_VERSION == 4
         state = index.estado()
         assert state.articulos == 5
         assert state.boletines["indexado"] == 1
@@ -1191,7 +1192,7 @@ def test_v2_index_is_migrated_to_v3_in_place(tmp_path: Path) -> None:
     build_v2(path)
     index = SumarioIndex(path)
     try:
-        assert index.version_esquema() == SCHEMA_VERSION == 3
+        assert index.version_esquema() == SCHEMA_VERSION == 4
         assert failure(index, "BOME-B-2018-5522") == ("roto", 500, 1)
         assert failure(index, "BOME-B-2017-5400") == ("roto", 502, 1)
         assert failure(index, "BOME-B-2017-5401") == ("error", 404, 0)
@@ -1231,7 +1232,7 @@ def test_v2_index_is_migrated_to_v3_in_place(tmp_path: Path) -> None:
         index.close()
     again = SumarioIndex(path)
     try:
-        assert again.version_esquema() == 3
+        assert again.version_esquema() == 4
         assert failure(again, "BOME-B-2018-5522") == ("roto", 500, 1)
         assert again.buscar("cese").total == 2
     finally:
@@ -1249,7 +1250,7 @@ def test_v1_index_with_errors_is_migrated_to_v3(tmp_path: Path) -> None:
         )
     index = SumarioIndex(path)
     try:
-        assert index.version_esquema() == 3
+        assert index.version_esquema() == 4
         assert failure(index, "BOME-B-2018-5522") == ("roto", 500, 1)
         assert failure(index, "BOME-B-2026-6375") == ("indexado", None, 0)
         assert index.buscar("cese").total == 1
@@ -1273,3 +1274,383 @@ def test_v3_migration_failure_rolls_back_to_v2(tmp_path: Path, monkeypatch: pyte
         assert raw.execute("SELECT count(*) FROM bulletins").fetchone()[0] == 9
         columns = {row[1] for row in raw.execute("PRAGMA table_info(bulletins)")}
         assert "http_status" not in columns
+
+
+# --------------------------------------------------------------------------- old-portal-index task 1: schema v4
+
+ANTIGUO = Path(__file__).parent / "fixtures" / "antiguo"
+
+
+def boletin_antiguo(cve: str, day: date, dboid: int, extraordinario: bool = False) -> BoletinAntiguo:
+    return BoletinAntiguo(
+        cve=cve, numero=int(cve.rsplit("-", 1)[1]), extraordinario=extraordinario, sufijo=None,
+        fecha=day, dboid=dboid, url_ficha=url_ficha(dboid), cve_oficial=day.year >= 2014,
+    )
+
+
+def ficha(name: str, boletin: BoletinAntiguo) -> FichaAntigua:
+    return parse_ficha((ANTIGUO / f"{name}.html").read_bytes(), boletin.dboid, boletin=boletin)
+
+
+B1991 = boletin_antiguo("BOME-B-1991-3175", date(1991, 12, 26), 281500)
+B1999 = boletin_antiguo("BOME-B-1999-3660", date(1999, 12, 30), 276000)
+B1986 = boletin_antiguo("BOME-B-1986-2899", date(1986, 12, 25), 279997)
+EXTRA_A = boletin_antiguo("BOME-BX-1986-1", date(1986, 3, 1), 280058, extraordinario=True)
+EXTRA_B = boletin_antiguo("BOME-BX-1986-1", date(1986, 9, 1), 280087, extraordinario=True)
+
+
+@pytest.fixture
+def mixed(filled: SumarioIndex) -> SumarioIndex:
+    """``filled`` (bomemelilla.es) plus the 1991 and 1999 fichas of the old portal."""
+    assert filled.guardar_boletin_antiguo(B1991, ficha("ficha_1991_3175", B1991), "indexado", clave=B1991.cve) == "indexado"
+    assert filled.guardar_boletin_antiguo(B1999, ficha("ficha_1999_3660", B1999), "indexado", clave=B1999.cve) == "indexado"
+    return filled
+
+
+def bulletin_row(index: SumarioIndex, key: str) -> tuple:
+    row = index._conn().execute(
+        "SELECT origen, dboid, estado, n_articulos, number, date, extraordinary FROM bulletins WHERE cve = ?",
+        (key,),
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+def test_schema_v4_is_current() -> None:
+    assert SCHEMA_VERSION == 4
+
+
+def test_old_portal_bulletins_are_stored_with_origin_and_dboid(mixed: SumarioIndex) -> None:
+    assert bulletin_row(mixed, B1991.cve) == ("melilla.es", 281500, "indexado", 30, 3175, "1991-12-26", 0)
+    assert bulletin_row(mixed, B1999.cve) == ("melilla.es", 276000, "indexado", 73, 3660, "1999-12-30", 0)
+    assert bulletin_row(mixed, B1.cve)[:2] == ("bomemelilla.es", None)
+    origins = dict(mixed._conn().execute("SELECT origen, count(*) FROM articles GROUP BY origen").fetchall())
+    assert origins == {"bomemelilla.es": 9, "melilla.es": 103}
+
+
+def test_old_portal_articles_are_found_with_their_origin(mixed: SumarioIndex) -> None:
+    found = mixed.buscar("suscripciones")
+    assert found.total == 1
+    hit = found.articulos[0]
+    assert hit.origen == "melilla.es"
+    assert (hit.bome_cve, hit.bome_numero, hit.bome_fecha, hit.bome_extraordinario) == (
+        "BOME-B-1999-3660", 3660, date(1999, 12, 30), False,
+    )
+    assert (hit.cve, hit.numero, hit.consejeria) == ("MEL-276000-3260", 3260, "Presidencia (Boletín Oficial)")
+    assert hit.url == url_ficha(276000)
+    assert hit.pdf_url == "https://www.melilla.es/mandar.php/n/14/7953/3660_3119.pdf"
+    assert hit.resaltado and "**suscripciones**" in hit.resaltado
+    assert hit.to_dict()["origen"] == "melilla.es"
+    # bomemelilla.es results carry their origin too.
+    assert {a.origen for a in mixed.buscar("nombramiento").articulos} == {"bomemelilla.es"}
+
+
+def test_boolean_search_spans_both_origins(mixed: SumarioIndex) -> None:
+    both = mixed.buscar(terminos=[{"texto": "juicio de faltas"}, {"texto": "citación"}])
+    assert both.total > 0 and all(a.bome_cve == B1999.cve for a in both.articulos)
+    assert all("Citación" in a.sumario and "Faltas" in a.sumario for a in both.articulos)
+    either = mixed.buscar(terminos=[{"texto": "desahucio"}, {"texto": "cese", "operador": "o"}])
+    origins = {a.origen for a in either.articulos}
+    assert origins == {"melilla.es", "bomemelilla.es"}
+    assert {a.bome_cve for a in either.articulos if a.origen == "melilla.es"} == {B1991.cve, B1999.cve}
+    negated = mixed.buscar(terminos=[{"texto": "notificación"}, {"texto": "faltas", "modo": "no_contiene"}])
+    assert negated.total > 0 and not any("faltas" in a.sumario.lower() for a in negated.articulos)
+    assert {a.origen for a in negated.articulos} == {"melilla.es"}
+    dated = mixed.buscar("notificación", desde="1991-01-01", hasta="1991-12-31")
+    assert dated.total > 0 and {a.bome_cve for a in dated.articulos} == {B1991.cve}
+    by_consejeria = mixed.buscar("tribunal", consejeria="recursos humanos")
+    assert by_consejeria.total == 2 and {a.origen for a in by_consejeria.articulos} == {"melilla.es"}
+
+
+def test_a_ficha_without_articles_is_sin_sumarios(idx: SumarioIndex) -> None:
+    empty = ficha("ficha_1986_2899", B1986)
+    assert empty.articulos == ()
+    assert idx.guardar_boletin_antiguo(B1986, empty, "indexado", clave=B1986.cve) == "sin_sumarios"
+    assert bulletin_row(idx, B1986.cve) == ("melilla.es", 279997, "sin_sumarios", 0, 2899, "1986-12-25", 0)
+
+
+def test_a_ficha_whose_articles_have_no_sumario_is_sin_sumarios(idx: SumarioIndex) -> None:
+    full = ficha("ficha_1991_3175", B1991)
+    blank = FichaAntigua(**{**{f: getattr(full, f) for f in full.__slots__},
+                            "articulos": tuple(a.__class__(**{**{f: getattr(a, f) for f in a.__slots__}, "sumario": None})
+                                               for a in full.articulos)})
+    assert idx.guardar_boletin_antiguo(B1991, blank, "indexado", clave=B1991.cve) == "sin_sumarios"
+    assert idx.estado().articulos == 30
+    assert idx.buscar("edicto").total == 0
+
+
+def test_repeated_pre_2014_identifiers_are_both_stored_by_dboid(idx: SumarioIndex) -> None:
+    for boletin in (EXTRA_A, EXTRA_B):
+        body = ficha("ficha_1986_2899", boletin)
+        key = f"{boletin.cve}~{boletin.dboid}"
+        assert idx.guardar_boletin_antiguo(boletin, body, "indexado", clave=key) == "sin_sumarios"
+    assert bulletin_row(idx, "BOME-BX-1986-1~280058")[:3] == ("melilla.es", 280058, "sin_sumarios")
+    assert bulletin_row(idx, "BOME-BX-1986-1~280087")[:3] == ("melilla.es", 280087, "sin_sumarios")
+    assert bulletin_row(idx, "BOME-BX-1986-1") is None
+    assert idx.estados_boletines(origen="melilla.es") == {
+        "BOME-BX-1986-1~280058": "sin_sumarios",
+        "BOME-BX-1986-1~280087": "sin_sumarios",
+    }
+
+
+def test_the_key_must_be_the_cve_or_the_cve_with_its_dboid(idx: SumarioIndex) -> None:
+    body = ficha("ficha_1986_2899", B1986)
+    for bad in ("BOME-B-1986-2900", "BOME-B-1986-2899~1", "x"):
+        with pytest.raises(ValueError):
+            idx.guardar_boletin_antiguo(B1986, body, "indexado", clave=bad)
+    with pytest.raises(ValueError):  # the ficha of another bulletin
+        idx.guardar_boletin_antiguo(B1991, body, "indexado", clave=B1991.cve)
+    with pytest.raises(ValueError):  # a success needs its ficha
+        idx.guardar_boletin_antiguo(B1986, None, "indexado", clave=B1986.cve)
+    with pytest.raises(ValueError):
+        idx.guardar_boletin_antiguo(B1986, body, "roto", clave=B1986.cve)  # type: ignore[arg-type]
+    assert idx.estados_boletines() == {}
+
+
+def test_duplicate_article_numbers_in_one_ficha_get_suffixed_keys(idx: SumarioIndex) -> None:
+    full = ficha("ficha_1999_3660", B1999)
+    first, second = full.articulos[0], full.articulos[1]
+    twin = second.__class__(**{**{f: getattr(second, f) for f in second.__slots__}, "numero": first.numero})
+    body = FichaAntigua(**{**{f: getattr(full, f) for f in full.__slots__}, "articulos": (first, twin, full.articulos[2])})
+    assert idx.guardar_boletin_antiguo(B1999, body, "indexado", clave=B1999.cve) == "indexado"
+    keys = [row[0] for row in idx._conn().execute("SELECT cve FROM articles ORDER BY id")]
+    assert keys == ["MEL-276000-3260", "MEL-276000-3260-2", "MEL-276000-3262"]
+    assert bulletin_row(idx, B1999.cve)[3] == 3
+
+
+def test_storing_an_old_portal_bulletin_again_replaces_its_articles(mixed: SumarioIndex) -> None:
+    body = ficha("ficha_1999_3660", B1999)
+    shorter = FichaAntigua(**{**{f: getattr(body, f) for f in body.__slots__}, "articulos": body.articulos[:2]})
+    assert mixed.guardar_boletin_antiguo(B1999, shorter, "indexado", clave=B1999.cve) == "indexado"
+    assert bulletin_row(mixed, B1999.cve)[3] == 2
+    assert mixed.buscar("faltas", desde="1999-01-01", hasta="1999-12-31").total == 0
+
+
+def test_an_old_portal_page_answering_5xx_twice_becomes_roto(idx: SumarioIndex) -> None:
+    url = B1999.url_ficha
+    first = BomeHTTPError(f"HTTP 500 for {url}", status=500, url=url)
+    assert idx.guardar_boletin_antiguo(B1999, None, "error", first, clave=B1999.cve) == "error"
+    assert failure(idx, B1999.cve) == ("error", 500, 1)
+    assert idx.guardar_boletin_antiguo(B1999, None, "error", first, clave=B1999.cve) == "roto"
+    assert failure(idx, B1999.cve) == ("roto", 500, 2)
+    assert bulletin_row(idx, B1999.cve)[:2] == ("melilla.es", 276000)
+    assert idx.estados_boletines(origen="melilla.es") == {B1999.cve: "roto"}
+    # A success afterwards resets it, like bomemelilla.es bulletins.
+    assert idx.guardar_boletin_antiguo(B1999, ficha("ficha_1999_3660", B1999), "indexado", clave=B1999.cve) == "indexado"
+    assert failure(idx, B1999.cve) == ("indexado", None, 0)
+    # An error never discards what was indexed.
+    assert idx.guardar_boletin_antiguo(B1999, None, "error", first, clave=B1999.cve) == "indexado"
+    assert idx.buscar("suscripciones").total == 1
+
+
+def test_old_portal_writes_leave_bomemelilla_rows_alone(mixed: SumarioIndex) -> None:
+    assert mixed.buscar("cese").total == 3
+    assert mixed.estados_boletines(origen="bomemelilla.es") == {
+        B1.cve: "indexado", B2.cve: "indexado", BX.cve: "indexado", OLD.cve: "sin_sumarios",
+    }
+    assert mixed.estados_boletines(origen="melilla.es") == {B1991.cve: "indexado", B1999.cve: "indexado"}
+    assert len(mixed.estados_boletines()) == 6  # every origin, as the bomemelilla.es sync plans with
+    # A bomemelilla.es bulletin that is already indexed is never taken over by the old portal.
+    same = boletin_antiguo(B2.cve, B2.date, 999)
+    body = FichaAntigua(**{**{f: getattr(ficha("ficha_1999_3660", B1999), f) for f in FichaAntigua.__slots__},
+                           "cve": B2.cve, "dboid": 999})
+    assert mixed.guardar_boletin_antiguo(same, body, "indexado", clave=B2.cve) == "indexado"
+    assert mixed.guardar_boletin_antiguo(same, None, "error", "boom", clave=B2.cve) == "indexado"
+    assert bulletin_row(mixed, B2.cve)[:4] == ("bomemelilla.es", None, "indexado", 3)
+    assert failure(mixed, B2.cve) == ("indexado", None, 0)
+    assert mixed.buscar("hacienda", desde="2018-01-01").total == 1
+
+
+def test_a_failed_bomemelilla_bulletin_is_replaced_by_its_old_portal_copy(idx: SumarioIndex) -> None:
+    broken = ref("BOME-B-2016-5302", date(2016, 1, 8))
+    idx.guardar_boletin(broken, [], "error", error=http_error(500, broken.cve))
+    idx.guardar_boletin(broken, [], "error", error=http_error(500, broken.cve))
+    assert idx.estado_boletin(broken.cve) == "roto"
+    old = boletin_antiguo(broken.cve, broken.date, 216808)
+    # An old-portal failure does not touch the bomemelilla.es failure counters.
+    assert idx.guardar_boletin_antiguo(old, None, "error", "timeout", clave=old.cve) == "roto"
+    assert failure(idx, broken.cve) == ("roto", 500, 2)
+    body = parse_ficha((ANTIGUO / "ficha_5302.html").read_bytes(), 216808, boletin=old)
+    assert idx.guardar_boletin_antiguo(old, body, "indexado", clave=old.cve) == "indexado"
+    assert bulletin_row(idx, broken.cve)[:4] == ("melilla.es", 216808, "indexado", 4)
+    assert failure(idx, broken.cve) == ("indexado", None, 0)
+    assert idx.estados_boletines(origen="bomemelilla.es") == {}
+    # A later bomemelilla.es failure keeps the old-portal copy; a success replaces it.
+    assert idx.guardar_boletin(broken, [], "error", error=http_error(500, broken.cve)) == "indexado"
+    assert bulletin_row(idx, broken.cve)[:3] == ("melilla.es", 216808, "indexado")
+    assert idx.guardar_boletin(broken, [art(broken, 27, "Cese del director.")], "indexado") == "indexado"
+    assert bulletin_row(idx, broken.cve)[:4] == ("bomemelilla.es", None, "indexado", 1)
+    assert [a.origen for a in idx.buscar(desde="2016-01-01", hasta="2016-12-31").articulos] == ["bomemelilla.es"]
+
+
+def test_the_better_outcome_wins_across_origins(idx: SumarioIndex) -> None:
+    # 2014-2016 bulletins have no sumarios on bomemelilla.es; the old portal has them.
+    bulletin = ref("BOME-B-2016-5302", date(2016, 1, 8))
+    assert idx.guardar_boletin(bulletin, [], "sin_sumarios") == "sin_sumarios"
+    old = boletin_antiguo(bulletin.cve, bulletin.date, 216808)
+    body = parse_ficha((ANTIGUO / "ficha_5302.html").read_bytes(), 216808, boletin=old)
+    assert idx.guardar_boletin_antiguo(old, body, "indexado", clave=old.cve) == "indexado"
+    assert bulletin_row(idx, bulletin.cve)[:3] == ("melilla.es", 216808, "indexado")
+    # A later bomemelilla.es sin_sumarios never downgrades the old-portal sumarios.
+    assert idx.guardar_boletin(bulletin, [], "sin_sumarios") == "indexado"
+    assert bulletin_row(idx, bulletin.cve)[:3] == ("melilla.es", 216808, "indexado")
+    # An empty old-portal ficha does not replace a bomemelilla.es sin_sumarios (tie: it wins).
+    other = ref("BOME-B-2016-5303", date(2016, 1, 12))
+    assert idx.guardar_boletin(other, [], "sin_sumarios") == "sin_sumarios"
+    empty = FichaAntigua(**{**{f: getattr(body, f) for f in FichaAntigua.__slots__},
+                            "cve": other.cve, "dboid": 1, "articulos": ()})
+    old_other = boletin_antiguo(other.cve, other.date, 1)
+    assert idx.guardar_boletin_antiguo(old_other, empty, "indexado", clave=other.cve) == "sin_sumarios"
+    assert bulletin_row(idx, other.cve)[:2] == ("bomemelilla.es", None)
+
+
+def test_estado_counts_per_origin(mixed: SumarioIndex) -> None:
+    mixed.guardar_boletin_antiguo(B1986, ficha("ficha_1986_2899", B1986), "indexado", clave=B1986.cve)
+    mixed.guardar_boletin_antiguo(EXTRA_A, None, "error", http_error(500), clave=f"{EXTRA_A.cve}~{EXTRA_A.dboid}")
+    mixed.registrar_calendario([B1, B2, BX, OLD])
+    state = mixed.estado()
+    assert state.boletines == {"indexado": 5, "sin_sumarios": 2, "error": 1, "roto": 0, "total": 8}
+    assert state.articulos == 112
+    assert (state.fecha_min, state.fecha_max) == (date(1986, 12, 25), date(2026, 9, 18))
+    assert state.pendientes == 0
+    assert state.por_origen == {
+        "bomemelilla.es": {
+            "boletines": {"indexado": 3, "sin_sumarios": 1, "error": 0, "roto": 0, "total": 4},
+            "articulos": 9,
+            "articulos_con_sumario": 7,
+            "fecha_min": date(2014, 1, 3),
+            "fecha_max": date(2026, 9, 18),
+        },
+        "melilla.es": {
+            "boletines": {"indexado": 2, "sin_sumarios": 1, "error": 1, "roto": 0, "total": 4},
+            "articulos": 103,
+            "articulos_con_sumario": 103,
+            "fecha_min": date(1986, 12, 25),
+            "fecha_max": date(1999, 12, 30),
+        },
+    }
+    data = state.to_dict()
+    assert data["por_origen"]["melilla.es"]["fecha_min"] == "1986-12-25"
+    json.dumps(data)
+    cobertura = mixed.buscar("cese").cobertura
+    assert cobertura["boletines_indexados"] == 7
+    assert cobertura["por_origen"] == {
+        "bomemelilla.es": {"boletines_indexados": 4, "fecha_min": "2014-01-03", "fecha_max": "2026-09-18", "rotos": 0},
+        "melilla.es": {"boletines_indexados": 3, "fecha_min": "1986-12-25", "fecha_max": "1999-12-30", "rotos": 0},
+    }
+
+
+def test_estados_boletines_rejects_an_unknown_origin(idx: SumarioIndex) -> None:
+    with pytest.raises(BusquedaInvalidaError):
+        idx.estados_boletines(origen="boe.es")
+
+
+def test_empty_index_counts_every_origin(idx: SumarioIndex) -> None:
+    state = idx.estado()
+    assert set(state.por_origen) == {"bomemelilla.es", "melilla.es"}
+    assert state.por_origen["melilla.es"]["boletines"]["total"] == 0
+    assert state.por_origen["melilla.es"]["fecha_min"] is None
+
+
+V3_DDL = V2_DDL.replace(
+    "estado TEXT NOT NULL CHECK (estado IN ('indexado', 'sin_sumarios', 'error')),\n"
+    "    error_code TEXT, error_message TEXT, n_articulos INTEGER NOT NULL DEFAULT 0,\n"
+    "    indexed_at TEXT NOT NULL\n",
+    "estado TEXT NOT NULL CHECK (estado IN ('indexado', 'sin_sumarios', 'error', 'roto')),\n"
+    "    error_code TEXT, error_message TEXT, n_articulos INTEGER NOT NULL DEFAULT 0,\n"
+    "    indexed_at TEXT NOT NULL, http_status INTEGER, fallos_5xx INTEGER NOT NULL DEFAULT 0\n",
+)
+
+
+def build_v3(path: Path) -> None:
+    """A schema-v3 index file as v0.0.3 wrote it."""
+    assert V3_DDL != V2_DDL
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V3_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '3')")
+        conn.execute("INSERT INTO meta VALUES ('last_sync', '{\"estado\": \"completado\"}')")
+        rows = [
+            ("BOME-B-2026-6375", 6375, "2026-05-01", "indexado", None, None, 2, None, 0),
+            ("BOME-B-2018-5522", 5522, "2018-03-02", "roto", "BomeHTTPError", "HTTP 500 for x", 0, 500, 2),
+            ("BOME-B-2014-5092", 5092, "2014-01-03", "sin_sumarios", None, None, 0, None, 0),
+        ]
+        for cve, number, day, estado, code, message, count, status, fails in rows:
+            conn.execute(
+                "INSERT INTO bulletins VALUES (?, ?, ?, 0, ?, ?, ?, ?, '2026-09-23T10:00:00Z', ?, ?)",
+                (cve, number, day, estado, code, message, count, status, fails),
+            )
+            conn.execute("INSERT INTO calendar VALUES (?, ?, ?, 0)", (cve, number, day))
+        for number, sumario in ((1, "Cese del director."), (2, "Nombramiento de personal eventual.")):
+            cursor = conn.execute(
+                "INSERT INTO articles (cve, bulletin_cve, number, sumario, departamento, consejeria, "
+                "organismo, consejeria_norm, url, pdf_url, listado_en_bome) "
+                "VALUES (?, 'BOME-B-2026-6375', ?, ?, 'CAM', 'HACIENDA', 'HACIENDA', 'hacienda', ?, NULL, 1)",
+                (f"BOME-A-2026-{number}", number, sumario, f"{BASE}/bome/BOME-B-2026-6375/articulo/{number}"),
+            )
+            conn.execute(
+                "INSERT INTO articles_fts (rowid, texto) VALUES (?, ?)", (cursor.lastrowid, normalize(sumario))
+            )
+
+
+def test_v3_index_is_migrated_to_v4_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "v3.sqlite3"
+    build_v3(path)
+    index = SumarioIndex(path)
+    try:
+        assert index.version_esquema() == 4
+        assert bulletin_row(index, "BOME-B-2026-6375") == ("bomemelilla.es", None, "indexado", 2, 6375, "2026-05-01", 0)
+        assert failure(index, "BOME-B-2018-5522") == ("roto", 500, 2)
+        assert bulletin_row(index, "BOME-B-2018-5522")[:2] == ("bomemelilla.es", None)
+        origins = index._conn().execute("SELECT DISTINCT origen FROM articles").fetchall()
+        assert [row[0] for row in origins] == ["bomemelilla.es"]
+        found = index.buscar("cese")
+        assert [(a.cve, a.origen) for a in found.articulos] == [("BOME-A-2026-1", "bomemelilla.es")]
+        state = index.estado()
+        assert state.boletines == {"indexado": 1, "sin_sumarios": 1, "error": 0, "roto": 1, "total": 3}
+        assert state.por_origen["bomemelilla.es"]["boletines"]["total"] == 3
+        assert state.por_origen["melilla.es"]["boletines"]["total"] == 0
+        assert state.ultima_sincronizacion == {"estado": "completado"}
+        with pytest.raises(sqlite3.IntegrityError):
+            index._conn().execute("UPDATE bulletins SET origen = 'banana'")
+        # The migrated file takes old-portal bulletins.
+        assert index.guardar_boletin_antiguo(B1999, ficha("ficha_1999_3660", B1999), "indexado", clave=B1999.cve) == "indexado"
+    finally:
+        index.close()
+    again = SumarioIndex(path)
+    try:
+        assert again.version_esquema() == 4
+        assert again.buscar("cese").total == 1 and again.buscar("suscripciones").total == 1
+    finally:
+        again.close()
+
+
+def test_v4_migration_failure_rolls_back_to_v3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "v3.sqlite3"
+    build_v3(path)
+
+    def boom(tx: sqlite3.Connection) -> None:
+        tx.execute("ALTER TABLE bulletins ADD COLUMN origen TEXT NOT NULL DEFAULT 'bomemelilla.es'")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(SumarioIndex, "_upgrade_v3_to_v4", staticmethod(boom))
+    with pytest.raises(BomeIndexUnavailableError):
+        SumarioIndex(path)
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "3"
+        columns = {row[1] for row in raw.execute("PRAGMA table_info(bulletins)")}
+        assert "origen" not in columns
+
+
+def test_v2_and_v1_files_reach_v4_through_the_chain(tmp_path: Path) -> None:
+    build_v2(tmp_path / "v2.sqlite3")
+    build_v1(tmp_path / "v1.sqlite3", ["Cese del director."])
+    for name in ("v2.sqlite3", "v1.sqlite3"):
+        index = SumarioIndex(tmp_path / name)
+        try:
+            assert index.version_esquema() == 4
+            columns = {row[1] for row in index._conn().execute("PRAGMA table_info(bulletins)")}
+            assert {"origen", "dboid", "http_status", "fallos_5xx"} <= columns
+            assert {row[1] for row in index._conn().execute("PRAGMA table_info(articles)")} >= {"origen"}
+            assert {a.origen for a in index.buscar("cese").articulos} == {"bomemelilla.es"}
+            assert index.estados_boletines(origen="melilla.es") == {}
+        finally:
+            index.close()
