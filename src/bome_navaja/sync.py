@@ -31,8 +31,8 @@ crawl below the site's firewall threshold:
 * A run that starts while the guard is cooling down ends at once as
   ``bloqueado`` (with ``reintentar_tras_segundos``) without a single request.
 * Before the calendar and before each bulletin the sync waits
-  ``guard.espera_necesaria()`` (the error budget: at most 3 HTTP error answers
-  per 10 minutes), reported in ``mensaje`` as a preventive pause. If the budget
+  ``guard.espera_necesaria()`` (the error budget: by default at most 3 HTTP
+  error answers per 10 minutes), reported in ``mensaje`` as a preventive pause. If the budget
   fills inside a bulletin (e.g. hidden-article probes answering errors), the
   client raises :class:`~bome_navaja.models.BomePausaPreventivaError`: the sync
   waits its ``retry_after`` and resumes the same bulletin, replaying the
@@ -40,13 +40,14 @@ crawl below the site's firewall threshold:
   :data:`MAX_PAUSAS_PREVENTIVAS_SEGUIDAS` pauses in a row for one step the
   budget is considered stuck and the sync ends as ``bloqueado``.
 * A bulletin page that answers a 5xx (not 503) is recorded as ``error`` and
-  followed by a random pause of :data:`PAUSA_TRAS_ERROR_MIN_SEGUNDOS` to
-  :data:`PAUSA_TRAS_ERROR_MAX_SEGUNDOS` seconds before the next bulletin.
+  followed by a random pause of ``pausa_tras_error`` to twice that many
+  seconds (default :data:`PAUSA_TRAS_ERROR_MIN_SEGUNDOS` to
+  :data:`PAUSA_TRAS_ERROR_MAX_SEGUNDOS`) before the next bulletin.
 * A block (403/429/503, or two requests in a row without any answer, which
   the guard turns into a cooldown) ends the sync as ``bloqueado`` promptly:
   a refused bulletin is not recorded; a bulletin lost to a timeout or reset is
   recorded as ``error`` (never ``roto``). There is no retry against a closed
-  site: the guard's cooldown (75 minutes or ``Retry-After``) is far longer than
+  site: the guard's cooldown (75 minutes by default, or ``Retry-After``) is far longer than
   a sync should hold its lease.
 
 Every wait runs in cancellable slices (at most
@@ -61,8 +62,10 @@ interactive tools: :data:`SYNC_POLITE_DELAY` seconds plus a random
 plan). A capped run still ends as ``completado``; its state reports the cap
 (``limite_boletines``) and the planned bulletins left for a later run
 (``pendientes_tras_limite``), so the full history is filled over several,
-spread-out runs. :func:`sync_settings_from_env` reads the overrides
-``BOME_NAVAJA_SYNC_DELAY`` and ``BOME_NAVAJA_SYNC_MAX_BOLETINES``.
+spread-out runs. The server reads the pace, the cap and the pause after an
+error from the environment (:mod:`bome_navaja.ajustes`; no lower limit, only
+risk warnings); :func:`sync_settings_from_env` is the older, sync-only view of
+those settings.
 
 Every bulletin is committed on its own, so an interrupted sync simply
 continues next time. Cancellation is cooperative: it is checked between
@@ -102,7 +105,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Literal, cast
 
 from .client import BomeClient
-from .guard import VENTANA_ERRORES_SEGUNDOS, GuardiaSitio
+from .guard import GuardiaSitio
 from .index import LEASE_STALE_SECONDS, ORIGEN_BOME, SYNC_DEFAULT_START, SumarioIndex, utc_iso
 from .models import (
     Article,
@@ -137,13 +140,11 @@ SYNC_POLITE_DELAY = 2.0
 SYNC_JITTER = 1.0
 """Upper bound of the random seconds added to each sync pause."""
 
-MIN_SYNC_POLITE_DELAY = 1.0
-"""Lowest pause accepted from ``BOME_NAVAJA_SYNC_DELAY``; lower values are raised to it."""
-
 DEFAULT_MAX_BULLETINS_PER_RUN = 250
 """Bulletins one sync run indexes at most; the rest wait for the next run."""
 
 ENV_SYNC_DELAY = "BOME_NAVAJA_SYNC_DELAY"
+ENV_SYNC_JITTER = "BOME_NAVAJA_SYNC_JITTER"
 ENV_SYNC_MAX_BOLETINES = "BOME_NAVAJA_SYNC_MAX_BOLETINES"
 
 MAX_CONSECUTIVE_STORAGE_FAILURES = 3
@@ -154,8 +155,9 @@ BACKOFF_SLICE_SECONDS = 30.0
 """Longest single wait between lease renewals during a pause."""
 
 PAUSA_TRAS_ERROR_MIN_SEGUNDOS = 30.0
-PAUSA_TRAS_ERROR_MAX_SEGUNDOS = 60.0
-"""Bounds of the random pause after a bulletin page answered a 5xx."""
+PAUSA_TRAS_ERROR_MAX_SEGUNDOS = 2 * PAUSA_TRAS_ERROR_MIN_SEGUNDOS
+"""Default bounds of the random pause after a bulletin page answered a 5xx
+(the upper bound is always twice the lower one)."""
 
 MAX_PAUSAS_PREVENTIVAS_SEGUIDAS = 6
 """Preventive pauses in a row for one step (calendar or bulletin) before the
@@ -190,53 +192,29 @@ class SyncSettings:
     max_boletines: int = DEFAULT_MAX_BULLETINS_PER_RUN
     jitter: float = SYNC_JITTER
     warnings: tuple[str, ...] = ()
-    """One line per ignored or adjusted override, for the operator's log."""
+    """Invalid-value warnings, then risk warnings, of the sync variables only."""
 
 
 def sync_settings_from_env(environ: Mapping[str, str]) -> SyncSettings:
-    """Sync pace and budget from the environment overrides (pure; never raises).
+    """Sync pace and cap from ``BOME_NAVAJA_SYNC_DELAY``, ``BOME_NAVAJA_SYNC_JITTER``
+    and ``BOME_NAVAJA_SYNC_MAX_BOLETINES`` (pure; never raises).
 
-    ``BOME_NAVAJA_SYNC_DELAY`` is seconds between requests: a value below
-    :data:`MIN_SYNC_POLITE_DELAY` is raised to it and an unparsable one keeps
-    :data:`SYNC_POLITE_DELAY`. ``BOME_NAVAJA_SYNC_MAX_BOLETINES`` is an integer
-    >= 1; anything else keeps :data:`DEFAULT_MAX_BULLETINS_PER_RUN`. Empty
-    values count as unset. Every adjustment adds a line to ``warnings``.
+    A thin view over :func:`bome_navaja.ajustes.ajustes_desde_entorno` limited to
+    those three variables: there is no lower limit (user decision 2026-09-24),
+    an invalid value keeps its default and a riskier-than-recommended one is
+    kept with a risk warning.
     """
-    warnings: list[str] = []
-    delay = SYNC_POLITE_DELAY
-    raw = environ.get(ENV_SYNC_DELAY, "").strip()
-    if raw:
-        try:
-            parsed = float(raw)
-        except ValueError:
-            parsed = math.nan
-        if not math.isfinite(parsed):
-            warnings.append(
-                f"{ENV_SYNC_DELAY}={raw!r} is not a number of seconds; using {SYNC_POLITE_DELAY:g} s"
-            )
-        elif parsed < MIN_SYNC_POLITE_DELAY:
-            delay = MIN_SYNC_POLITE_DELAY
-            warnings.append(
-                f"{ENV_SYNC_DELAY}={raw} is below the minimum of {MIN_SYNC_POLITE_DELAY:g} s; "
-                f"using {MIN_SYNC_POLITE_DELAY:g} s"
-            )
-        else:
-            delay = parsed
-    cap = DEFAULT_MAX_BULLETINS_PER_RUN
-    raw = environ.get(ENV_SYNC_MAX_BOLETINES, "").strip()
-    if raw:
-        try:
-            parsed_cap = int(raw)
-        except ValueError:
-            parsed_cap = 0
-        if parsed_cap >= 1:
-            cap = parsed_cap
-        else:
-            warnings.append(
-                f"{ENV_SYNC_MAX_BOLETINES}={raw!r} is not an integer >= 1; "
-                f"using {DEFAULT_MAX_BULLETINS_PER_RUN}"
-            )
-    return SyncSettings(polite_delay=delay, max_boletines=cap, warnings=tuple(warnings))
+    from .ajustes import ajustes_desde_entorno  # ajustes imports this module
+
+    names = (ENV_SYNC_DELAY, ENV_SYNC_JITTER, ENV_SYNC_MAX_BOLETINES)
+    own = {name: environ[name] for name in names if name in environ}
+    ajustes = ajustes_desde_entorno(own)
+    return SyncSettings(
+        polite_delay=ajustes.pausa_sincronizacion_segundos,
+        max_boletines=ajustes.max_boletines_por_ejecucion,
+        jitter=ajustes.variacion_sincronizacion_segundos,
+        warnings=ajustes.avisos + ajustes.riesgos,
+    )
 
 
 def _check_cap(value: object) -> int:
@@ -399,7 +377,15 @@ class SincronizadorBase:
         stale_after: float,
         wait: Callable[[float], bool] | None,
         pausa_aleatoria: Callable[[float, float], float],
+        pausa_tras_error: float = PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
     ) -> None:
+        if (
+            isinstance(pausa_tras_error, bool)
+            or not isinstance(pausa_tras_error, (int, float))
+            or not math.isfinite(pausa_tras_error)
+            or pausa_tras_error < 0
+        ):
+            raise ValueError(f"pausa_tras_error must be a finite number >= 0, got {pausa_tras_error!r}")
         self.index = index
         self.guard = guard
         self._max_boletines = _check_cap(max_boletines)
@@ -408,6 +394,7 @@ class SincronizadorBase:
         self._clock = clock
         self._stale_after = stale_after
         self._random_pause = pausa_aleatoria
+        self._error_pause = float(pausa_tras_error)
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._wait = wait or self._cancel.wait
@@ -616,7 +603,7 @@ class SincronizadorBase:
         self._update(
             mensaje=_PAUSE_MESSAGE.format(
                 errors=self.guard.errores_en_ventana(),
-                window=f"{VENTANA_ERRORES_SEGUNDOS / 60:g}",
+                window=f"{self.guard.ventana_segundos / 60:g}",
                 wait=math.ceil(seconds),
                 what=what,
             )
@@ -628,7 +615,7 @@ class SincronizadorBase:
         cause, self._pending_pause = self._pending_pause, None
         if cause is None:
             return
-        seconds = self._random_pause(PAUSA_TRAS_ERROR_MIN_SEGUNDOS, PAUSA_TRAS_ERROR_MAX_SEGUNDOS)
+        seconds = self._random_pause(self._error_pause, 2 * self._error_pause)
         self._update(mensaje=f"pausing {seconds:.0f} s after {cause} (gentle on the site's firewall)")
         self._back_off(seconds)
         self._update(mensaje=None)
@@ -741,13 +728,15 @@ class SincronizadorIndice(SincronizadorBase):
         wait: Callable[[float], bool] | None = None,
         guard: GuardiaSitio | None = None,
         pausa_aleatoria: Callable[[float, float], float] = random.uniform,
+        pausa_tras_error: float = PAUSA_TRAS_ERROR_MIN_SEGUNDOS,
     ) -> None:
         """``wait(seconds)`` performs one pause slice and returns ``True`` when
         cancelled; it defaults to waiting on the cancellation event (tests inject
         a fake so they never sleep). ``guard`` is the site guard (default: a
         memory-only one); ``client_factory`` is called as
         ``client_factory(guard=guard)`` and must wire it into the client.
-        ``pausa_aleatoria(low, high)`` draws the pause after a broken page.
+        ``pausa_aleatoria(low, high)`` draws the pause after a broken page,
+        between ``pausa_tras_error`` and twice that (a finite number >= 0).
         ``polite_delay`` and ``jitter`` only shape the default client;
         ``max_boletines`` is the cap of runs started without one."""
         super().__init__(
@@ -760,6 +749,7 @@ class SincronizadorIndice(SincronizadorBase):
             stale_after=stale_after,
             wait=wait,
             pausa_aleatoria=pausa_aleatoria,
+            pausa_tras_error=pausa_tras_error,
         )
         self._client_factory: Callable[..., BomeClient] = client_factory or (
             lambda *, guard=None: BomeClient(polite_delay=polite_delay, jitter=jitter, guard=guard)
@@ -884,10 +874,10 @@ __all__ = [
     "DEFAULT_MAX_BULLETINS_PER_RUN",
     "DEFAULT_RECENT_DAYS",
     "ENV_SYNC_DELAY",
+    "ENV_SYNC_JITTER",
     "ENV_SYNC_MAX_BOLETINES",
     "MAX_CONSECUTIVE_STORAGE_FAILURES",
     "MAX_PAUSAS_PREVENTIVAS_SEGUIDAS",
-    "MIN_SYNC_POLITE_DELAY",
     "PAUSA_TRAS_ERROR_MAX_SEGUNDOS",
     "PAUSA_TRAS_ERROR_MIN_SEGUNDOS",
     "SYNC_JITTER",

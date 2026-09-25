@@ -4,7 +4,7 @@
   "display_name": "BOME Melilla — Boletín Oficial de Melilla",
   "version": "${VERSION}",
   "description": "Consulta el Boletín Oficial de la Ciudad Autónoma de Melilla (bomemelilla.es): lista y abre boletines, lee artículos y PDF completos, busca en vivo y en un índice local de sumarios.",
-  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014 en bomemelilla.es y, desde 1985 hasta marzo de 2021, los del portal antiguo de melilla.es (catálogo, búsqueda de artículos, fichas y PDF por página, pedidos bajo demanda; sus sumarios de 1991 a 2017 también se pueden indexar): calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide.",
+  "long_description": "Servidor MCP para el Boletín Oficial de la Ciudad Autónoma de Melilla (BOME). Cubre los boletines publicados desde 2014 en bomemelilla.es y, desde 1985 hasta marzo de 2021, los del portal antiguo de melilla.es (catálogo, búsqueda de artículos, fichas y PDF por página, pedidos bajo demanda; sus sumarios de 1991 a 2017 también se pueden indexar): calendario, árbol de artículos, texto completo paginado de artículos y boletines, descarga de PDF, búsqueda en vivo con la misma semántica que el sitio (subcadena sin tildes ni mayúsculas) y un índice local SQLite de sumarios que se sincroniza solo cuando se pide. Uso responsable: los ajustes de la extensión marcan el ritmo con que se piden páginas a los sitios; valores más agresivos que los recomendados pueden hacer que el cortafuegos de bomemelilla.es bloquee tu IP durante cerca de 1 hora, y los cambios se aplican al reiniciar la extensión.",
   "author": {
     "name": "jgarcialaneitor"
   },
@@ -20,7 +20,16 @@
         "bome_navaja_mcpb.py"
       ],
       "env": {
-        "BOME_NAVAJA_DATA_DIR": "${user_config.directorio_datos}"
+        "BOME_NAVAJA_DATA_DIR": "${user_config.directorio_datos}",
+        "BOME_NAVAJA_SYNC_DELAY": "${user_config.pausa_sincronizacion_segundos}",
+        "BOME_NAVAJA_SYNC_JITTER": "${user_config.variacion_sincronizacion_segundos}",
+        "BOME_NAVAJA_SYNC_MAX_BOLETINES": "${user_config.max_boletines_por_sincronizacion}",
+        "BOME_NAVAJA_QUERY_DELAY": "${user_config.pausa_consultas_segundos}",
+        "BOME_NAVAJA_GUARD_MAX_ERRORS": "${user_config.errores_tolerados}",
+        "BOME_NAVAJA_GUARD_WINDOW_MINUTES": "${user_config.ventana_errores_minutos}",
+        "BOME_NAVAJA_GUARD_COOLDOWN_MINUTES": "${user_config.espera_tras_bloqueo_minutos}",
+        "BOME_NAVAJA_ERROR_PAUSE_SECONDS": "${user_config.pausa_tras_error_segundos}",
+        "BOME_NAVAJA_TIMEOUT": "${user_config.tiempo_espera_segundos}"
       }
     }
   },
@@ -41,6 +50,78 @@
       "description": "Opcional. Carpeta para el índice local de sumarios y los PDF descargados. Si se deja vacía se usa la carpeta de datos del usuario del sistema.",
       "required": false,
       "default": ""
+    },
+    "pausa_sincronizacion_segundos": {
+      "type": "number",
+      "title": "Pausa entre peticiones al sincronizar (segundos)",
+      "description": "Segundos de espera entre cada página que pide la sincronización del índice local. Si la bajas, sincroniza antes, pero el cortafuegos del sitio puede bloquear tu IP durante cerca de 1 hora. Recomendado: 2 o más. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 2,
+      "min": 0
+    },
+    "variacion_sincronizacion_segundos": {
+      "type": "number",
+      "title": "Variación al azar de la pausa al sincronizar (segundos)",
+      "description": "Hasta cuántos segundos al azar se suman a la pausa de la sincronización, para que no pida páginas a un ritmo fijo. Si la bajas, el ritmo es más regular, más fácil de tomar por un robot y de bloquear. Recomendado: 1 o más. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 1,
+      "min": 0
+    },
+    "max_boletines_por_sincronizacion": {
+      "type": "number",
+      "title": "Máximo de boletines por sincronización",
+      "description": "Cuántos boletines procesa como mucho cada sincronización del índice; los que falten quedan para la siguiente. Si lo subes, cada sincronización hace más peticiones seguidas y aumenta el riesgo de que el sitio bloquee tu IP. Recomendado: 250 o menos. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 250,
+      "min": 1
+    },
+    "pausa_consultas_segundos": {
+      "type": "number",
+      "title": "Pausa entre peticiones en las consultas (segundos)",
+      "description": "Segundos de espera entre peticiones de las herramientas que consultan bomemelilla.es en vivo (buscar, abrir boletines, leer artículos). Si la bajas, las respuestas llegan antes, pero el sitio puede bloquear tu IP durante cerca de 1 hora. Recomendado: 0,5 o más. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 0.5,
+      "min": 0
+    },
+    "errores_tolerados": {
+      "type": "number",
+      "title": "Errores del sitio tolerados antes de parar",
+      "description": "Cuántas respuestas de error del sitio se admiten dentro de la ventana de errores antes de hacer una pausa preventiva. El cortafuegos de bomemelilla.es bloquea tu IP durante cerca de 1 hora tras unas 5 respuestas de error en poco tiempo, vayas al ritmo que vayas: si lo subes a 5 o más, ya no se para antes del bloqueo. Recomendado: 3, que deja margen. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 3,
+      "min": 1
+    },
+    "ventana_errores_minutos": {
+      "type": "number",
+      "title": "Ventana para contar los errores del sitio (minutos)",
+      "description": "Minutos durante los que se recuerda cada respuesta de error del sitio para contarla. Si la acortas, los errores se olvidan antes y caben más en poco tiempo, lo que acerca el bloqueo de tu IP. Recomendado: 10 o más (3 errores cada 10 minutos deja margen frente al bloqueo). Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 10,
+      "min": 0.001
+    },
+    "espera_tras_bloqueo_minutos": {
+      "type": "number",
+      "title": "Espera tras una señal de bloqueo (minutos)",
+      "description": "Minutos sin pedir nada al sitio cuando da señales de bloqueo (un rechazo o varias peticiones seguidas sin respuesta). El bloqueo de bomemelilla.es dura cerca de 1 hora: si esperas menos, vuelves a un sitio que aún te bloquea y puedes alargar el bloqueo. Recomendado: 75, que cubre esa hora con margen. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 75,
+      "min": 0
+    },
+    "pausa_tras_error_segundos": {
+      "type": "number",
+      "title": "Pausa tras un error del sitio al sincronizar (segundos)",
+      "description": "Pausa mínima de la sincronización tras una página rota del sitio; la pausa real es al azar entre este valor y el doble. Si la bajas, vuelve a pedir antes, y varios errores seguidos provocan el bloqueo de tu IP. Recomendado: 30 o más. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 30,
+      "min": 0
+    },
+    "tiempo_espera_segundos": {
+      "type": "number",
+      "title": "Tiempo máximo de espera de cada petición (segundos)",
+      "description": "Segundos que se espera la respuesta del sitio antes de dar la petición por fallida. Si lo bajas, un sitio lento puede parecer bloqueado: 2 peticiones seguidas sin respuesta se toman como bloqueo y se deja de pedir durante la espera tras bloqueo. Recomendado: 30 o más. Úsalo con responsabilidad; el cambio se aplica al reiniciar la extensión.",
+      "required": false,
+      "default": 30,
+      "min": 0.001
     }
   },
   "tools": [

@@ -76,6 +76,13 @@ def test_context_manager_closes(recorder: Recorder) -> None:
 def test_default_timeout_is_30_seconds(recorder: Recorder) -> None:
     with recorder.client() as bome:
         assert bome.timeout == 30.0
+        assert bome._client.timeout == httpx.Timeout(30.0)
+
+
+def test_a_configured_timeout_reaches_every_request(recorder: Recorder) -> None:
+    with recorder.client(timeout=4.5) as bome:
+        assert bome.timeout == 4.5
+        assert bome._client.timeout == httpx.Timeout(4.5)
 
 
 # --------------------------------------------------------------------------- calendar

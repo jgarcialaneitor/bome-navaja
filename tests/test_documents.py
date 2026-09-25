@@ -789,6 +789,25 @@ def test_ax_shortcut_article_pages_count_toward_the_cap(site: Site) -> None:
     assert all(f"BOME-BX-2019-{n}" in message for n in (25, 23, 26))
 
 
+@pytest.mark.parametrize(("max_errores", "expected"), [(1, 1), (2, 1), (3, 2), (5, 2)])
+def test_ax_lookup_cap_follows_the_guard_budget(site: Site, max_errores: int, expected: int) -> None:
+    # One error of the configured budget stays free for the explicit call the error
+    # suggests (never fewer than one attempt); a larger budget never raises the cap.
+    from bome_navaja.guard import GuardiaSitio
+
+    site_bug_resolver(site)
+    extraordinary_year(site, 2019, 30, listed_except({23: (98, 101), 24: None, 25: None}))
+    guard = GuardiaSitio(None, max_errores=max_errores)
+    with BomeClient(transport=httpx.MockTransport(site), guard=guard) as client:
+        with pytest.raises(documents_module.ArticuloNoLocalizadoError) as caught:
+            leer_articulo(client, "BOME-AX-2019-106")
+    fetched = article_fetches(site)
+    assert fetched == ["/bome/BOME-BX-2019-24/articulo/106", "/bome/BOME-BX-2019-25/articulo/106"][:expected]
+    page = "page" if expected == 1 else "pages"
+    assert f"stopped after {expected} article {page}" in str(caught.value)
+    assert guard.errores_en_ventana() == expected
+
+
 def test_ax_gap_page_budget_exhausted_is_a_clear_error(site: Site) -> None:
     # 16 BX bulletins listing nothing: 6 search pages, then 4 gap pages, 6 left unchecked.
     site_bug_resolver(site)
