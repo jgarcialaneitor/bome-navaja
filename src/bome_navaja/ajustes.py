@@ -69,8 +69,13 @@ UMBRAL_ERRORES_BLOQUEO = 5
 DURACION_BLOQUEO_MINUTOS = 60
 """Approximate length of the site's ban (field evidence 2026-09-24)."""
 
-MAX_TIEMPO_SEGUNDOS = 365 * 24 * 60 * 60
-"""Longest valid time, one year in seconds: larger ones crash at runtime."""
+MAX_TIEMPO_SEGUNDOS = 24 * 60 * 60
+"""Longest valid time, one day in seconds: a technical limit, not a safety one.
+
+Larger values are not portable: on Windows ``socket.settimeout`` rejected
+one year with ``OverflowError`` (CI evidence). One day stays far below an
+``INT_MAX``-millisecond limit (about 24.8 days).
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +294,7 @@ def _parse(spec: _Ajuste, raw: str) -> float | str:
     if value < spec.minimo or (value == spec.minimo and not spec.minimo_incluido):
         return requisito
     if not spec.entero and value * spec.factor_segundos > MAX_TIEMPO_SEGUNDOS:
-        return "es un tiempo demasiado grande (más de un año)"
+        return "es un tiempo demasiado grande (más de un día)"
     return value
 
 

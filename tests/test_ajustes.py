@@ -196,35 +196,35 @@ def test_a_decimal_comma_in_a_count_must_still_be_integral() -> None:
     assert message.startswith("BOME_NAVAJA_GUARD_MAX_ERRORS='2,5' no es válido: tiene que ser un número entero")
 
 
-YEAR = 365 * 24 * 60 * 60
-"""One year in seconds: the longest valid time."""
+DAY = 24 * 60 * 60
+"""One day in seconds: the longest valid time."""
 
-TOO_BIG = "es un tiempo demasiado grande (más de un año)"
+TOO_BIG = "es un tiempo demasiado grande (más de un día)"
 
 
-def test_the_longest_valid_time_is_one_year() -> None:
-    assert MAX_TIEMPO_SEGUNDOS == YEAR == 31_536_000
+def test_the_longest_valid_time_is_one_day() -> None:
+    assert MAX_TIEMPO_SEGUNDOS == DAY == 86_400
 
 
 @pytest.mark.parametrize(
     ("variable", "raw", "default"),
     [
         # Seconds settings: the value itself.
-        ("BOME_NAVAJA_SYNC_DELAY", "31536000.001", "2 s"),
-        ("BOME_NAVAJA_SYNC_JITTER", "31536001", "1 s"),
+        ("BOME_NAVAJA_SYNC_DELAY", "86400.001", "2 s"),
+        ("BOME_NAVAJA_SYNC_JITTER", "86401", "1 s"),
         ("BOME_NAVAJA_QUERY_DELAY", "1e10", "0.5 s"),
         ("BOME_NAVAJA_TIMEOUT", "1e10", "30 s"),
         ("BOME_NAVAJA_TIMEOUT", "1e308", "30 s"),
         # Minutes settings: the value times 60.
-        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "525600,01", "10 min"),
-        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "525601", "75 min"),
+        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "1440,01", "10 min"),
+        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "1441", "75 min"),
         ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "1e307", "75 min"),
         # Error pause: its top, twice the value.
-        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "15768000.5", "30 s"),
+        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "43200.5", "30 s"),
         ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "1e308", "30 s"),
     ],
 )
-def test_a_time_longer_than_a_year_keeps_the_default_with_a_warning(
+def test_a_time_longer_than_a_day_keeps_the_default_with_a_warning(
     variable: str, raw: str, default: str
 ) -> None:
     ajustes, message = one({variable: raw})
@@ -236,27 +236,27 @@ def test_a_time_longer_than_a_year_keeps_the_default_with_a_warning(
 @pytest.mark.parametrize(
     ("variable", "raw", "seconds"),
     [
-        ("BOME_NAVAJA_SYNC_DELAY", "31536000", lambda a: a.pausa_sincronizacion_segundos),
-        ("BOME_NAVAJA_TIMEOUT", "31536000", lambda a: a.tiempo_espera_segundos),
-        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "525600", lambda a: a.guardia_enfriamiento_segundos),
-        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "525600", lambda a: a.guardia_ventana_segundos),
-        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "15768000", lambda a: a.pausa_tras_error_max_segundos),
+        ("BOME_NAVAJA_SYNC_DELAY", "86400", lambda a: a.pausa_sincronizacion_segundos),
+        ("BOME_NAVAJA_TIMEOUT", "86400", lambda a: a.tiempo_espera_segundos),
+        ("BOME_NAVAJA_GUARD_COOLDOWN_MINUTES", "1440", lambda a: a.guardia_enfriamiento_segundos),
+        ("BOME_NAVAJA_GUARD_WINDOW_MINUTES", "1440", lambda a: a.guardia_ventana_segundos),
+        ("BOME_NAVAJA_ERROR_PAUSE_SECONDS", "43200", lambda a: a.pausa_tras_error_max_segundos),
     ],
 )
-def test_a_time_of_exactly_one_year_is_used(variable: str, raw: str, seconds: Callable[[Ajustes], float]) -> None:
+def test_a_time_of_exactly_one_day_is_used(variable: str, raw: str, seconds: Callable[[Ajustes], float]) -> None:
     ajustes = ajustes_desde_entorno({variable: raw})
     assert getattr(ajustes, FIELD[variable]) == float(raw)
     assert ajustes.avisos == ()
-    assert seconds(ajustes) == YEAR
+    assert seconds(ajustes) == DAY
 
 
 def test_the_longest_valid_times_still_work_at_runtime() -> None:
     ajustes = ajustes_desde_entorno(
         {
-            "BOME_NAVAJA_SYNC_DELAY": "31536000",
-            "BOME_NAVAJA_SYNC_JITTER": "31536000",
-            "BOME_NAVAJA_GUARD_COOLDOWN_MINUTES": "525600",
-            "BOME_NAVAJA_TIMEOUT": "31536000",
+            "BOME_NAVAJA_SYNC_DELAY": "86400",
+            "BOME_NAVAJA_SYNC_JITTER": "86400",
+            "BOME_NAVAJA_GUARD_COOLDOWN_MINUTES": "1440",
+            "BOME_NAVAJA_TIMEOUT": "86400",
         }
     )
     assert ajustes.avisos == ()
@@ -267,7 +267,7 @@ def test_the_longest_valid_times_still_work_at_runtime() -> None:
     # A socket accepts the timeout (no connection is made).
     with socket.socket() as sock:
         sock.settimeout(ajustes.tiempo_espera_segundos)
-        assert sock.gettimeout() == YEAR
+        assert sock.gettimeout() == DAY
 
 
 def test_every_bad_variable_gets_its_own_warning() -> None:

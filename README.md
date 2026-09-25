@@ -391,7 +391,7 @@ Los nueve ajustes son los mismos para bomemelilla.es y para el portal antiguo de
 }
 ```
 
-Una variable vacía o sin definir usa el valor por defecto. Los decimales admiten punto o coma (`0.5` o `0,5`), y los recuentos, un entero escrito como `250.0`. Un tiempo de más de un año no es válido: se usa el valor por defecto. `estado_servidor` muestra los valores en uso en `ajustes` (y el ritmo de la sincronización en `cortesia_sincronizacion` y `cortesia_sincronizacion_portal_antiguo`).
+Una variable vacía o sin definir usa el valor por defecto. Los decimales admiten punto o coma (`0.5` o `0,5`), y los recuentos, un entero escrito como `250.0`. Un tiempo de más de un día (24 horas) no es válido: se usa el valor por defecto. `estado_servidor` muestra los valores en uso en `ajustes` (y el ritmo de la sincronización en `cortesia_sincronizacion` y `cortesia_sincronizacion_portal_antiguo`).
 
 | Ajuste en Claude Desktop y variable | Por defecto (recomendado) | Qué hace | Si lo haces más agresivo |
 | --- | --- | --- | --- |
