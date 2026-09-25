@@ -87,6 +87,18 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
   `native_invocation_attempted: false` and `lineage_created: false` — a host-side consent-relay
   defect, nothing mutated. The user was told and said to continue, so this candidate is treated
   as left unreviewed; Windows CI on PR #5 is its verification.
+- Review, second attempt (same day, after the fix was committed): the host resolved consent on its
+  own UI and the review started, but the candidate was then the whole branch against `main`
+  (20 files, 1750 lines, 156 KB materialized prompt, tier `high`) and the relay aborted a reviewer
+  at 1,034,203 ms against a 1,034,180 ms bound (`pi-host-relay-timeout`, 0 reviewers prepared,
+  0 submitted, nothing mutated); lineage `review-4ea50fde085826c1` stayed in `reviewing` and the
+  provider stated a relaunch of the same slot reaches the same wall.
+- User decision: narrow the candidate instead of raising the host relay timeout. New transaction
+  `review-711515129835e773` over `046b710..0687561` (4 files, 84 lines, tier `medium`, single lens
+  `review-reliability`): **approved and acknowledged**, authority burned
+  (`gentle-ai.review-acknowledged/v1`). The other 18 files of the branch keep their per-commit
+  approvals (`review-d190a663d5477e7a`, `review-c7b65e4e98b89bc6`, `review-6524c4135285f9b7`).
+  `review-4ea50fde085826c1` remains an unfinished lineage with no review outcome.
 
 ## Delivery
 
