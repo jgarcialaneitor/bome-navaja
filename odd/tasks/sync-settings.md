@@ -66,7 +66,30 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
       `1068 passed, 18 skipped`; `uv lock --check` OK. Commit `f48c07b`; native review
       `review-6524c4135285f9b7` approved and acknowledged.
 
+## Post-review fix: the time ceiling was not portable
+
+- PR #5 (`feat/sync-settings` → `main`, pushed 2026-09-25) failed CI job `test-windows` while `test`,
+  `bundle` and `bundle-windows` were green:
+  `tests/test_ajustes.py::test_the_longest_valid_times_still_work_at_runtime` raised
+  `OverflowError: timeout doesn't fit into C timeval` at `sock.settimeout(31536000)`.
+- Cause: `MAX_TIEMPO_SEGUNDOS` was one year. Linux accepts a timeout that large; Windows caps
+  socket timeouts near `INT_MAX` milliseconds (about 24.8 days), so the "largest valid time"
+  rule from task 3 was not portable, not wrong about validity.
+- User decision 2026-09-25: lower the ceiling to 24 h (`86400` s), about 25 times below that
+  limit and still far above any real value (the actual cooldown is 75 min). Still validity, not
+  safety: a larger value falls back to the default with the same warning, now worded "más de un
+  día". `src/bome_navaja/ajustes.py`, the boundary fixtures in `tests/test_ajustes.py`
+  (`86400`/`86401`, `1440`/`1441`, `43200`) and the README sentence updated. Verified:
+  `1068 passed, 18 skipped`; the runtime test still exercises `socket.settimeout`, which is what
+  caught this. Commit `eb8d8b5`.
+- Native review could not start for this candidate: five `review.start` attempts returned
+  `consent-binding-stale` (`consent-binding-expired` at issue time) with four distinct bindings,
+  `native_invocation_attempted: false` and `lineage_created: false` — a host-side consent-relay
+  defect, nothing mutated. The user was told and said to continue, so this candidate is treated
+  as left unreviewed; Windows CI on PR #5 is its verification.
+
 ## Delivery
 
-- Pending (user decisions): push, PR, merge, build and verify the `.mcpb`, release v0.0.5.
+- Done: branch pushed and PR #5 opened; CI `test`, `bundle`, `bundle-windows` green.
+- Pending (user decisions): merge, build and verify the `.mcpb`, release v0.0.5.
 - Not verified: the settings screen inside Claude Desktop (decimals, `min`, the decimal comma).
