@@ -103,5 +103,24 @@ lease staleness, Retry-After cap); the old portal's interactive pace (stays 1 s 
 ## Delivery
 
 - Done: branch pushed and PR #5 opened; CI `test`, `bundle`, `bundle-windows` green.
-- Pending (user decisions): merge, build and verify the `.mcpb`, release v0.0.5.
-- Not verified: the settings screen inside Claude Desktop (decimals, `min`, the decimal comma).
+- Merged: PR #5 merged into `main` with a merge commit, `1338067cac1df3402352ac903e904a26453aeae1`
+  (same convention as PR #3 and PR #4; branch not deleted). CI on `main`: 4/4 success. Local on
+  `main`: `1068 passed, 18 skipped`.
+- Released: **v0.0.5**, marked Latest, tagged on `1338067`. Bundle `bome-navaja-0.0.5.mcpb`
+  (196,801 bytes, sha256 `5fbf2ff86857618ac14c4d55bdab1f3e6db2daf078b1b7b6f7e56f6a8289d379`), built from
+  `main` and verified by an independent pass before publishing: 19 tools, version `0.0.5`, every
+  shipped file byte-identical to the repository copy, `uv.lock` byte-identical to the repo's, and
+  `mcpb validate` passing. The asset downloaded back from the release hashes identically to the
+  local build.
+- Correction to the wording above: the manifest declares **10** `user_config` entries — the nine
+  new numeric settings plus the pre-existing `directorio_datos` (`directory`, `BOME_NAVAJA_DATA_DIR`,
+  already present in v0.0.4). "Nine settings" always meant the nine numeric site-facing ones, and
+  the README sentence is accurate as written; the release notes say "nueve campos nuevos" for that
+  reason.
+- Not verified: the settings screen inside Claude Desktop (decimals, `min`, the decimal comma) and
+  how `uv run` cold-starts in a real install; also macOS/Windows behaviour, since verification ran
+  on Linux only.
+- Open, low priority: no `max` on any numeric field, so a user can still choose an aggressive value
+  (mitigated by the warning in `estado_servidor` and the in-code site guard); the merged
+  `feat/sync-settings` branch still exists locally and on origin; and the oversized-range lineage
+  `review-4ea50fde085826c1` remains in `reviewing` with no outcome.
